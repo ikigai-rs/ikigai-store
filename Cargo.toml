@@ -1,0 +1,10 @@
+[package]
+name = "ikigai-store"
+description = "RDF/SPARQL endpoint backed by Oxigraph."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
