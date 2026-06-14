@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-store"
-description = "RDF/SPARQL endpoint backed by Oxigraph."
+description = "RDF/SPARQL endpoint backed by Oxigraph (in-memory)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,3 +8,11 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+ikigai-core = { path = "../ikigai-core" }
+# In-memory store only: default-features=false drops the RocksDB (C++) backend,
+# whose `oxrocksdb-sys` is also gated out of wasm by Oxigraph itself.
+oxigraph = { version = "0.5", default-features = false }
+
+# On wasm, Oxigraph needs its `js` feature (getrandom wasm backend) to build.
+[target.'cfg(target_family = "wasm")'.dependencies]
+oxigraph = { version = "0.5", default-features = false, features = ["js"] }
