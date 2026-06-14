@@ -14,7 +14,9 @@
 
 use std::sync::Arc;
 
-use ikigai_core::{Endpoint, Error, Invocation, ReprType, Representation, Result};
+use ikigai_core::{
+    ArgSpec, Description, Endpoint, Error, Invocation, ReprType, Representation, Result, Verb,
+};
 use oxigraph::io::{RdfFormat, RdfSerializer};
 use oxigraph::model::GraphName;
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
@@ -97,11 +99,31 @@ impl SparqlEndpoint {
 
 impl Endpoint for SparqlEndpoint {
     fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        self.evaluate(inv.inline_str("query")?)
+        match inv.request.verb {
+            // DESCRIBE the endpoint itself as RDF.
+            Verb::Meta => Ok(ikigai_vocab::describe_turtle(&self.describe())),
+            _ => self.evaluate(inv.inline_str("query")?),
+        }
     }
 
     fn name(&self) -> &str {
         "sparql"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("sparql")
+            .title("SPARQL query endpoint")
+            .summary(
+                "Evaluates a SPARQL query (the `query` argument) against an in-memory RDF store.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .input(
+                ArgSpec::new("query")
+                    .summary("A SPARQL SELECT, ASK, CONSTRUCT, or DESCRIBE query."),
+            )
+            .output("application/sparql-results+json")
+            .output("application/n-triples")
     }
 }
 
@@ -164,5 +186,25 @@ mod tests {
         assert!(String::from_utf8(rep.bytes)
             .unwrap()
             .contains("http://ex/a"));
+    }
+
+    #[test]
+    fn meta_returns_rdf_self_description() {
+        let ep = SparqlEndpoint::new().unwrap();
+        let req = Request::new(Verb::Meta, Iri::parse("urn:sparql:default").unwrap());
+        let bindings = Bindings::new();
+        let cap = Capability::root();
+        let inv = Invocation {
+            request: &req,
+            bindings: &bindings,
+            capability: &cap,
+        };
+        let rep = ep.invoke(&inv).unwrap();
+        assert_eq!(rep.repr_type.media_type, "text/turtle");
+        let ttl = String::from_utf8(rep.bytes).unwrap();
+        assert!(ttl.contains("a ik:Endpoint"));
+        assert!(ttl.contains("ik:id \"sparql\""));
+        assert!(ttl.contains("ik:verb \"Source\", \"Meta\""));
+        assert!(ttl.contains("ik:inputName \"query\""));
     }
 }
