@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use ikigai_core::{
     ArgSpec, Description, Endpoint, Error, Invocation, ReprType, Representation, Result, Verb,
 };
@@ -97,8 +98,9 @@ impl SparqlEndpoint {
     }
 }
 
+#[async_trait]
 impl Endpoint for SparqlEndpoint {
-    fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         match inv.request.verb {
             // DESCRIBE the endpoint itself as RDF.
             Verb::Meta => Ok(ikigai_vocab::describe_turtle(&self.describe())),
@@ -138,6 +140,7 @@ fn endpoint_err(e: impl std::fmt::Display) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
     use ikigai_core::{ArgRef, Bindings, Capability, Iri, Request, Verb};
 
     fn query_rep(ep: &SparqlEndpoint, sparql: &[u8]) -> Representation {
@@ -150,7 +153,7 @@ mod tests {
             bindings: &bindings,
             capability: &cap,
         };
-        ep.invoke(&inv).unwrap()
+        block_on(ep.invoke(&inv)).unwrap()
     }
 
     #[test]
@@ -199,7 +202,7 @@ mod tests {
             bindings: &bindings,
             capability: &cap,
         };
-        let rep = ep.invoke(&inv).unwrap();
+        let rep = block_on(ep.invoke(&inv)).unwrap();
         assert_eq!(rep.repr_type.media_type, "text/turtle");
         let ttl = String::from_utf8(rep.bytes).unwrap();
         assert!(ttl.contains("a ik:Endpoint"));
