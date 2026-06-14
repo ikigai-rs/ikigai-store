@@ -148,11 +148,7 @@ mod tests {
             .with_arg("query", ArgRef::Inline(sparql.to_vec()));
         let bindings = Bindings::new();
         let cap = Capability::root();
-        let inv = Invocation {
-            request: &req,
-            bindings: &bindings,
-            capability: &cap,
-        };
+        let inv = Invocation::detached(&req, &bindings, &cap);
         block_on(ep.invoke(&inv)).unwrap()
     }
 
@@ -197,11 +193,7 @@ mod tests {
         let req = Request::new(Verb::Meta, Iri::parse("urn:sparql:default").unwrap());
         let bindings = Bindings::new();
         let cap = Capability::root();
-        let inv = Invocation {
-            request: &req,
-            bindings: &bindings,
-            capability: &cap,
-        };
+        let inv = Invocation::detached(&req, &bindings, &cap);
         let rep = block_on(ep.invoke(&inv)).unwrap();
         assert_eq!(rep.repr_type.media_type, "text/turtle");
         let ttl = String::from_utf8(rep.bytes).unwrap();
