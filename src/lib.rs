@@ -102,9 +102,12 @@ impl SparqlEndpoint {
 impl Endpoint for SparqlEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         match inv.request.verb {
-            // DESCRIBE the endpoint itself as RDF.
-            Verb::Meta => Ok(ikigai_vocab::describe_turtle(&self.describe())),
-            _ => self.evaluate(inv.inline_str("query")?),
+            // `Meta` is routed by the kernel (it renders `describe()` via the
+            // transform layer); the endpoint only serves data.
+            Verb::Source => self.evaluate(inv.inline_str("query")?),
+            other => Err(Error::Endpoint(format!(
+                "sparql endpoint does not support the {other:?} verb"
+            ))),
         }
     }
 
@@ -141,7 +144,11 @@ fn endpoint_err(e: impl std::fmt::Display) -> Error {
 mod tests {
     use super::*;
     use futures::executor::block_on;
-    use ikigai_core::{ArgRef, Bindings, Capability, Iri, Request, Verb};
+    use ikigai_core::{
+        ArgRef, Bindings, Capability, EndpointSpace, Exact, Iri, Kernel, Request, Verb,
+    };
+    use ikigai_vocab::TurtleRenderer;
+    use std::sync::Arc;
 
     fn query_rep(ep: &SparqlEndpoint, sparql: &[u8]) -> Representation {
         let req = Request::new(Verb::Source, Iri::parse("urn:sparql:default").unwrap())
@@ -188,18 +195,22 @@ mod tests {
     }
 
     #[test]
-    fn meta_returns_rdf_self_description() {
-        let ep = SparqlEndpoint::new().unwrap();
-        let req = Request::new(Verb::Meta, Iri::parse("urn:sparql:default").unwrap());
-        let bindings = Bindings::new();
+    fn meta_renders_self_description_via_kernel() {
+        let space = EndpointSpace::new().bind(
+            Exact::new("urn:sparql:default"),
+            SparqlEndpoint::new().unwrap(),
+        );
+        let kernel = Kernel::with_meta_renderer(Arc::new(space), Arc::new(TurtleRenderer));
         let cap = Capability::root();
-        let inv = Invocation::detached(&req, &bindings, &cap);
-        let rep = block_on(ep.invoke(&inv)).unwrap();
+        let rep = block_on(kernel.issue(
+            Request::new(Verb::Meta, Iri::parse("urn:sparql:default").unwrap()),
+            &cap,
+        ))
+        .unwrap();
         assert_eq!(rep.repr_type.media_type, "text/turtle");
         let ttl = String::from_utf8(rep.bytes).unwrap();
         assert!(ttl.contains("a ik:Endpoint"));
         assert!(ttl.contains("ik:id \"sparql\""));
-        assert!(ttl.contains("ik:verb \"Source\", \"Meta\""));
         assert!(ttl.contains("ik:inputName \"query\""));
     }
 }

@@ -10,7 +10,6 @@ repository.workspace = true
 [dependencies]
 async-trait = "0.1"
 ikigai-core = { path = "../ikigai-core" }
-ikigai-vocab = { path = "../ikigai-vocab" }
 # In-memory store only: default-features=false drops the RocksDB (C++) backend,
 # whose `oxrocksdb-sys` is also gated out of wasm by Oxigraph itself.
 oxigraph = { version = "0.5", default-features = false }
@@ -21,3 +20,4 @@ oxigraph = { version = "0.5", default-features = false, features = ["js"] }
 
 [dev-dependencies]
 futures = "0.3"
+ikigai-vocab = { path = "../ikigai-vocab" }
