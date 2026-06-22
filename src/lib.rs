@@ -98,8 +98,7 @@ impl SparqlEndpoint {
     }
 }
 
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[async_trait]
 impl Endpoint for SparqlEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         match inv.request.verb {
