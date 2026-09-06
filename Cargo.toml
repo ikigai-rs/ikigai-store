@@ -9,6 +9,15 @@ repository.workspace = true
 
 [dependencies]
 async-trait = "0.1"
+# `0.1` is the TRUE minimum here, not an un-audited family pin (2026-09-06): every
+# core item this crate names — `Endpoint`/`Invocation::inline_str`, `Representation`,
+# `ReprType`, `Error::Endpoint`, `Description`/`ArgSpec` and their builders — was
+# already public before 0.1.0. Verified two ways: `git log -S` puts every
+# introducing commit in the 0.0.0 pre-release era, and a standalone copy of this
+# crate's lib compiles clean against `ikigai-core = "=0.1.0"`. Re-audit whenever a
+# new core item is used: a pin BELOW the API you call stays green under fmt, clippy,
+# test and CI (the path dep satisfies the call) and fails only at
+# `cargo publish --dry-run`. That is what happened to `ikigai-vocab` in 0.1.66.
 ikigai-core = { path = "../ikigai-core", version = "0.1" }
 # In-memory store only: default-features=false drops the RocksDB (C++) backend,
 # whose `oxrocksdb-sys` is also gated out of wasm by Oxigraph itself.
@@ -20,4 +29,8 @@ oxigraph = { version = "0.5", default-features = false, features = ["js"] }
 
 [dev-dependencies]
 futures = "0.3"
+# Tests only, and `0.1` is likewise the audited minimum: the single item used is
+# `TurtleRenderer`, public since before 0.1.0. Note the resolution consequence —
+# vocab 0.1.66 now requires core 0.1.66, so the TEST graph is pulled to that even
+# though the lib above genuinely builds on 0.1.0.
 ikigai-vocab = { path = "../ikigai-vocab", version = "0.1" }
