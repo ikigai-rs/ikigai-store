@@ -143,19 +143,19 @@ names the path**, ever — an env var is invisible to `ikigai config`, is not in
 a launchd agent, and two processes that disagree about it never meet. An unknown key, an
 empty `path` and an unwritable directory are all loud.
 
-## Status: `publish = false`, and the seven conditions are met
+## Status: publishable as of 2026-09-13
 
-`ikigai-core` #110 set seven conditions for lifting the guard, and this version meets all
+`ikigai-core` #110 set seven conditions for lifting `publish = false`, and 0.2.0 meets all
 seven — durable backend, a `Sink` that writes through the kernel, declared = enforced
 capabilities in both directions, a golden thread the writer cuts, typed inputs and an `as`
 selector that refuses rather than substitutes, an `ikigai-conformance` walk, and a
-namespace this crate owns.
+namespace this crate owns. Brian yanked 0.1.70 and lifted the guard.
 
-The line stays on anyway, deliberately. **The last time it was absent, this crate was
-published by accident** — a lockstep sweep shipped the in-memory placeholder as 0.1.70 on
-2026-09-12, and that version is still on crates.io, unyanked, wearing the name of a
-persistent store. Lifting `publish = false` is one line, and it is Brian's, together with
-the yank.
+**Why 0.2.0 and not a patch.** 0.1.70 was the in-memory placeholder, shipped by a lockstep
+sweep on 2026-09-12 and yanked the next day at 9 downloads. crates.io never re-uses a
+yanked version, and this code has none of the shape that number was attached to. That
+accident is also half the reason this crate left the `ikigai-core` workspace: a release
+here is now a deliberate act on one crate rather than a side effect of a kernel release.
 
 ## Where this lives, and why
 
