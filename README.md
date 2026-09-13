@@ -60,11 +60,13 @@ Every item is something core #109 found missing from the placeholder:
    offers an agent two indistinguishable query actions over two different stores, and
    the one declaring no capability is the one that answers an unrestricted query.
 
-## Where this should live
+## Where this lives
 
-**Recommendation: its own repo, like every other module — but moved as the first step of
-the arc that builds the backend, not before it.** The argument, from the CI and the
-manifests rather than from the shape of the ecosystem:
+**Its own repo, like every other module — moved 2026-09-13** (decided in `ikigai-core`
+#110, executed as the first and only step of its own change, before any backend work).
+The crate's 13 commits of history came across with `git subtree split`, so `git log` here
+still reaches the M2 scaffold. The argument, from the CI and the manifests rather than
+from the shape of the ecosystem:
 
 **The wasm gate is *not* the reason, and the widely-repeated version of that claim is
 wrong.** `ikigai-core`'s `ci.yml` does call the shared workflow with `features: "*"` and
@@ -101,19 +103,22 @@ The reasons that survive that check:
 - **The module recipe assumes a repo**: its own CI, its own conformance walk, its own
   release cadence, one session owning one tree.
 
-**What keeping it here would cost, stated fairly**, because the CI objection did not
-survive: a `[features]` split (`memory` default, `persistent` opt-in), roughly six
-minutes of CI on cache-miss builds, `libclang` in the toolchain expectations for anyone
-building the kernel with `--all-features`, and the lockstep coupling above. None of that
-is fatal. It is simply worse than a repo, and it is worse in the direction the ecosystem
-has already chosen twice.
+**What keeping it in the core workspace would have cost, stated fairly**, because the CI
+objection did not survive: a `[features]` split (`memory` default, `persistent` opt-in),
+roughly six minutes of CI on cache-miss builds, `libclang` in the toolchain expectations
+for anyone building the kernel with `--all-features`, and the lockstep coupling above.
+None of that is fatal. It is simply worse than a repo, and worse in the direction the
+ecosystem has already chosen twice.
 
-**Why not move it today:** the crate is `publish = false`, so the accident that started
-all of this cannot recur, and the urgency is gone. Relocating a placeholder buys nothing
-and pays the churn twice — this repo's `README.md` crate table and the walkthrough card
-in `tools/walkthrough/walkthrough.toml` both point at `crates/ikigai-store/src/lib.rs`,
-and `ikigai-tutorial` names the crate as well. Move it once, with the backend, when the
-move is carrying something.
+**Why it moved before the backend rather than with it.** #110 recommended moving it as
+the first step of the backend arc; Brian's call on 2026-09-13 was to move it first and
+separately — *"I don't mind yanking ikigai-store as a subcrate of core, but we should
+move it to a stand alone module to build on."* That is the better order for the reason
+the brief itself gave: a relocation is high-churn and low-risk, the backend is the
+opposite, and the two do not belong in one diff. What it costs is one extra round of
+churn on the references — `ikigai-core`'s README crate table and its walkthrough card
+(both removed in the companion core PR) and `ikigai-tutorial`, which names the crate in
+`books/ikigai/src/repositories.md` and is another repo's to change.
 
 ## How it composes (the design constraint that keeps this small)
 
@@ -191,5 +196,5 @@ same store runs natively, in the browser, or embedded.
 
 ## License
 
-Licensed under either of [MIT](../../LICENSE-MIT) or
-[Apache-2.0](../../LICENSE-APACHE) at your option.
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your
+option.

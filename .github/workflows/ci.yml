@@ -1,0 +1,18 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # never cancel main
+jobs:
+  ci:
+    uses: ikigai-rs/.github/.github/workflows/rust.yml@main
+    # `wasm-lib` preserves what this crate builds TODAY: the in-memory placeholder has a
+    # wasm face (Oxigraph's `js` feature is pulled in under `cfg(target_family = "wasm")`).
+    # ⚠ The durable backend this crate exists for does NOT build for wasm — RocksDB is
+    # native-linked — so the arc that adds it decides what this line becomes: a `features`
+    # set that lints the native backend, and either a wasm face restricted to the in-memory
+    # store or no wasm job at all. Do not delete it silently; whichever way it goes is a
+    # statement about who this crate serves.
+    with: { wasm-lib: true }
