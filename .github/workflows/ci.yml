@@ -8,11 +8,15 @@ concurrency:
 jobs:
   ci:
     uses: ikigai-rs/.github/.github/workflows/rust.yml@main
-    # `wasm-lib` preserves what this crate builds TODAY: the in-memory placeholder has a
-    # wasm face (Oxigraph's `js` feature is pulled in under `cfg(target_family = "wasm")`).
-    # ⚠ The durable backend this crate exists for does NOT build for wasm — RocksDB is
-    # native-linked — so the arc that adds it decides what this line becomes: a `features`
-    # set that lints the native backend, and either a wasm face restricted to the in-memory
-    # store or no wasm job at all. Do not delete it silently; whichever way it goes is a
-    # statement about who this crate serves.
-    with: { wasm-lib: true }
+    # `features: persistent` is NOT optional and must never be dropped. The durable
+    # backend lives behind `#[cfg(feature = "persistent")]`, and a cfg path inside a
+    # LIBRARY is not a target — so `ci-drift`'s `required-features` check cannot see its
+    # absence, `--all-targets` does not reach it, and without this line nothing lints or
+    # tests the entire reason this crate exists. Same family as constitution 9c: a gate
+    # that silently covers less than it looks like it does. It costs an `oxrocksdb-sys`
+    # build (~494 s of CPU) on a cache miss and is cached by `Swatinem/rust-cache`
+    # thereafter.
+    #
+    # `wasm-lib: true` keeps the in-memory face honest: it runs with DEFAULT features, so
+    # it lints exactly the half of this crate that has no RocksDB in it.
+    with: { features: persistent, wasm-lib: true }
