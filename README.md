@@ -4,10 +4,6 @@
 survives a process restart, opened from a path instead of rebuilt from its sources on
 every boot.
 
-> I think the original purpose was to have a store that was backed by a persistent
-> mechanism like the rocksdb implementation. Keep it and we'll migrate it to that.
-> — Brian, 2026-09-12
-
 Nothing else in the ecosystem does that, and the gap is load-bearing: every host that
 materializes an expensive graph recomputes it at startup. The reading room's books graph
 derives from a 4.3 MB Zotero export; materializing a whole relational database is on the
