@@ -18,8 +18,8 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # is how it would happen a third time:
 #   - 2026-08-08: "grow ikigai-sparql rather than publish ikigai-store" was decided in a
 #     brief and nowhere else, so the lockstep 0.1.70 sweep published the crate anyway on
-#     2026-09-12 — one version, zero downloads, an in-memory placeholder wearing the name
-#     of a persistent store. ⚠ 0.1.70 IS STILL ON CRATES.IO and should be YANKED.
+#     2026-09-12 — one version, an in-memory placeholder wearing the name of a persistent
+#     store. YANKED by Brian 2026-09-13, at 9 downloads.
 #   - 2026-09-12: the arc that noticed compared that placeholder against a finished
 #     `ikigai-sparql` and concluded "vestige, superseded", writing DEPRECATED into this
 #     manifest. Its findings about the CODE were all correct — they became the work list
@@ -38,7 +38,8 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # how this crate got published by accident), and because of PRECEDENT twice in that same
 # workspace (`ikigai-fs` #21, `ikigai-shacl` #52).
 #
-# ★ `publish = false` — the seven conditions #110 set for lifting it are now MET:
+# ★ PUBLISHABLE since 2026-09-13. `ikigai-core` #110 set seven conditions for lifting
+# `publish = false`; 0.2.0 meets all seven, 0.1.70 is yanked, and Brian lifted the guard:
 #   1. durable backend behind an explicit feature, path from the config home, loud on an
 #      unwritable path                                          → src/store.rs, src/config.rs
 #   2. a `Verb::Sink` that loads through the kernel (`load_turtle` is gone)  → src/endpoints.rs
@@ -47,10 +48,11 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 #   5. typed inputs and an `as` selector that refuses rather than substitutes
 #   6. an `ikigai-conformance` walk                                          → tests/conformance.rs
 #   7. a namespace this crate owns (`urn:iki:store:`, born migrated)
-# The line STAYS ON anyway, and deliberately: the last time it was absent this crate was
-# published by accident, and 0.1.70 is still unyanked. Lifting it is one line and it is
-# Brian's, together with the yank — not a satellite's, and not a sweep's.
-publish = false
+#
+# ⚠ The guard is off, so the thing it guarded against is possible again: this crate is now
+# reachable by any sweep that publishes what it finds. It is NOT in a lockstep workspace
+# any more (that is half of why it moved), so a release here is a deliberate act on one
+# crate — keep it that way. Publishing remains Brian's, always.
 # 0.2.0, not a patch onto 0.1.70: crates.io never re-uses a yanked version, and this code
 # has none of the shape the number 0.1.70 was attached to.
 version = "0.2.0"
