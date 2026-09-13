@@ -1,89 +1,59 @@
 [package]
 name = "ikigai-store"
-description = "The PERSISTENT RDF store for ikigai — UNFINISHED. What is here today is an in-memory placeholder; the durable, restart-surviving backend the crate is named for is not built yet."
-# ★ UNFINISHED, NOT DEPRECATED — and `publish = false` is the guard, not an obituary.
-#
-# This crate's PURPOSE, written here because it has never been written anywhere:
+description = "The persistent RDF store for ikigai: a dataset opened from a path and owned by one process, exposed as urn:iki:store:{query,info,update,load} with capability-gated reads and writes, and reads that are cacheable because nothing else can write."
+# ★ THE CRATE'S PURPOSE, written here because it once lived only in Brian's head and the
+# record went wrong twice for exactly that reason:
 #
 #   > I think the original purpose was to have a store that was backed by a persistent
 #   > mechanism like the rocksdb implementation. Keep it and we'll migrate it to that.
 #   >   — Brian, 2026-09-12
 #
-# So `ikigai-store` is the crate that OWNS DURABLE RDF: a dataset that survives a
-# process restart, opened from a path rather than rebuilt from source on every boot.
-# Nothing in the ecosystem does that today. `ikigai-sparql` deliberately does not: its
-# `space()` builds a dataset per query and drops it, and `space_with_store(Arc<Store>)`
-# takes a store the CALLER owns and never says where that store's bytes live. This
-# crate is meant to be the answer to "where do they live", and then to hand its
-# `Arc<Store>` to `space_with_store` so the query surface is not written twice.
+# `ikigai-store` OWNS DURABLE RDF: a dataset that survives a process restart, opened from
+# a path rather than rebuilt from source on every boot. `ikigai-sparql` deliberately does
+# not do this — its `space()` builds a dataset per query and drops it, and
+# `space_with_store(Arc<Store>)` takes a store the CALLER owns and never says where that
+# store's bytes live. This crate is the answer to "where do they live".
 #
-# ⚠ What is in `src/lib.rs` right now is a PLACEHOLDER for that store, not the store:
-# `Store::new()` (in-memory), a `load_turtle` side door, and one un-gated `Source`. It
-# has stood there since the M2 scaffold (`47ea17e`, "Add M2 SPARQL endpoint: in-memory
-# Oxigraph store") and nothing has ever consumed it.
-#
-# ★ HOW THE RECORD WENT WRONG, twice, the same way both times:
+# ★ HOW THE RECORD WENT WRONG, twice, the same way both times — kept because deleting it
+# is how it would happen a third time:
 #   - 2026-08-08: "grow ikigai-sparql rather than publish ikigai-store" was decided in a
-#     brief and nowhere else, so the lockstep 0.1.70 sweep published this crate anyway
-#     on 2026-09-12 — one version, zero downloads. Brian should YANK 0.1.70: it is an
-#     in-memory placeholder wearing the name of a persistent store.
-#   - 2026-09-12: the arc that noticed that (core #109) compared this placeholder
-#     against a finished `ikigai-sparql` and concluded "vestige, superseded", writing
-#     DEPRECATED into this manifest, the crate docs and the README. Its findings about
-#     the CODE were all correct (they are the work list below). Its conclusion was
-#     wrong, because the crate's purpose lived only in Brian's head — and comparing a
-#     placeholder to a finished crate can only ever conclude redundancy.
-# Both failures are one failure: a fact nobody wrote in the repo does not survive
-# contact with a process. That is what these lines are for.
+#     brief and nowhere else, so the lockstep 0.1.70 sweep published the crate anyway on
+#     2026-09-12 — one version, zero downloads, an in-memory placeholder wearing the name
+#     of a persistent store. ⚠ 0.1.70 IS STILL ON CRATES.IO and should be YANKED.
+#   - 2026-09-12: the arc that noticed compared that placeholder against a finished
+#     `ikigai-sparql` and concluded "vestige, superseded", writing DEPRECATED into this
+#     manifest. Its findings about the CODE were all correct — they became the work list
+#     this version completes. Its conclusion was wrong, because comparing a placeholder
+#     to a finished crate can only conclude redundancy.
+# Both failures are one failure: a fact nobody wrote in the repo does not survive contact
+# with a process.
 #
-# ★ WHAT WOULD MAKE THIS PUBLISHABLE AGAIN — the condition, so the guard can be lifted
-# by evidence rather than by mood. Every item is something core #109 found MISSING from
-# the placeholder and is therefore a requirement, not a wish:
-#   1. A durable backend: `Store::open(path)` behind an explicit feature, with the
-#      config home (not an env var) naming the path, and honest behaviour when the
-#      path is unwritable (fail loud).
-#   2. A `Verb::Sink` that loads through the kernel — `load_turtle` mutates the store
-#      out of band, where no capability check and no thread cut can see it.
-#   3. Declared = enforced capabilities on BOTH directions. Today a
-#      `SELECT * { ?s ?p ?o }` is answered for any attenuated caller with no `requires`
-#      at all.
-#   4. A golden thread the writer cuts, and reads that may then be `.cacheable()` —
-#      the coverage argument in `ikigai-sparql`'s `UPDATE_THREAD` docs turns in this
-#      crate's favour exactly when the store OWNS its data instead of sharing a raw
-#      handle.
-#   5. Typed inputs (`ArgSpec::class`) and an `as` selector. The placeholder declares
-#      two outputs and gives no caller any way to choose between them, and its `query`
-#      arg has no class — so an `ikigai-conformance` walk of it probes NOTHING.
-#   6. An `ikigai-conformance` test, from day one.
-#   7. A namespace this crate owns. The placeholder's tests and README bind
-#      `urn:sparql:default`, inside a namespace `ikigai-sparql` owns: a host binding
-#      both would offer an agent two indistinguishable query actions over two different
-#      stores, and the one declaring no capability is the one that answers an
-#      unrestricted query.
+# ★ WHERE THIS LIVES — its own repo since 2026-09-13 (decided in `ikigai-core` #110,
+# executed as #111), with the crate's 13 commits of history carried across by
+# `git subtree split`. NOT because of wasm: `wasm-check` runs with DEFAULT features and
+# Oxigraph target-gates `oxrocksdb-sys` off wasm regardless (measured — a crate with
+# RocksDB on `cargo check`s clean for wasm32 in 10 s). Because of NATIVE COMPILE COST
+# charged to the foundation (`oxrocksdb-sys` = 494 s of CPU on a cache miss, under
+# `cargo check`, because it is a build script), because of LOCKSTEP VERSIONING (which is
+# how this crate got published by accident), and because of PRECEDENT twice in that same
+# workspace (`ikigai-fs` #21, `ikigai-shacl` #52).
 #
-# ★ WHERE THIS LIVES — decided in ikigai-core #110, executed 2026-09-13. This crate was
-# a member of the `ikigai-core` workspace from the M2 scaffold until that date; it now
-# has its own repo, its 13 commits of history carried across by `git subtree split`.
-# The reasons, recorded HERE because this is where the next person will ask:
-#   - NOT wasm. The claim that core's `wasm-check` plus `features: "*"` forced RocksDB
-#     out is FALSE and should stop being repeated: `wasm-check` runs with DEFAULT
-#     features, and Oxigraph target-gates `oxrocksdb-sys` off wasm regardless. Measured
-#     2026-09-12: a crate with RocksDB ON checks clean for wasm32 in 10 s, no sys crate.
-#   - Native compile cost charged to the foundation. `oxrocksdb-sys` measured at 494 s
-#     of CPU on a cache miss, and it is a BUILD SCRIPT, so even `cargo check` pays in
-#     full — on the most-frequently-built workspace in the ecosystem, one that describes
-#     itself as dependency-light. Plus `libclang` in its toolchain expectations, plus the
-#     edge runbook's OOM-killed compiler.
-#   - Lockstep versioning — which is HOW THIS CRATE GOT PUBLISHED BY ACCIDENT. Every
-#     store release would have been a kernel release, and vice versa.
-#   - Precedent twice in that same workspace: `ikigai-fs` (#21), `ikigai-shacl` (#52).
+# ★ `publish = false` — the seven conditions #110 set for lifting it are now MET:
+#   1. durable backend behind an explicit feature, path from the config home, loud on an
+#      unwritable path                                          → src/store.rs, src/config.rs
+#   2. a `Verb::Sink` that loads through the kernel (`load_turtle` is gone)  → src/endpoints.rs
+#   3. declared = enforced capabilities on BOTH directions, ablation-tested  → tests/endpoints.rs
+#   4. a golden thread the writer cuts, and reads cacheable under it        → tests/endpoints.rs
+#   5. typed inputs and an `as` selector that refuses rather than substitutes
+#   6. an `ikigai-conformance` walk                                          → tests/conformance.rs
+#   7. a namespace this crate owns (`urn:iki:store:`, born migrated)
+# The line STAYS ON anyway, and deliberately: the last time it was absent this crate was
+# published by accident, and 0.1.70 is still unyanked. Lifting it is one line and it is
+# Brian's, together with the yank — not a satellite's, and not a sweep's.
 publish = false
-# ⚠ 0.1.70 IS ON CRATES.IO and should be yanked (see above): it is this in-memory
-# placeholder wearing the name of a persistent store. The number stays because it is
-# honestly what this code IS. crates.io never re-uses a yanked version, and the store
-# that lifts `publish = false` will not have this shape — so the first release out of
-# this repo should be 0.2.0, not a patch onto a number that meant something else.
-version = "0.1.70"
+# 0.2.0, not a patch onto 0.1.70: crates.io never re-uses a yanked version, and this code
+# has none of the shape the number 0.1.70 was attached to.
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -92,26 +62,44 @@ homepage = "https://github.com/ikigai-rs/ikigai-store"
 keywords = ["ikigai", "roc", "rdf", "sparql", "store"]
 categories = ["database-implementations"]
 
+[features]
+# In-memory by default, exactly the trade `ikigai-cli` makes for `quic` and `web`: the
+# heavy backend is opt-in so the wasm face and cheap tests survive. ⚠ `ci.yml` MUST pass
+# `features: persistent` — a `cfg(feature)` path inside a library is not a TARGET, so
+# `ci-drift`'s `required-features` check cannot see an omission here and nothing would
+# lint or test the durable path.
+default = []
+# ⚠ Cargo feature unification is global and additive, and `rocksdb` is a DEFAULT feature
+# of oxigraph that the dependency below turns off. Enabling this anywhere in a host's
+# graph gives EVERY oxigraph consumer in that build the RocksDB backend, `ikigai-sparql`'s
+# copy included. That is what makes the `space_with_store` composition work (one `Store`
+# type either way) and it means "off by default" is a property of the build, not of this
+# crate.
+persistent = ["oxigraph/rocksdb"]
+
 [dependencies]
 async-trait = "0.1"
-# `0.1` is the TRUE minimum here, not an un-audited family pin (2026-09-06): every
-# core item this crate names — `Endpoint`/`Invocation::inline_str`, `Representation`,
-# `ReprType`, `Error::Endpoint`, `Description`/`ArgSpec` and their builders — was
-# already public before 0.1.0. Verified two ways: `git log -S` puts every
-# introducing commit in the 0.0.0 pre-release era, and a standalone copy of this
-# crate's lib compiles clean against `ikigai-core = "=0.1.0"`. Re-audit whenever a
-# new core item is used: a pin BELOW the API you call stays green under fmt, clippy,
-# test and CI (the path dep satisfies the call) and fails only at
-# `cargo publish --dry-run`. That is what happened to `ikigai-vocab` in 0.1.66 — and
-# since the move out of the core workspace (2026-09-13) it can no longer happen here,
-# because this is a REGISTRY dep: too low a pin now fails at build time. That is the one
-# good thing about losing the path dep.
-# ⚠ `"0.1"` is a CEILING as well as a floor — `>=0.1.0, <0.2.0`. When core reaches 0.2
-# this line must move, or this crate silently freezes out of every release after it.
-ikigai-core = "0.1"
-# In-memory store only: default-features=false drops the RocksDB (C++) backend,
-# whose `oxrocksdb-sys` is also gated out of wasm by Oxigraph itself.
+# 0.1.57 is the TRUE minimum and it is `data_home` (#87) that sets it: `config.rs`
+# defaults the dataset directory under the data home, and that function exists nowhere
+# earlier. The next floors down, for whoever re-audits: `config_home`/`layered_paths_in`
+# are 0.1.56 (#86), `Error::Unavailable` — the typed, transient refusal a held lock
+# returns — is 0.1.45 (#70), and everything else named here (`Endpoint`, `Invocation`,
+# `Representation`, `ArgSpec::{class,one_of,default_value}`, `Description::requires`)
+# predates 0.1.0.
+# ⚠ `"0.1.57"` is a CEILING as well as a floor — `>=0.1.57, <0.2.0`. When core reaches
+# 0.2 this line must move, or this crate silently freezes out of every release after it.
+ikigai-core = "0.1.57"
+# In-memory store by default; `persistent` turns the RocksDB backend back on. Oxigraph
+# itself gates `oxrocksdb-sys` out of wasm by target, so the feature pulls in nothing
+# there — and this crate's durable constructors are gated off wasm too, so `persistent`
+# on wasm compiles to exactly the default build. That is deliberate: a wasm-only fallback
+# branch would be code no CI job can reach (checked: `cargo clippy --lib --target
+# wasm32-unknown-unknown --features persistent` is clean and adds nothing).
 oxigraph = { version = "0.5", default-features = false }
+# The layered `store.toml`. `deny_unknown_fields` on the layer type is what makes a
+# misspelled key loud instead of ignored. Both crates are pure Rust and wasm-clean.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 # On wasm, Oxigraph needs its `js` feature (getrandom wasm backend) to build.
 [target.'cfg(target_family = "wasm")'.dependencies]
@@ -119,8 +107,10 @@ oxigraph = { version = "0.5", default-features = false, features = ["js"] }
 
 [dev-dependencies]
 futures = "0.3"
-# Tests only, and `0.1` is likewise the audited minimum: the single item used is
-# `TurtleRenderer`, public since before 0.1.0. Note the resolution consequence —
-# vocab 0.1.66 now requires core 0.1.66, so the TEST graph is pulled to that even
-# though the lib above genuinely builds on 0.1.0.
+# The module recipe as one test, from day one — condition 6. 0.2.0 is the published
+# version and the one whose DECLARATIONS check exists.
+ikigai-conformance = "0.2"
+# `TurtleRenderer` for the `Meta` face the kernel routes. ⚠ Resolution consequence worth
+# knowing: vocab 0.1.70 requires core 0.1.66, so the TEST graph is pulled to that even
+# though the library above genuinely builds on 0.1.57.
 ikigai-vocab = "0.1"
