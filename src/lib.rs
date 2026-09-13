@@ -1,25 +1,49 @@
-//! **DEPRECATED (2026-09-12) — use [`ikigai-sparql`] instead.**
+//! **The persistent RDF store — UNFINISHED. What is in this file is a placeholder.**
 //!
-//! `ikigai_sparql::space_with_store(Arc<Store>)` supersedes this crate's store
-//! handle, and `urn:sparql:update` — a `Verb::Sink` applying SPARQL 1.1 UPDATE in
-//! one transaction, gated on a declared `urn:cap:sparql:update` and cutting a
-//! golden thread the kernel bumps on success — supersedes [`SparqlEndpoint::load_turtle`],
-//! which mutates the store out of band where no capability check and no thread cut
-//! can see it. The four `urn:sparql:{select,ask,describe,construct}` forms supersede
-//! the single `Source` below, with typed inputs and an `as` selector this crate's two
-//! declared outputs have no way to choose between. See this crate's README for the
-//! item-by-item argument and the removal path.
+//! # What this crate is for
 //!
-//! No `#[deprecated]` attribute: the crate is `publish = false` and its one published
-//! version (0.1.70, zero downloads) does not carry the attribute either, so it would
-//! warn nobody downstream while forcing an `#[allow(deprecated)]` over this crate's own
-//! tests — an opt-out that would silently cover whatever those tests grow next.
+//! `ikigai-store` is meant to own **durable RDF**: a dataset that survives a process
+//! restart, opened from a path rather than rebuilt from its sources on every boot.
+//!
+//! > I think the original purpose was to have a store that was backed by a persistent
+//! > mechanism like the rocksdb implementation. Keep it and we'll migrate it to that.
+//! >   — Brian, 2026-09-12
+//!
+//! Nothing in the ecosystem does that today, and the gap is load-bearing: every host
+//! that materializes an expensive graph recomputes it at startup. [`ikigai-sparql`]
+//! deliberately does not fill it — its `space()` builds a dataset per query and drops
+//! it, and `space_with_store(Arc<Store>)` takes a store the **caller** owns without
+//! ever saying where that store's bytes live. This crate is meant to be the answer to
+//! *where they live*, and then to hand its `Arc<Store>` to `space_with_store` so the
+//! query surface is written once, in the crate that already has four typed forms, an
+//! `as` selector and a conformance walk.
+//!
+//! # What is actually here (read this before believing the paragraph above)
+//!
+//! [`SparqlEndpoint`] is the **M2 scaffold** — `Store::new()` (in-memory), a
+//! [`load_turtle`](SparqlEndpoint::load_turtle) side door, and one un-gated `Source`.
+//! It has stood unchanged and unconsumed since commit `47ea17e`. It is a stand-in for
+//! the store described above, and every difference between it and a finished module is
+//! the work list: no durable backend, no `Sink`, no `requires` on a query that reads
+//! everything, no golden thread, untyped inputs, two declared outputs a caller cannot
+//! choose between, and no `ikigai-conformance` test. The manifest states the whole list
+//! as the condition for lifting `publish = false`.
+//!
+//! # A correction to the record
+//!
+//! Until 2026-09-12 these docs said **DEPRECATED — superseded by `ikigai-sparql`**. The
+//! findings behind that were accurate; the conclusion was not. The crate's purpose had
+//! never been written down anywhere, so an arc compared a placeholder against a finished
+//! crate — which can only conclude redundancy. The purpose is written down now, here and
+//! in the manifest, which is the only form in which it survives the next process that
+//! looks at this directory. The published 0.1.70 (in-memory, zero downloads) should be
+//! yanked; it wears the name of a store it is not.
 //!
 //! [`ikigai-sparql`]: https://crates.io/crates/ikigai-sparql
 //!
 //! ---
 //!
-//! RDF/SPARQL endpoint backed by Oxigraph (in-memory).
+//! # The placeholder, as it stands
 //!
 //! [`SparqlEndpoint`] wraps an in-memory Oxigraph store and answers `Source`
 //! requests by evaluating the SPARQL query supplied in the `query` argument,
@@ -32,6 +56,11 @@
 //! evaluation needs no async runtime, and the crate stays WASM-able (it depends
 //! on Oxigraph with `default-features = false`, i.e. no RocksDB; the `js`
 //! feature is added only for the wasm target).
+//!
+//! ⚠ That last sentence is about the placeholder, not about the crate's future.
+//! Oxigraph gates `oxrocksdb-sys` out of wasm by target, so enabling its `rocksdb`
+//! feature does not break a wasm build — the durable backend costs a *native* compile,
+//! not the wasm face. See the README's "Where this should live".
 
 use std::sync::Arc;
 

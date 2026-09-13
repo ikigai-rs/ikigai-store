@@ -1,46 +1,145 @@
 # ikigai-store
 
-> ## ⚠ DEPRECATED — do not adopt this crate
+> ## ⚠ UNFINISHED — not deprecated, and not what it says on the tin *yet*
 >
-> **Use [`ikigai-sparql`](https://crates.io/crates/ikigai-sparql) instead**, whose
-> `space_with_store` and `urn:sparql:update` supersede everything here.
+> **`ikigai-store` is the persistent RDF store.** Its job is durable RDF: a dataset that
+> survives a process restart, opened from a path instead of rebuilt from its sources on
+> every boot.
 >
-> This crate shipped inside the `ikigai-core` workspace in June 2026, was never
-> consumed by anything, and was published for the first and only time on
-> 2026-09-12 (0.1.70) by a lockstep workspace release — against a decision made
-> five weeks earlier to grow `ikigai-sparql` rather than publish this. It carries
-> `publish = false` now; `crates/ikigai-store` is removed from the workspace once
-> 0.1.70 is yanked.
+> > I think the original purpose was to have a store that was backed by a persistent
+> > mechanism like the rocksdb implementation. Keep it and we'll migrate it to that.
+> >   — Brian, 2026-09-12
 >
-> **What replaces it**, in `ikigai-sparql` 0.1.9:
+> **That store is not built.** What is in `src/lib.rs` is the June 2026 M2 scaffold
+> standing in for it — an in-memory Oxigraph store behind one un-gated `Source` — and
+> nothing has ever consumed it. The crate carries `publish = false` until it is the thing
+> it is named for; the manifest states the exact conditions for lifting that.
 >
-> | this crate | the successor |
-> | --- | --- |
-> | `SparqlEndpoint::new()` holds an `Arc<Store>` | `space_with_store(Arc<Store>)` — the store is *caller-owned*, and `pub use oxigraph::store::Store` gives every host one canonical type to unify on |
-> | `load_turtle(&str)` — a Rust-level side door | `urn:sparql:update`, a `Verb::Sink`: SPARQL 1.1 UPDATE in one transaction, so a *resource* consumer can load data. `INSERT DATA { GRAPH <g> { … } }` loads a named graph; `DROP GRAPH <g>` drops one |
-> | no `requires` — `SELECT * { ?s ?p ?o }` to any attenuated caller | `CAP_UPDATE` (`urn:cap:sparql:update`) declared on the Sink, and therefore enforced by the kernel before `invoke` |
-> | no golden thread | `UPDATE_THREAD`, cut by the kernel's automatic target-named cut on a successful sink |
-> | one `Source` on `urn:sparql:default`, `query` untyped, two declared outputs and no way to ask for either | `urn:sparql:{select,ask,describe,construct}`, every input carrying an `xsd` class, `as` with `one_of` and a default, outputs declared per form, and a refusal rather than a substitution on an unknown target |
->
-> The only surface this crate has that the successor does not is `Store::new()`,
-> `Store::load_from_slice(RdfFormat::Turtle, …)` and a `&Store` borrow — three
-> lines of Oxigraph. Against that it binds `urn:sparql:default`, an IRI inside a
-> namespace `ikigai-sparql` owns, under a *different* contract: a host binding
-> both offers an agent two SPARQL query actions over two different stores, with
-> nothing in the action manifold to tell them apart, and the one that declares no
-> capability is the one that reads everything.
->
-> An `ikigai-conformance` 0.2.0 walk of the published 0.1.70 reports two findings
-> and, with no fixture, **probes nothing at all** — the endpoint cannot be reached
-> from its own declarations, because `query` has no `class` for the walk to
-> synthesize a value from. With a fixture supplying a query it serves
-> `application/sparql-results+json` when asked for its own declared
-> `application/n-triples` face: a declared output no caller can select.
->
-> Everything below this line describes the crate as it was, and is retained so the
-> published 0.1.70 has honest documentation until it is yanked.
+> **Correction to the record (2026-09-12).** This README previously read *DEPRECATED —
+> superseded by `ikigai-sparql`*. The findings behind that verdict were accurate and are
+> reproduced below as the work list; the verdict was not. The crate's purpose had never
+> been written down anywhere, so an arc compared a placeholder against a finished crate,
+> and that comparison can only ever conclude redundancy. The purpose is written down now
+> — here and in `Cargo.toml` — because a fact that lives only in someone's head does not
+> survive contact with a process. (It has now failed that way twice on this one crate:
+> the 2026-08-08 decision not to publish it lived only in a brief, and the lockstep sweep
+> published **0.1.70** anyway. That version is in-memory, has zero downloads, and should
+> be **yanked**.)
+
+## Why `ikigai-sparql` does not already do this
+
+It is the right question, and the answer is specific: `ikigai-sparql` is a *query*
+module, and both of its spaces are explicit about not owning storage.
+
+| | `ikigai-sparql` | what is missing |
+| --- | --- | --- |
+| `space()` | builds a dataset per query from the `graph=` list and **drops it when the call returns** | nothing persists, by design — `urn:sparql:update` is deliberately left unbound there because a write would vanish microseconds later |
+| `space_with_store(Arc<Store>)` | queries and updates a store the **caller** owns | it never says where the caller's store comes from, or where its bytes live. Today every caller passes `Store::new()` — memory |
+
+So "hand a store to `space_with_store`" is not an alternative to this crate; it is this
+crate's *output*. The durable dataset is the missing half, and the query surface must
+not be written a second time — see "How it composes" below.
+
+## The work list (what a finished `ikigai-store` needs)
+
+Every item is something core #109 found missing from the placeholder:
+
+1. **A durable backend.** `Store::open(path)` behind an explicit feature, the path named
+   through the config home (never an env var), and a loud failure when it is unwritable.
+2. **A `Verb::Sink`.** `load_turtle` is a Rust-level side door: it mutates the store
+   where no capability check and no thread cut can see it.
+3. **Declared = enforced capabilities**, both directions. Today a `SELECT * { ?s ?p ?o }`
+   is answered for any attenuated caller, with no `requires` at all.
+4. **A golden thread the writer cuts**, and reads that may then be `.cacheable()`.
+5. **Typed inputs and an `as` selector.** The placeholder declares two output types and
+   gives no caller a way to select either; `query` has no `class`, so an
+   `ikigai-conformance` walk of it synthesizes no value and **probes nothing**.
+6. **An `ikigai-conformance` test from day one.**
+7. **A namespace this crate owns.** The placeholder's tests and the example below bind
+   `urn:sparql:default` — inside a namespace `ikigai-sparql` owns. A host binding both
+   offers an agent two indistinguishable query actions over two different stores, and
+   the one declaring no capability is the one that answers an unrestricted query.
+
+## Where this should live
+
+**Recommendation: its own repo, like every other module — but moved as the first step of
+the arc that builds the backend, not before it.** The argument, from the CI and the
+manifests rather than from the shape of the ecosystem:
+
+**The wasm gate is *not* the reason, and the widely-repeated version of that claim is
+wrong.** `ikigai-core`'s `ci.yml` does call the shared workflow with `features: "*"` and
+`wasm-check: true` — but `wasm-check` runs `cargo check --workspace --target
+wasm32-unknown-unknown` with **default features**, so `"*"` never reaches it. And even if
+it did, Oxigraph declares `oxrocksdb-sys` under `[target.'cfg(not(target_family =
+"wasm"))'.dependencies]` and gates `Store::open` on `all(not(target_family = "wasm"),
+feature = "rocksdb")`. Measured 2026-09-12: a crate depending on `oxigraph = "0.5"` with
+**default features (RocksDB on)** `cargo check`s clean for `wasm32-unknown-unknown` in
+10 s, pulling no sys crate at all. A `persistent` feature could sit in this workspace and
+CI would stay green.
+
+The reasons that survive that check:
+
+- **Compile cost, charged to the foundation.** `--all-features` is a *native* job, and it
+  would build RocksDB from C++ source on every cache miss. Measured on the same probe:
+  **494 s of CPU** (44 s wall at 12× parallelism) for `oxrocksdb-sys` alone — under
+  `cargo check`, because it is a build script, so even the cheapest gate pays in full. A
+  two-core CI runner pays that as wall clock. `ikigai-core` is the most-frequently-built
+  workspace in the ecosystem and describes itself as "the core, dependency-light layer".
+  Adding `clang`/`libclang` as a build prerequisite of *that* workspace taxes everyone,
+  and the edge runbook already records the small-VPS failure mode: the compiler
+  OOM-killed.
+- **Lockstep versioning, which is how this crate got published by accident.** Workspace
+  members share `version.workspace`, so every `ikigai-store` release would be an
+  `ikigai-core` release and vice versa. A store that grows a C++ dependency and a
+  storage-format compatibility story does not want the kernel's release cadence, and the
+  kernel does not want the store's.
+- **Precedent inside this exact workspace, twice.** `ikigai-fs` (#21) and `ikigai-shacl`
+  (#52) were both core-workspace crates removed in favour of their own repos.
+  `ikigai-shacl` is the near-exact analogy: a module whose backend is native-only (rudof
+  gates its validator off wasm) with a separate browser story. `ikigai-store` is the last
+  module crate left in a workspace that is otherwise kernel + vocabulary.
+- **The module recipe assumes a repo**: its own CI, its own conformance walk, its own
+  release cadence, one session owning one tree.
+
+**What keeping it here would cost, stated fairly**, because the CI objection did not
+survive: a `[features]` split (`memory` default, `persistent` opt-in), roughly six
+minutes of CI on cache-miss builds, `libclang` in the toolchain expectations for anyone
+building the kernel with `--all-features`, and the lockstep coupling above. None of that
+is fatal. It is simply worse than a repo, and it is worse in the direction the ecosystem
+has already chosen twice.
+
+**Why not move it today:** the crate is `publish = false`, so the accident that started
+all of this cannot recur, and the urgency is gone. Relocating a placeholder buys nothing
+and pays the churn twice — this repo's `README.md` crate table and the walkthrough card
+in `tools/walkthrough/walkthrough.toml` both point at `crates/ikigai-store/src/lib.rs`,
+and `ikigai-tutorial` names the crate as well. Move it once, with the backend, when the
+move is carrying something.
+
+## How it composes (the design constraint that keeps this small)
+
+A persistent `ikigai-store` **must not grow a second query surface.** `ikigai-sparql`
+already has four typed forms, an `as` selector, a refusal (not a substitution) on an
+unknown target, and a conformance walk. `Store` is one type whether it was opened from a
+path or created in memory — `Store::open` is purely additive behind a feature — so the
+composition is:
+
+```text
+ikigai-store  ->  opens the durable dataset, owns writes, cuts the thread
+                  hands the same Arc<Store> to
+ikigai-sparql ->  space_with_store(store)  ->  urn:sparql:{select,ask,describe,construct}
+```
+
+That may be the whole design. Test it before writing an endpoint that duplicates it.
+
+⚠ One consequence to know before enabling the feature: Cargo unifies features across the
+graph, and Oxigraph's `rocksdb` is a **default** feature. The moment any crate in a host
+turns it on, every other Oxigraph consumer in that build gets it too. Additive, but it is
+why the placeholder's `default-features = false` never protected anything it did not also
+have to protect elsewhere.
 
 ---
+
+Everything below describes the placeholder as it stands today.
 
 An RDF/SPARQL **store endpoint** for the
 [ikigai-core](https://crates.io/crates/ikigai-core) resolution kernel, backed by

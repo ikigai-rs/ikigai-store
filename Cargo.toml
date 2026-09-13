@@ -1,38 +1,70 @@
 [package]
 name = "ikigai-store"
-description = "DEPRECATED - superseded by ikigai-sparql's space_with_store + urn:sparql:update."
-# ★ DEPRECATED 2026-09-12, and NOT PUBLISHED AGAIN.
+description = "The PERSISTENT RDF store for ikigai — UNFINISHED. What is here today is an in-memory placeholder; the durable, restart-surviving backend the crate is named for is not built yet."
+# ★ UNFINISHED, NOT DEPRECATED — and `publish = false` is the guard, not an obituary.
 #
-# `publish = false` is the machine-checkable half of a decision that was already
-# made in prose and then quietly undone. The record (2026-08-08, in
-# `ikigai-devtools/claude/briefs/ikigai-linkeddata-shared-store.md`) reads: "grow
-# ikigai-sparql rather than publish ikigai-store". That happened —
-# `ikigai_sparql::space_with_store` shipped, and with it `urn:sparql:update`. But
-# nothing in this manifest said so, so the lockstep 0.1.70 sweep published this
-# crate anyway on 2026-09-12: one version, zero downloads, zero consumers, and a
-# standing decision contradicted by a release. A decision that lives only in a
-# brief is a memory, and memory is what failed. This line is not.
+# This crate's PURPOSE, written here because it has never been written anywhere:
 #
-# What supersedes it, item for item (`ikigai-sparql` 0.1.9):
-#   holding a dataset  -> `space_with_store(Arc<Store>)`, caller-owned, with
-#                         `pub use oxigraph::store::Store` so hosts name ONE type
-#   putting triples in -> `urn:sparql:update`, a `Verb::Sink` applying SPARQL 1.1
-#                         UPDATE in one transaction (`INSERT DATA { GRAPH <g> … }`
-#                         loads a named graph, `DROP GRAPH <g>` drops one)
-#   authority          -> `CAP_UPDATE` ("urn:cap:sparql:update"), declared and
-#                         therefore enforced, with an ablation test
-#   golden thread      -> `UPDATE_THREAD`, cut by the kernel's automatic
-#                         target-named cut on a successful sink
-#   querying           -> `urn:sparql:{select,ask,describe,construct}`, typed
-#                         inputs, `as` with `one_of` + a default, per-form outputs
-# What remains here that is not there: `Store::new()`, `load_from_slice(Turtle, …)`
-# and `&Store` — three lines of oxigraph, behind an endpoint that binds
-# `urn:sparql:default` inside a namespace another crate owns, with no `requires`
-# on a `SELECT * { ?s ?p ?o }`.
+#   > I think the original purpose was to have a store that was backed by a persistent
+#   > mechanism like the rocksdb implementation. Keep it and we'll migrate it to that.
+#   >   — Brian, 2026-09-12
 #
-# Removal from the workspace waits on `cargo yank --version 0.1.70 ikigai-store`,
-# so the published crate's `repository` link keeps pointing at real source until
-# then. See this crate's README for the full argument.
+# So `ikigai-store` is the crate that OWNS DURABLE RDF: a dataset that survives a
+# process restart, opened from a path rather than rebuilt from source on every boot.
+# Nothing in the ecosystem does that today. `ikigai-sparql` deliberately does not: its
+# `space()` builds a dataset per query and drops it, and `space_with_store(Arc<Store>)`
+# takes a store the CALLER owns and never says where that store's bytes live. This
+# crate is meant to be the answer to "where do they live", and then to hand its
+# `Arc<Store>` to `space_with_store` so the query surface is not written twice.
+#
+# ⚠ What is in `src/lib.rs` right now is a PLACEHOLDER for that store, not the store:
+# `Store::new()` (in-memory), a `load_turtle` side door, and one un-gated `Source`. It
+# has stood there since the M2 scaffold (`47ea17e`, "Add M2 SPARQL endpoint: in-memory
+# Oxigraph store") and nothing has ever consumed it.
+#
+# ★ HOW THE RECORD WENT WRONG, twice, the same way both times:
+#   - 2026-08-08: "grow ikigai-sparql rather than publish ikigai-store" was decided in a
+#     brief and nowhere else, so the lockstep 0.1.70 sweep published this crate anyway
+#     on 2026-09-12 — one version, zero downloads. Brian should YANK 0.1.70: it is an
+#     in-memory placeholder wearing the name of a persistent store.
+#   - 2026-09-12: the arc that noticed that (core #109) compared this placeholder
+#     against a finished `ikigai-sparql` and concluded "vestige, superseded", writing
+#     DEPRECATED into this manifest, the crate docs and the README. Its findings about
+#     the CODE were all correct (they are the work list below). Its conclusion was
+#     wrong, because the crate's purpose lived only in Brian's head — and comparing a
+#     placeholder to a finished crate can only ever conclude redundancy.
+# Both failures are one failure: a fact nobody wrote in the repo does not survive
+# contact with a process. That is what these lines are for.
+#
+# ★ WHAT WOULD MAKE THIS PUBLISHABLE AGAIN — the condition, so the guard can be lifted
+# by evidence rather than by mood. Every item is something core #109 found MISSING from
+# the placeholder and is therefore a requirement, not a wish:
+#   1. A durable backend: `Store::open(path)` behind an explicit feature, with the
+#      config home (not an env var) naming the path, and honest behaviour when the
+#      path is unwritable (fail loud).
+#   2. A `Verb::Sink` that loads through the kernel — `load_turtle` mutates the store
+#      out of band, where no capability check and no thread cut can see it.
+#   3. Declared = enforced capabilities on BOTH directions. Today a
+#      `SELECT * { ?s ?p ?o }` is answered for any attenuated caller with no `requires`
+#      at all.
+#   4. A golden thread the writer cuts, and reads that may then be `.cacheable()` —
+#      the coverage argument in `ikigai-sparql`'s `UPDATE_THREAD` docs turns in this
+#      crate's favour exactly when the store OWNS its data instead of sharing a raw
+#      handle.
+#   5. Typed inputs (`ArgSpec::class`) and an `as` selector. The placeholder declares
+#      two outputs and gives no caller any way to choose between them, and its `query`
+#      arg has no class — so an `ikigai-conformance` walk of it probes NOTHING.
+#   6. An `ikigai-conformance` test, from day one.
+#   7. A namespace this crate owns. The placeholder's tests and README bind
+#      `urn:sparql:default`, inside a namespace `ikigai-sparql` owns: a host binding
+#      both would offer an agent two indistinguishable query actions over two different
+#      stores, and the one declaring no capability is the one that answers an
+#      unrestricted query.
+#
+# ⚠ And the decision that comes BEFORE all of that: a RocksDB-backed store probably
+# does not belong in this workspace at all — see this crate's README, "Where this
+# should live". `ikigai-fs` (#21) and `ikigai-shacl` (#52) both left the core
+# workspace for their own repos; this is the last module crate in it.
 publish = false
 version.workspace = true
 edition.workspace = true
