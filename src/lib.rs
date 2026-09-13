@@ -82,6 +82,14 @@
 //! owned store into a shared one later. The choice is made at the call site, on the line
 //! where it is paid for.
 //!
+//! # Cache ejection
+//!
+//! `ikigai-core`'s `cache-ejection.md` stops because there is nowhere durable to put an
+//! ejected cache. The bundle is a **file** a second instance imports into its own store
+//! — not a shared store, which the one-writer rule forbids, and not a read-only opener,
+//! which is frozen. `docs/design/cache-bundle.md` records what that asks of this crate;
+//! nothing here exports or imports yet, and deliberately so.
+//!
 //! # Features
 //!
 //! | feature | what it adds | cost |

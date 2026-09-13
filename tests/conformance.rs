@@ -1,4 +1,4 @@
-//! The module recipe as one test: `ikigai-conformance` walks the four resources
+//! The module recipe as one test: `ikigai-conformance` walks the seven resources
 //! [`ikigai_store::space`] binds and reports every violation at once.
 //!
 //! # The fixture is a store, and the walk WRITES to it

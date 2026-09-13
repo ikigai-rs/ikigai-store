@@ -1,4 +1,4 @@
-//! The four resources this crate binds, under the namespace it owns.
+//! The seven resources this crate binds, under the namespace it owns.
 //!
 //! ```text
 //! urn:iki:store:select     Source  SPARQL SELECT              urn:cap:store:read
@@ -114,7 +114,7 @@ const LOAD_FORMATS: [&str; 5] = [
     "application/rdf+xml",
 ];
 
-/// Bind this store's four resources into a space.
+/// Bind this store's seven resources into a space.
 ///
 /// The store is moved in: this space and the endpoints in it are the only holders of the
 /// dataset unless the caller took a handle at construction (see

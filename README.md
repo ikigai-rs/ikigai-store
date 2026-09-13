@@ -15,7 +15,9 @@ roadmap. A store that survives a restart is the difference between those being v
 being a warm-up cost.
 
 ```rust
+use ikigai_core::Kernel;
 use ikigai_store::{space, DurableStore, StoreConfig};
+use std::sync::Arc;
 
 let config = StoreConfig::load(Some("my-host"))?;   // ~/.config/ikigai/store.toml
 let store = DurableStore::open(&config.path)?;      // takes the write lock, for good
@@ -90,6 +92,19 @@ There is no accessor that turns the first into the second. A host that wants
 `ikigai_sparql::space_with_store` over this dataset asks for the `_shared` constructor
 and pays for it in cacheability, at the call site, on the line where the choice is made.
 `urn:iki:store:info` reports `covered: true|false` so an operator can see which it got.
+
+## Cache ejection: a file, not a shared store
+
+`ikigai-core/docs/design/cache-ejection.md` works out cross-process cache export and stops
+because there is nowhere durable to put it. The obvious reading — two instances sharing
+one store — collides head-on with the one-writer rule above, so Brian settled it on
+2026-09-13: **the bundle is a file the second instance imports into its own store.**
+
+Nothing exports and nothing imports yet. [`docs/design/cache-bundle.md`](docs/design/cache-bundle.md)
+records which of that design's constraints land here (four of its five are already
+satisfied by `urn:iki:store:load` being a capability-gated, thread-cutting write of
+untrusted input), which one this crate must not pretend to satisfy, and the one thing that
+must *not* be built here.
 
 ## Features
 

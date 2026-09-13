@@ -1,4 +1,4 @@
-//! What the four resources promise, held to it through the kernel.
+//! What the seven resources promise, held to it through the kernel.
 //!
 //! Everything here runs on an in-memory `DurableStore`, which is the same code path as
 //! the durable one for every property under test — capability enforcement, thread cuts,
