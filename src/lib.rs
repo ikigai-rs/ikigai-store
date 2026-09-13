@@ -1,3 +1,24 @@
+//! **DEPRECATED (2026-09-12) — use [`ikigai-sparql`] instead.**
+//!
+//! `ikigai_sparql::space_with_store(Arc<Store>)` supersedes this crate's store
+//! handle, and `urn:sparql:update` — a `Verb::Sink` applying SPARQL 1.1 UPDATE in
+//! one transaction, gated on a declared `urn:cap:sparql:update` and cutting a
+//! golden thread the kernel bumps on success — supersedes [`SparqlEndpoint::load_turtle`],
+//! which mutates the store out of band where no capability check and no thread cut
+//! can see it. The four `urn:sparql:{select,ask,describe,construct}` forms supersede
+//! the single `Source` below, with typed inputs and an `as` selector this crate's two
+//! declared outputs have no way to choose between. See this crate's README for the
+//! item-by-item argument and the removal path.
+//!
+//! No `#[deprecated]` attribute: the crate is `publish = false` and its one published
+//! version (0.1.70, zero downloads) does not carry the attribute either, so it would
+//! warn nobody downstream while forcing an `#[allow(deprecated)]` over this crate's own
+//! tests — an opt-out that would silently cover whatever those tests grow next.
+//!
+//! [`ikigai-sparql`]: https://crates.io/crates/ikigai-sparql
+//!
+//! ---
+//!
 //! RDF/SPARQL endpoint backed by Oxigraph (in-memory).
 //!
 //! [`SparqlEndpoint`] wraps an in-memory Oxigraph store and answers `Source`

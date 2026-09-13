@@ -1,6 +1,39 @@
 [package]
 name = "ikigai-store"
-description = "RDF/SPARQL endpoint backed by Oxigraph (in-memory)."
+description = "DEPRECATED - superseded by ikigai-sparql's space_with_store + urn:sparql:update."
+# ★ DEPRECATED 2026-09-12, and NOT PUBLISHED AGAIN.
+#
+# `publish = false` is the machine-checkable half of a decision that was already
+# made in prose and then quietly undone. The record (2026-08-08, in
+# `ikigai-devtools/claude/briefs/ikigai-linkeddata-shared-store.md`) reads: "grow
+# ikigai-sparql rather than publish ikigai-store". That happened —
+# `ikigai_sparql::space_with_store` shipped, and with it `urn:sparql:update`. But
+# nothing in this manifest said so, so the lockstep 0.1.70 sweep published this
+# crate anyway on 2026-09-12: one version, zero downloads, zero consumers, and a
+# standing decision contradicted by a release. A decision that lives only in a
+# brief is a memory, and memory is what failed. This line is not.
+#
+# What supersedes it, item for item (`ikigai-sparql` 0.1.9):
+#   holding a dataset  -> `space_with_store(Arc<Store>)`, caller-owned, with
+#                         `pub use oxigraph::store::Store` so hosts name ONE type
+#   putting triples in -> `urn:sparql:update`, a `Verb::Sink` applying SPARQL 1.1
+#                         UPDATE in one transaction (`INSERT DATA { GRAPH <g> … }`
+#                         loads a named graph, `DROP GRAPH <g>` drops one)
+#   authority          -> `CAP_UPDATE` ("urn:cap:sparql:update"), declared and
+#                         therefore enforced, with an ablation test
+#   golden thread      -> `UPDATE_THREAD`, cut by the kernel's automatic
+#                         target-named cut on a successful sink
+#   querying           -> `urn:sparql:{select,ask,describe,construct}`, typed
+#                         inputs, `as` with `one_of` + a default, per-form outputs
+# What remains here that is not there: `Store::new()`, `load_from_slice(Turtle, …)`
+# and `&Store` — three lines of oxigraph, behind an endpoint that binds
+# `urn:sparql:default` inside a namespace another crate owns, with no `requires`
+# on a `SELECT * { ?s ?p ?o }`.
+#
+# Removal from the workspace waits on `cargo yank --version 0.1.70 ikigai-store`,
+# so the published crate's `repository` link keeps pointing at real source until
+# then. See this crate's README for the full argument.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,5 +1,47 @@
 # ikigai-store
 
+> ## ⚠ DEPRECATED — do not adopt this crate
+>
+> **Use [`ikigai-sparql`](https://crates.io/crates/ikigai-sparql) instead**, whose
+> `space_with_store` and `urn:sparql:update` supersede everything here.
+>
+> This crate shipped inside the `ikigai-core` workspace in June 2026, was never
+> consumed by anything, and was published for the first and only time on
+> 2026-09-12 (0.1.70) by a lockstep workspace release — against a decision made
+> five weeks earlier to grow `ikigai-sparql` rather than publish this. It carries
+> `publish = false` now; `crates/ikigai-store` is removed from the workspace once
+> 0.1.70 is yanked.
+>
+> **What replaces it**, in `ikigai-sparql` 0.1.9:
+>
+> | this crate | the successor |
+> | --- | --- |
+> | `SparqlEndpoint::new()` holds an `Arc<Store>` | `space_with_store(Arc<Store>)` — the store is *caller-owned*, and `pub use oxigraph::store::Store` gives every host one canonical type to unify on |
+> | `load_turtle(&str)` — a Rust-level side door | `urn:sparql:update`, a `Verb::Sink`: SPARQL 1.1 UPDATE in one transaction, so a *resource* consumer can load data. `INSERT DATA { GRAPH <g> { … } }` loads a named graph; `DROP GRAPH <g>` drops one |
+> | no `requires` — `SELECT * { ?s ?p ?o }` to any attenuated caller | `CAP_UPDATE` (`urn:cap:sparql:update`) declared on the Sink, and therefore enforced by the kernel before `invoke` |
+> | no golden thread | `UPDATE_THREAD`, cut by the kernel's automatic target-named cut on a successful sink |
+> | one `Source` on `urn:sparql:default`, `query` untyped, two declared outputs and no way to ask for either | `urn:sparql:{select,ask,describe,construct}`, every input carrying an `xsd` class, `as` with `one_of` and a default, outputs declared per form, and a refusal rather than a substitution on an unknown target |
+>
+> The only surface this crate has that the successor does not is `Store::new()`,
+> `Store::load_from_slice(RdfFormat::Turtle, …)` and a `&Store` borrow — three
+> lines of Oxigraph. Against that it binds `urn:sparql:default`, an IRI inside a
+> namespace `ikigai-sparql` owns, under a *different* contract: a host binding
+> both offers an agent two SPARQL query actions over two different stores, with
+> nothing in the action manifold to tell them apart, and the one that declares no
+> capability is the one that reads everything.
+>
+> An `ikigai-conformance` 0.2.0 walk of the published 0.1.70 reports two findings
+> and, with no fixture, **probes nothing at all** — the endpoint cannot be reached
+> from its own declarations, because `query` has no `class` for the walk to
+> synthesize a value from. With a fixture supplying a query it serves
+> `application/sparql-results+json` when asked for its own declared
+> `application/n-triples` face: a declared output no caller can select.
+>
+> Everything below this line describes the crate as it was, and is retained so the
+> published 0.1.70 has honest documentation until it is yanked.
+
+---
+
 An RDF/SPARQL **store endpoint** for the
 [ikigai-core](https://crates.io/crates/ikigai-core) resolution kernel, backed by
 [Oxigraph](https://github.com/oxigraph/oxigraph).
