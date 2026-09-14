@@ -1,3 +1,7 @@
 /target
 Cargo.lock
 .DS_Store
+
+# Emacs undo-tree history files (matches ikigai-cli, ikigai-core, ikigai-tutorial, ikigai-web-demo)
+.*.~undo-tree~
+*.~undo-tree~
