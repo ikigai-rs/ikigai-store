@@ -8,15 +8,38 @@ concurrency:
 jobs:
   ci:
     uses: ikigai-rs/.github/.github/workflows/rust.yml@main
-    # `features: persistent` is NOT optional and must never be dropped. The durable
-    # backend lives behind `#[cfg(feature = "persistent")]`, and a cfg path inside a
-    # LIBRARY is not a target — so `ci-drift`'s `required-features` check cannot see its
-    # absence, `--all-targets` does not reach it, and without this line nothing lints or
-    # tests the entire reason this crate exists. Same family as constitution 9c: a gate
-    # that silently covers less than it looks like it does. It costs an `oxrocksdb-sys`
-    # build (~494 s of CPU) on a cache miss and is cached by `Swatinem/rust-cache`
-    # thereafter.
+    # `features: "*"` is `--all-features`, and it carries TWO jobs' worth of meaning.
+    #
+    # 1. It keeps `persistent` on, which is NOT optional and must never be dropped. The
+    #    durable backend lives behind `#[cfg(feature = "persistent")]`, and a cfg path
+    #    inside a LIBRARY is not a target — so `ci-drift`'s `required-features` check
+    #    cannot see its absence, `--all-targets` does not reach it, and without it
+    #    nothing lints or tests the entire reason this crate exists. It costs an
+    #    `oxrocksdb-sys` build (~494 s of CPU) on a cache miss, cached by
+    #    `Swatinem/rust-cache` thereafter.
+    #
+    # 2. ★ It reaches `rdf-12`, which exists ONLY as this gate. 0.2.2 shipped to
+    #    crates.io not compiling for `ikigai-cli`, because a sibling there
+    #    (rudof, via `ikigai-shacl`) enables `oxrdf/rdf-12` and that adds a fourth
+    #    `Term` variant an exhaustive match here did not cover. This job was the missing
+    #    one: every gate was green on a crate its consumers could not build.
+    #
+    # ⚠ Read the LIMIT of this precisely, because a gate that looks like it closes a
+    # class and does not is worse than none. `--all-features` cannot see "a feature a
+    # sibling enables" — it only enables features THIS manifest declares. It catches the
+    # `rdf-12` break because `rdf-12 = ["oxigraph/rdf-12"]` was added for it to reach,
+    # one upstream feature named by hand. The next unification break through a feature
+    # nobody thought to declare is exactly as invisible as this one was. The gate that
+    # would cover the class is a build of this crate inside a real consumer's graph
+    # (`ikigai-cli`), and that lives in the ecosystem's clock, not here — see
+    # `ikigai-store-PENDING.md`.
+    #
+    # ⚠ And not every upstream feature belongs under `*`: `oxigraph/http-client` must
+    # NOT be declared here. `scope.rs`'s SERVICE probe is designed to FAIL when it is on
+    # (federation with no `urn:cap:net:*` in sight), so adding it would turn a security
+    # tripwire into a red build. Compile-must-survive and must-not-be-on are different
+    # gates.
     #
     # `wasm-lib: true` keeps the in-memory face honest: it runs with DEFAULT features, so
     # it lints exactly the half of this crate that has no RocksDB in it.
-    with: { features: persistent, wasm-lib: true }
+    with: { features: "*", wasm-lib: true }

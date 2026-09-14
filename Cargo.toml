@@ -73,7 +73,21 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # whole dataset, so a module enforcing its own read capability over the graph it owns
 # could be gone around by a caller who holds the broad grant and queries this store
 # directly. A boundary with a documented bypass is not a boundary.
-version = "0.2.2"
+#
+# ★ 0.2.3 is a PATCH that fixes a crate which DID NOT COMPILE for a real class of
+# consumer. 0.2.2 matched `oxrdf::Term` exhaustively behind a comment reasoning that the
+# RDF-star variant is "behind a feature nothing here enables" — true of this crate's own
+# graph, false under cargo feature unification, which is global. Any sibling enabling
+# `oxrdf/rdf-12` adds `Term::Triple`; `ikigai-cli` has one (rudof, through
+# `ikigai-shacl`), so 0.2.2 failed there with E0004 the moment it was pinned. The API is
+# unchanged: one match arm, one gate feature, one CI input.
+# ⚠ The lesson is the gate, not the arm. Every gate was GREEN on 0.2.2 because `ci.yml`
+# passed `features: persistent` and this crate's own graph has no `rdf-12` in it —
+# constitution 9c/9e, a gate covering less than it appears to. `features: "*"` plus the
+# `rdf-12` pass-through below closes this instance; it does NOT close the class, because
+# `--all-features` can only enable features this manifest declares. See the long note in
+# `.github/workflows/ci.yml`.
+version = "0.2.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -85,9 +99,10 @@ categories = ["database-implementations"]
 [features]
 # In-memory by default, exactly the trade `ikigai-cli` makes for `quic` and `web`: the
 # heavy backend is opt-in so the wasm face and cheap tests survive. ⚠ `ci.yml` MUST pass
-# `features: persistent` — a `cfg(feature)` path inside a library is not a TARGET, so
-# `ci-drift`'s `required-features` check cannot see an omission here and nothing would
-# lint or test the durable path.
+# `features: "*"` (it did pass `persistent`, which was not enough — see `rdf-12` below):
+# a `cfg(feature)` path inside a library is not a TARGET, so `ci-drift`'s
+# `required-features` check cannot see an omission here and nothing would lint or test
+# the durable path.
 default = []
 # ⚠ Cargo feature unification is global and additive, and `rocksdb` is a DEFAULT feature
 # of oxigraph that the dependency below turns off. Enabling this anywhere in a host's
@@ -96,6 +111,18 @@ default = []
 # type either way) and it means "off by default" is a property of the build, not of this
 # crate.
 persistent = ["oxigraph/rocksdb"]
+# ⚠ NOT a feature for this crate's own use — a GATE, and the only one that can see the
+# break that shipped as 0.2.2. `oxrdf`'s `Term` grows a fourth variant under `rdf-12`, so
+# a match on `Term` that is exhaustive in THIS crate's graph is non-exhaustive in a
+# consumer's the moment any sibling enables it (`ikigai-cli` does: rudof, via
+# `ikigai-shacl`). Nothing this crate declared could see that, because the feature is a
+# DEPENDENCY's, so `ci.yml` now passes `features: "*"` and this line is what `*` reaches.
+# ★ It is a gate and NEVER a `cfg`: a consumer enabling `oxrdf/rdf-12` through rudof does
+# NOT enable this feature, so `#[cfg(feature = "rdf-12")]` on a match arm would be false
+# exactly where the variant exists — the same break wearing a fix's clothes. The one
+# sound direction is the other one: this feature ON implies the variant exists, which is
+# why the test that constructs a quoted triple may be cfg'd on it and the arm may not.
+rdf-12 = ["oxigraph/rdf-12"]
 
 [dependencies]
 async-trait = "0.1"
