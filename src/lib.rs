@@ -13,14 +13,18 @@
 //! *where they live*.
 //!
 //! ```text
-//! urn:iki:store:select     Source  SPARQL SELECT              urn:cap:store:read
-//! urn:iki:store:ask        Source  SPARQL ASK                 urn:cap:store:read
-//! urn:iki:store:construct  Source  SPARQL CONSTRUCT           urn:cap:store:read
-//! urn:iki:store:describe   Source  SPARQL DESCRIBE            urn:cap:store:read
-//! urn:iki:store:info       Source  backing, size, coverage    urn:cap:store:read
-//! urn:iki:store:update     Sink    SPARQL UPDATE, all of it   urn:cap:store:write
-//! urn:iki:store:graph-update Sink  SPARQL UPDATE, one graph   urn:cap:store:write:graph:<iri>
-//! urn:iki:store:load       Sink    bulk-load an RDF document  urn:cap:store:write
+//! urn:iki:store:select           Source  SPARQL SELECT            urn:cap:store:read
+//! urn:iki:store:ask              Source  SPARQL ASK               urn:cap:store:read
+//! urn:iki:store:construct        Source  SPARQL CONSTRUCT         urn:cap:store:read
+//! urn:iki:store:describe         Source  SPARQL DESCRIBE          urn:cap:store:read
+//! urn:iki:store:graph-select     Source  SELECT, one graph        urn:cap:store:read:graph:<iri>
+//! urn:iki:store:graph-ask        Source  ASK, one graph           urn:cap:store:read:graph:<iri>
+//! urn:iki:store:graph-construct  Source  CONSTRUCT, one graph     urn:cap:store:read:graph:<iri>
+//! urn:iki:store:graph-describe   Source  DESCRIBE, one graph      urn:cap:store:read:graph:<iri>
+//! urn:iki:store:info             Source  backing, size, coverage  urn:cap:store:read
+//! urn:iki:store:update           Sink    SPARQL UPDATE, all of it urn:cap:store:write
+//! urn:iki:store:graph-update     Sink    SPARQL UPDATE, one graph urn:cap:store:write:graph:<iri>
+//! urn:iki:store:load             Sink    bulk-load an RDF doc     urn:cap:store:write
 //! ```
 //!
 //! One IRI per query form, following `ikigai-sparql`: the form fixes the result family,
@@ -67,7 +71,7 @@
 //! lets oxigraph serialize them, because the only correct escaper for a grammar is the
 //! one that owns the grammar.
 //!
-//! # A write scope narrower than `DROP ALL`
+//! # A tenancy boundary: scopes narrower than the whole dataset
 //!
 //! [`CAP_WRITE`] is all-or-nothing, so a module layered over this store makes its callers
 //! hold `DROP ALL` to append one triple. `urn:iki:store:graph-update` is the narrow door:
@@ -77,6 +81,17 @@
 //! if anything lands elsewhere — which is what makes it exact against
 //! `DELETE WHERE { GRAPH ?g { … } }` and against a bare `INSERT DATA` that names no graph
 //! at all. The mechanism and its costs are in `src/confine.rs`.
+//!
+//! [`CAP_READ`] is the matching problem in the other direction, and leaving it unsolved
+//! left the boundary with a **documented bypass**: a module enforcing its own read
+//! capability over the graph it owns could be gone around by a caller who holds the broad
+//! grant and queries this store directly. `urn:iki:store:graph-{select,ask,construct,
+//! describe}` close it under [`cap_read_graph(graph)`](cap_read_graph). That half is
+//! confined **by construction** rather than by inspection: a query's dataset is a
+//! first-class thing in SPARQL, so `graph=G` is set on the prepared query as exactly
+//! `FROM <G> FROM NAMED <G>` and nothing is copied or diffed. `src/scope.rs` has the
+//! mechanism, the per-shape probes, and the one surprise — `DESCRIBE` reads the dataset's
+//! default graph and nothing else, upstream, in both doors.
 //!
 //! # One writer per directory — the constraint that shapes everything here
 //!
@@ -155,12 +170,13 @@
 pub mod config;
 pub(crate) mod confine;
 pub mod endpoints;
+pub(crate) mod scope;
 pub mod sparql;
 pub mod store;
 
 pub use config::StoreConfig;
 pub use endpoints::{
-    cap_write_graph, space, CAP_READ, CAP_WRITE, CAP_WRITE_GRAPH, GRAPH_UPDATE_THREAD, LOAD_THREAD,
-    UPDATE_THREAD,
+    cap_read_graph, cap_write_graph, space, CAP_READ, CAP_READ_GRAPH, CAP_WRITE, CAP_WRITE_GRAPH,
+    GRAPH_UPDATE_THREAD, LOAD_THREAD, UPDATE_THREAD,
 };
 pub use store::{Backing, DurableStore, Store};

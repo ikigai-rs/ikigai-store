@@ -65,7 +65,15 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # nothing, which is exactly the ceiling trap constitution 5 warns about from the other
 # direction. A consumer that wants the new API pins `0.2.1`; one that does not, does
 # nothing.
-version = "0.2.1"
+#
+# ★ 0.2.2 is a PATCH by the same argument, and closes the half 0.2.1 left open. It adds
+# `urn:iki:store:graph-{select,ask,construct,describe}`, `urn:cap:store:read:graph:*` and
+# `cap_read_graph` — four new IRIs, one new capability, nothing existing changed. The
+# urgency is not tidiness: 0.2.1 segmented WRITES and left `urn:cap:store:read` as the
+# whole dataset, so a module enforcing its own read capability over the graph it owns
+# could be gone around by a caller who holds the broad grant and queries this store
+# directly. A boundary with a documented bypass is not a boundary.
+version = "0.2.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
