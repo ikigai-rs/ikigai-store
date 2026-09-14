@@ -50,6 +50,10 @@ one kernel per process where you can.
 | `urn:iki:store:ask` | `Source` | SPARQL ASK | `urn:cap:store:read` |
 | `urn:iki:store:construct` | `Source` | SPARQL CONSTRUCT | `urn:cap:store:read` |
 | `urn:iki:store:describe` | `Source` | SPARQL DESCRIBE | `urn:cap:store:read` |
+| `urn:iki:store:graph-select` | `Source` | SPARQL SELECT, one named graph | `urn:cap:store:read:graph:<iri>` |
+| `urn:iki:store:graph-ask` | `Source` | SPARQL ASK, one named graph | `urn:cap:store:read:graph:<iri>` |
+| `urn:iki:store:graph-construct` | `Source` | SPARQL CONSTRUCT, one named graph | `urn:cap:store:read:graph:<iri>` |
+| `urn:iki:store:graph-describe` | `Source` | SPARQL DESCRIBE, one named graph | `urn:cap:store:read:graph:<iri>` |
 | `urn:iki:store:info` | `Source` | backing, quad count, coverage | `urn:cap:store:read` |
 | `urn:iki:store:update` | `Sink` | SPARQL UPDATE, whole dataset | `urn:cap:store:write` |
 | `urn:iki:store:graph-update` | `Sink` | SPARQL UPDATE, one named graph | `urn:cap:store:write:graph:<iri>` |
@@ -181,8 +185,76 @@ Three more things, each of them a decision rather than an omission:
 since `INSERT DATA { GRAPH <G> { … } }` through the narrow door does the same work under
 the narrow grant.
 
-⚠ **There is no matching per-graph READ scope yet.** `urn:cap:store:read` still grants the
-whole dataset, so this closes the write half of a tenancy boundary and not the read half.
+## ★ A per-graph read scope: `urn:cap:store:read:graph:<iri>`
+
+The write scope alone left the boundary with a documented bypass. A module enforcing its
+own read capability over the graph it owns — a named ledger, a layer, a tenant's
+annotations — could be gone around entirely by a caller who holds `urn:cap:store:read` and
+queries this store directly. **A boundary with a documented bypass is not a boundary**, so
+0.2.2 closes the other half.
+
+`urn:iki:store:graph-{select,ask,construct,describe}` each take a `graph=` IRI and require
+`urn:cap:store:read:graph:<that IRI>`.
+
+```text
+source urn:iki:store:graph-select \
+  graph=urn:iki:ledger:acme \
+  query='SELECT ?item ?filed WHERE { ?item <urn:filed> ?filed }'
+```
+
+**The confinement is by construction, not by inspection**, and this is where it differs
+from the write half. A query's dataset is a first-class thing in SPARQL and oxigraph
+exposes it: the prepared query's dataset specification is set before evaluation, so
+`graph=G` means exactly `FROM <G> FROM NAMED <G>` — written through the API rather than
+into the query text. Nothing is copied and nothing is diffed. What that does to the shapes
+that defeat a syntactic check:
+
+| query | what happens |
+| --- | --- |
+| `{ ?s ?p ?o }` (no `GRAPH` block) | reads `G` — it *is* the default graph |
+| `GRAPH <G> { … }` | reads `G` |
+| `GRAPH <other> { … }` | matches nothing — an empty result, not an error |
+| `GRAPH ?g { … }` | binds `?g` to `G` and to nothing else |
+| a sub-select, `FILTER EXISTS`/`NOT EXISTS`, a property path over another graph | confined the same way |
+| `DESCRIBE <s>` with no pattern | reads `G` |
+| `FROM` / `FROM NAMED` in the query text | **refused** — see below |
+| `SERVICE <http://…>` | refused: no HTTP client is built in — but see the feature warning below |
+
+Four decisions worth stating:
+
+- **`FROM` / `FROM NAMED` is refused rather than overridden.** It is a second way to name
+  a dataset, and it cannot widen the scope — the confinement overwrites whatever the
+  parser built from it. But answering `FROM <other>` with `G`'s rows would label one
+  tenant's data with another tenant's graph name, which is a wrong answer that looks
+  right. `graph=` *is* the dataset.
+- **The store's own default graph is unreachable from a scoped read.** The default graph
+  has no IRI, so no `urn:cap:store:read:graph:` token could name it. A host that keeps
+  tenant data in the default graph has put it outside this boundary's reach — which is the
+  safe direction, but it is a thing to know before choosing where data lives.
+- **`urn:cap:store:read` does not satisfy this door**, and a graph read scope does not
+  open `urn:iki:store:select`. Both directions are ablated in `tests/read_scope.rs`.
+- **Read and write scopes over the same graph are separate grants.** Neither implies the
+  other; a host that means a module to do both grants both.
+
+⚠ **`DESCRIBE` reads the dataset's default graph and nothing else** — that is upstream
+behaviour, not this crate's, and it applies to the *unscoped* `urn:iki:store:describe`
+too: `DESCRIBE <s>` for a subject that lives in a named graph has always returned nothing
+there. Under `graph=G` the default graph *is* `G`, so the scoped door is the one where
+describing a tenant's subject works.
+
+⚠ **`ikigai-conformance` cannot check any of this.** Its `AUTHORITY` check is silent on
+endpoints that declare a scope, and no check anywhere can see the *parameterized* half of
+a wildcard grant — the interesting case is always a caller holding a grant for one graph
+reaching for another. `tests/read_scope.rs` is the only evidence, and every test in it is
+a pair: the permitted graph comes back **with its rows**, beside the refusal. That pairing
+is the point, because empty is a legitimate answer to a query and a confinement that is
+wrong in the safe direction is otherwise indistinguishable from an empty graph.
+
+⚠ **A scoped query endpoint has two required by-value inputs, so a bare pipe into one is
+ambiguous.** The engine fills the single unnamed *required* argument from a pipe; with
+both `graph` and `query` unnamed it refuses with `accepts multiple arguments; name one
+with key=value`. Naming the graph — which a caller must do anyway — leaves `query` as the
+one unnamed required input, so `… | urn:iki:store:graph-select graph=<G>` pipes normally.
 
 ## Three things a consumer cannot learn any other way
 
@@ -305,14 +377,17 @@ names the path**, ever — an env var is invisible to `ikigai config`, is not in
 a launchd agent, and two processes that disagree about it never meet. An unknown key, an
 empty `path` and an unwritable directory are all loud.
 
-## Status: publishable as of 2026-09-13; 0.2.1 is additive
+## Status: publishable as of 2026-09-13; 0.2.1 and 0.2.2 are additive
 
-0.2.1 adds `bindings=`, `ikigai_store::sparql`, `urn:iki:store:graph-update` and its
-capability, and a third golden thread. **Nothing existing changed shape**, so the two
-live consumers — `ikigai-ledger` on crates.io and `ikigai-cli` behind a feature — need no
-change at all; one that wants the new API pins `0.2.1`. It is a patch rather than 0.3.0
-because in cargo's 0.x rules the second number is the breaking one, and forcing a
-manifest edit for a release that breaks nothing is the ceiling trap from the other side.
+0.2.2 adds the four `urn:iki:store:graph-{select,ask,construct,describe}` IRIs and
+`urn:cap:store:read:graph:*`, closing the read half of the tenancy boundary. 0.2.1 added
+`bindings=`, `ikigai_store::sparql`, `urn:iki:store:graph-update` and its capability, and
+a third golden thread. **Nothing existing changed shape in either**, so the two live
+consumers — `ikigai-ledger` on crates.io and `ikigai-cli` behind a feature — need no
+change at all; one that wants the new API pins `0.2.2`. Both are patches rather than a
+minor bump because in cargo's 0.x rules the second number is the breaking one, and forcing
+a manifest edit for a release that breaks nothing is the ceiling trap from the other
+side.
 
 
 

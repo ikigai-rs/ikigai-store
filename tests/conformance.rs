@@ -1,4 +1,4 @@
-//! The module recipe as one test: `ikigai-conformance` walks the seven resources
+//! The module recipe as one test: `ikigai-conformance` walks the twelve resources
 //! [`ikigai_store::space`] binds and reports every violation at once.
 //!
 //! # The fixture is a store, and the walk WRITES to it
@@ -21,6 +21,11 @@
 //!   valid `INSERT DATA`, and — for `store-graph-update` — one inside a `GRAPH` block
 //!   naming the graph its fixture also passes, because a bare `INSERT DATA` writes the
 //!   default graph and that endpoint refuses it on purpose.
+//! - **The four scoped query forms need a `graph=` as well**, and the graph they name is
+//!   seeded by [`kernel`] so their RDF faces have something to serialize. ⚠ They are also
+//!   the endpoints with TWO required by-value inputs, so a BARE pipe into one is
+//!   ambiguous — naming `graph=` leaves `query` as the single unnamed required input and
+//!   the pipe works. See `src/endpoints.rs`.
 //! - ⚠ **`AUTHORITY` (0.3.0) is silent here, and that is the correct result rather than
 //!   a gap.** It catches the fourth cell of the enforcement square — a `Sink` or
 //!   `Delete` that declares no `requires` and mutates anyway under a capability holding
@@ -78,6 +83,17 @@ fn kernel(store: DurableStore) -> Kernel {
         ),
     )
     .expect("seeding the conformance fixture");
+    // …and the same triple inside the scoped graph, so the scoped RDF faces serialize
+    // something rather than reporting `0 triple(s) — nothing was checked`.
+    block_on(
+        kernel.issue(
+            Request::new(Verb::Sink, Iri::parse("urn:iki:store:load").unwrap())
+                .with_arg("content", ArgRef::Inline(INSERT_TURTLE.as_bytes().to_vec()))
+                .with_arg("graph", ArgRef::Inline(SCOPED_GRAPH.as_bytes().to_vec())),
+            &Capability::root(),
+        ),
+    )
+    .expect("seeding the scoped graph");
     kernel
 }
 
@@ -118,6 +134,13 @@ fn fixtures() -> Suite {
         .fold(Suite::new(), |suite, (id, query)| {
             suite.fixture(Fixture::new(*id, Verb::Source).arg("query", *query))
         });
+    let suite = FORM_FIXTURES.iter().fold(suite, |suite, (id, query)| {
+        suite.fixture(
+            Fixture::new(scoped_id(id), Verb::Source)
+                .arg("query", *query)
+                .arg("graph", SCOPED_GRAPH),
+        )
+    });
     suite
         .fixture(Fixture::new("store-load", Verb::Sink).arg("content", INSERT_TURTLE))
         .fixture(Fixture::new("store-update", Verb::Sink).arg("content", INSERT_UPDATE))
@@ -128,12 +151,24 @@ fn fixtures() -> Suite {
         )
 }
 
-/// Every read endpoint, for the declaration both walks make about all of them.
-const READS: [&str; 5] = [
+/// `store-select` → `store-graph-select`: the scoped twin's description id.
+fn scoped_id(id: &str) -> String {
+    id.replace("store-", "store-graph-")
+}
+
+/// Every read endpoint, for the declaration both walks make about all of them. ★ A scoped
+/// read is cacheable exactly like a broad one — it depends on the same three write
+/// threads — and saying so here is what would catch a scoped face that quietly stopped
+/// being cached.
+const READS: [&str; 9] = [
     "store-select",
     "store-ask",
     "store-construct",
     "store-describe",
+    "store-graph-select",
+    "store-graph-ask",
+    "store-graph-construct",
+    "store-graph-describe",
     "store-info",
 ];
 
