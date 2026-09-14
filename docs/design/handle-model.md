@@ -75,6 +75,16 @@ For completeness (M3): a re-open after the previous handle is **dropped** succee
 ~7.5 ms and sees the data. Dropping the handle really does release the lock, which is
 what made B worth costing at all.
 
+★ **M2 is the fact a host trips over first, and it took a consumer to find out.** Under
+model A this is a correct refusal, but the obvious host code — `Kernel::new(Arc::new(
+space(DurableStore::open(&path)?)))`, once per kernel — hits it the moment the host has
+more than one kernel, which `ikigai-cli` does in several CLI modes and every test binary
+does a dozen times over. `DurableStore` is `Clone` over an `Arc<Store>`, so the answer is
+to **open once and clone the handle** (the README's snippet now does); the measurement
+above says nothing about that because it was asking a different question. Each kernel
+still keeps its own cache, so a write through one does not cut the other's threads —
+which is a kernel property and the reason to prefer one kernel per process.
+
 ## The decision: model A, the long-lived exclusive handle
 
 `DurableStore` opens its directory once and holds the handle for its own lifetime. The

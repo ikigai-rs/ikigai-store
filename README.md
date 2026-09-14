@@ -17,8 +17,30 @@ use std::sync::Arc;
 
 let config = StoreConfig::load(Some("my-host"))?;   // ~/.config/ikigai/store.toml
 let store = DurableStore::open(&config.path)?;      // takes the write lock, for good
-let kernel = Kernel::new(Arc::new(space(store)));
+let kernel = Kernel::new(Arc::new(space(store.clone())));
 ```
+
+### ⚠ `DurableStore::open` ONCE per process, then clone the handle
+
+That `.clone()` is the whole point of the line and it is why this snippet changed.
+RocksDB refuses a second open of the same directory **from the same process**, through
+its own in-process registry — so a host with more than one kernel (several CLI modes, a
+test binary with a dozen), written the obvious way, gets `Error::Unavailable` on the
+second one. `ikigai-cli`'s binding arc hit exactly this and had to memoize the space.
+
+`DurableStore` is `Clone` and holds an `Arc<Store>`, so the fix is to open once and hand
+each kernel a clone: they share the dataset, the write lock, and the coverage flag.
+
+```rust
+let store = DurableStore::open(&config.path)?;      // once, at startup
+let one = Kernel::new(Arc::new(space(store.clone())));
+let two = Kernel::new(Arc::new(space(store.clone())));
+```
+
+⚠ **Each kernel still has its own cache.** A write through `one` cuts `one`'s golden
+threads, not `two`'s, so a second kernel over the same store can serve a stale cached
+read. That is a property of the kernel, not of this crate, and it is the reason to prefer
+one kernel per process where you can.
 
 ## What it binds
 
@@ -29,7 +51,8 @@ let kernel = Kernel::new(Arc::new(space(store)));
 | `urn:iki:store:construct` | `Source` | SPARQL CONSTRUCT | `urn:cap:store:read` |
 | `urn:iki:store:describe` | `Source` | SPARQL DESCRIBE | `urn:cap:store:read` |
 | `urn:iki:store:info` | `Source` | backing, quad count, coverage | `urn:cap:store:read` |
-| `urn:iki:store:update` | `Sink` | SPARQL UPDATE | `urn:cap:store:write` |
+| `urn:iki:store:update` | `Sink` | SPARQL UPDATE, whole dataset | `urn:cap:store:write` |
+| `urn:iki:store:graph-update` | `Sink` | SPARQL UPDATE, one named graph | `urn:cap:store:write:graph:<iri>` |
 | `urn:iki:store:load` | `Sink` | bulk-load an RDF document | `urn:cap:store:write` |
 
 One IRI per query form, following `ikigai-sparql`: the form fixes the result family, so
@@ -44,6 +67,149 @@ ever put in it.
 The namespace is `urn:iki:store:`, **born migrated**. The ecosystem is moving 77
 namespaces under `urn:iki:` one at a time, and a brand-new namespace is the only kind
 whose migration is free.
+
+## ★ Getting a value in without it becoming syntax
+
+A query and an update are *strings*, so a consumer that interpolates a comment body into
+one is standing on a security boundary whether it means to be or not: with
+`urn:cap:store:write` in hand, `" } ; DROP ALL ; INSERT DATA { <urn:x> <urn:y> "` is not
+a rendering bug. `ikigai-ledger` wrote its own escaper and a hostile-content test;
+`ikigai-cli` was the second consumer to face it. There is now one answer here, so there
+need not be a third.
+
+**For a query, use `bindings=`** — the value never reaches the SPARQL parser at all.
+
+```text
+source urn:iki:store:select \
+  query='SELECT * WHERE { ?s <http://purl.org/dc/terms/title> ?title }' \
+  bindings='{"title": "\" } ; DROP ALL ; INSERT DATA { <urn:x> <urn:y> \""}'
+```
+
+It is a JSON object of variable name → value. A bare JSON string is a plain literal, a
+number is `xsd:integer` or `xsd:double`, `true`/`false` is `xsd:boolean`, and the SPARQL
+results term shape (`{"type":"uri","value":"urn:…"}`, or `"literal"` with `datatype` or
+`xml:lang`) names anything else — the same shape a row comes back in, so a value read out
+of one query binds into the next unchanged.
+
+⚠ **Every bound variable must appear in the query's projection.** `SELECT ?s WHERE { ?s
+?p ?o }` cannot bind `o`; `SELECT *` can, and ASK, CONSTRUCT and DESCRIBE have no
+projection to widen and accept any variable in the pattern. That is oxigraph's rule and
+oxigraph enforces it, which settles a design question in the right direction: **a binding
+the query does not mention is refused, not ignored**, so a filter you thought was applied
+can never silently not be. The refusal explains the projection rule, because upstream's
+sentence does not.
+
+**For an update, build the terms** — `urn:iki:store:update` refuses a `bindings`
+argument rather than pretending:
+
+```rust
+use ikigai_store::sparql::{iri, literal};
+
+let update = format!(
+    "INSERT DATA {{ GRAPH <urn:iki:ledger:acme> {{ {} <http://purl.org/dc/terms/title> {} }} }}",
+    iri(item, "about")?,
+    literal(user_text),
+);
+```
+
+★ **Nothing in `ikigai_store::sparql` escapes anything, and that is the point.** Each
+function builds an `oxigraph::model::Term` and asks *oxigraph* to serialize it: the only
+correct escaper for a grammar is the one that owns the grammar. `NamedNode::new` refuses
+`>`, a space and `{` at construction — so `iri` refuses rather than mangles, because
+quietly storing a different IRI than the caller named is an injection arriving by
+politeness — and `Literal`'s serializer escapes `\`, `"`, `\n`, `\r`, `\t` and every
+other control character. Both are pinned by tests here, so an upstream change that
+weakened either fails in this crate rather than in a consumer.
+
+The asymmetry between the two doors is upstream's: oxigraph's prepared *query* has
+`substitute_variable` and its prepared *update* has nothing, and a parsed update's AST is
+private. Binding into an update would mean rewriting the update's text, which is string
+interpolation with a longer name, in the one place where getting it wrong is `DROP ALL`.
+
+## ★ A per-graph write scope: `urn:cap:store:write:graph:<iri>`
+
+`urn:cap:store:write` is all-or-nothing and it means `DROP ALL`. Because a sub-request
+carries the caller's capability unchanged, a module layered over this store makes its
+callers hold that authority to append one triple — so the moment such a module is bound,
+any session that may file an item may also destroy everything. That is why `ikigai-cli`'s
+binding arc refused to put the store on the served space or the HTTP door at all.
+
+`urn:iki:store:graph-update` is the narrow door. It takes an arbitrary SPARQL UPDATE and
+a `graph=` IRI, and requires `urn:cap:store:write:graph:<that IRI>`.
+
+```text
+sink urn:iki:store:graph-update \
+  graph=urn:iki:ledger:acme \
+  content='INSERT DATA { GRAPH <urn:iki:ledger:acme> { <urn:iki:ledger:acme:item:1> <urn:p> "x" } }'
+```
+
+**The scope is enforced on effects, not on syntax**, which is the only way it can be
+exact. The update runs against a private copy of that one graph; if anything lands
+anywhere else the whole request is refused with the offending statement named, and
+otherwise the difference is applied to the real graph in one transaction. So the shapes
+that defeat a syntactic check are handled by construction:
+
+| update | what happens |
+| --- | --- |
+| `INSERT DATA { GRAPH <G> { … } }` | applied |
+| `INSERT DATA { <s> <p> <o> }` | **refused** — the default graph is not `G` |
+| `INSERT DATA { GRAPH <other> { … } }`, `WITH <other> …`, `COPY`/`MOVE`/`ADD … TO <other>` | **refused** |
+| `CREATE GRAPH <other>` | **refused** — no quad, but it registers a graph |
+| `DROP ALL`, `CLEAR ALL`, `DELETE WHERE { GRAPH ?g { … } }` | applied to `G` alone — the private copy held only `G`, and emptying `G` is within a grant over `G` |
+
+⚠ **A scoped update cannot READ outside its graph either**, so the same update run
+through `urn:iki:store:update` can behave differently. That is deliberate and it is the
+right way round: a grant that let one tenant's agent read another's graph in order to
+decide what to write in its own would be a filter, not a boundary.
+
+Three more things, each of them a decision rather than an omission:
+
+- **A grant names exactly one graph.** `Capability::allows` is exact-match set
+  membership, and inventing prefix semantics for one token would make this crate's grants
+  mean something other than every other grant in the system. A host that wants a caller
+  to write three graphs grants three scopes — which is the intended use, and several
+  different graph scopes held by several different callers at once is the case this was
+  designed for.
+- **`urn:cap:store:write` does not satisfy this door**, and is not meant to. A broad
+  holder uses `urn:iki:store:update`, which copies nothing and sees the whole dataset.
+  Accepting both here would mean the declared scope was not the enforced one.
+- **The graph is copied into memory on every scoped write**, twice (a before and an after
+  set). This door is priced for a graph a module owns — a ledger, a layer, an annotation
+  set — not for a materialized database. The unscoped door copies nothing.
+
+`urn:iki:store:load` keeps the broad scope: a graph-scoped caller has no need of it,
+since `INSERT DATA { GRAPH <G> { … } }` through the narrow door does the same work under
+the narrow grant.
+
+⚠ **There is no matching per-graph READ scope yet.** `urn:cap:store:read` still grants the
+whole dataset, so this closes the write half of a tenancy boundary and not the read half.
+
+## Three things a consumer cannot learn any other way
+
+Each of these cost a consumer real time, and none of them is visible from the API.
+
+**Multi-operation atomicity is real, and you may depend on it.** One request whose
+`content` is several `;`-separated operations is applied atomically: a malformed
+operation anywhere means none of it ran. A state change split across three *requests* is
+observably half-applied; the same change as one request is not. `ikigai-ledger` found
+this the hard way and now pins it with a test. The same holds through
+`urn:iki:store:graph-update`, where a refusal happens before anything reaches the real
+store.
+
+**Values come back in the engine's canonical lexical form — never compare against what
+you wrote.** Write `2026-09-13T00:00:00.000Z` and read back `2026-09-13T00:00:00Z`. A
+strict parser returned `None`, rows were silently dropped, and every newly filed item
+read back as if it had never been written — a failure that looks like a broken UPDATE and
+is not. Compare typed values after parsing them, or compare in SPARQL, where
+`xsd:dateTime` equality is by value.
+
+**Composition is N sub-requests per operation, with no shared-transaction seam.** The
+`Store` handle is `pub(crate)` on purpose — see the cacheability section below, where
+handing it out is a constructor-level decision with a permanent cost — and the
+consequence is that an in-process module built over this store reaches it the same way a
+remote one does: through the kernel, one request at a time. There is no way to put a read
+and a write in one transaction across that seam. Where a module needs atomicity, it needs
+it *inside* one request: one `;`-separated UPDATE, which is exactly the guarantee above.
 
 ## ⚠ One writer per directory — the constraint that shapes everything
 
@@ -139,7 +305,16 @@ names the path**, ever — an env var is invisible to `ikigai config`, is not in
 a launchd agent, and two processes that disagree about it never meet. An unknown key, an
 empty `path` and an unwritable directory are all loud.
 
-## Status: publishable as of 2026-09-13
+## Status: publishable as of 2026-09-13; 0.2.1 is additive
+
+0.2.1 adds `bindings=`, `ikigai_store::sparql`, `urn:iki:store:graph-update` and its
+capability, and a third golden thread. **Nothing existing changed shape**, so the two
+live consumers — `ikigai-ledger` on crates.io and `ikigai-cli` behind a feature — need no
+change at all; one that wants the new API pins `0.2.1`. It is a patch rather than 0.3.0
+because in cargo's 0.x rules the second number is the breaking one, and forcing a
+manifest edit for a release that breaks nothing is the ceiling trap from the other side.
+
+
 
 `ikigai-core` #110 set seven conditions for lifting `publish = false`, and 0.2.0 meets all
 seven — durable backend, a `Sink` that writes through the kernel, declared = enforced
