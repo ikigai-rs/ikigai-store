@@ -18,7 +18,8 @@
 //! urn:iki:store:construct  Source  SPARQL CONSTRUCT           urn:cap:store:read
 //! urn:iki:store:describe   Source  SPARQL DESCRIBE            urn:cap:store:read
 //! urn:iki:store:info       Source  backing, size, coverage    urn:cap:store:read
-//! urn:iki:store:update     Sink    SPARQL UPDATE              urn:cap:store:write
+//! urn:iki:store:update     Sink    SPARQL UPDATE, all of it   urn:cap:store:write
+//! urn:iki:store:graph-update Sink  SPARQL UPDATE, one graph   urn:cap:store:write:graph:<iri>
 //! urn:iki:store:load       Sink    bulk-load an RDF document  urn:cap:store:write
 //! ```
 //!
@@ -40,10 +41,42 @@
 //! # #[cfg(feature = "persistent")] {
 //! let config = StoreConfig::load(Some("my-host"))?;
 //! let store = DurableStore::open(&config.path)?;   // takes the write lock, for good
-//! let space = space(store);                        // bind into a kernel
+//! let one = space(store.clone());                  // bind into a kernel
+//! let two = space(store.clone());                  // …and into a second one
 //! # }
 //! # Ok(()) }
 //! ```
+//!
+//! ⚠ **`open` ONCE per process, then clone the handle** — that is what the `.clone()` is
+//! for, and it is the first thing a host gets wrong. RocksDB refuses a second open of the
+//! same directory from the *same* process through its own in-process registry, so a host
+//! with several kernels (several CLI modes, a test binary with a dozen) written the
+//! obvious way gets [`Error::Unavailable`](ikigai_core::Error::Unavailable) on the
+//! second. `DurableStore` is `Clone` over an `Arc<Store>`: clones share the dataset, the
+//! write lock and the coverage flag. Each kernel still keeps its own cache, though, so a
+//! write through one does not cut the other's golden threads — prefer one kernel per
+//! process where you can.
+//!
+//! # Getting a value in without it becoming syntax
+//!
+//! A query and an update are strings, so a consumer interpolating user text into one is
+//! standing on a security boundary whether it means to be or not. [`sparql`] is the one
+//! answer: `bindings=` for queries, where the value never reaches the parser, and term
+//! constructors for updates, where oxigraph offers no binding and this crate will not
+//! fake one by rewriting text. Nothing there escapes anything — it builds RDF terms and
+//! lets oxigraph serialize them, because the only correct escaper for a grammar is the
+//! one that owns the grammar.
+//!
+//! # A write scope narrower than `DROP ALL`
+//!
+//! [`CAP_WRITE`] is all-or-nothing, so a module layered over this store makes its callers
+//! hold `DROP ALL` to append one triple. `urn:iki:store:graph-update` is the narrow door:
+//! an arbitrary UPDATE confined to one named graph under
+//! [`cap_write_graph(graph)`](cap_write_graph). The scope is enforced on **effects, not
+//! syntax** — the update runs against a private copy of that graph and is refused in full
+//! if anything lands elsewhere — which is what makes it exact against
+//! `DELETE WHERE { GRAPH ?g { … } }` and against a bare `INSERT DATA` that names no graph
+//! at all. The mechanism and its costs are in `src/confine.rs`.
 //!
 //! # One writer per directory — the constraint that shapes everything here
 //!
@@ -72,8 +105,11 @@
 //! One process owning every write is exactly the **coverage** `ikigai-sparql`'s
 //! `UPDATE_THREAD` docs name as the missing precondition for caching a shared store. The
 //! kernel cuts the thread named after a mutating request's target, so a read that
-//! depends on [`UPDATE_THREAD`] and [`LOAD_THREAD`] is invalidated by every write the
-//! kernel can see — and under `DurableStore::open` there are no others.
+//! depends on [`UPDATE_THREAD`], [`LOAD_THREAD`] and [`GRAPH_UPDATE_THREAD`] is
+//! invalidated by every write the kernel can see — and under `DurableStore::open` there
+//! are no others. ⚠ **Three writing IRIs means three threads**: adding a write door
+//! without adding its thread leaves every cacheable read serving stale bytes after a
+//! write through it, silently, on the branch that looks like success.
 //!
 //! ⚠ **Handing out the `Arc<Store>` hands out a writer the kernel cannot see, and the
 //! coverage is gone.** That is not held by prose here: it is held by the constructors.
@@ -117,9 +153,14 @@
 //! [`ikigai-sparql`]: https://crates.io/crates/ikigai-sparql
 
 pub mod config;
+pub(crate) mod confine;
 pub mod endpoints;
+pub mod sparql;
 pub mod store;
 
 pub use config::StoreConfig;
-pub use endpoints::{space, CAP_READ, CAP_WRITE, LOAD_THREAD, UPDATE_THREAD};
+pub use endpoints::{
+    cap_write_graph, space, CAP_READ, CAP_WRITE, CAP_WRITE_GRAPH, GRAPH_UPDATE_THREAD, LOAD_THREAD,
+    UPDATE_THREAD,
+};
 pub use store::{Backing, DurableStore, Store};

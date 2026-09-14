@@ -17,8 +17,19 @@
 //!   `xsd:string`, and a synthesized `"x"` is a parse error — so each of the four gets a
 //!   [`Fixture`]. They are not interchangeable: `urn:iki:store:select` refuses a
 //!   CONSTRUCT, on purpose, because the IRI is what fixes the declared outputs.
-//! - **The two Sinks need parseable bodies** for the same reason: valid N-Triples and a
-//!   valid `INSERT DATA`.
+//! - **The three Sinks need parseable bodies** for the same reason: valid N-Triples, a
+//!   valid `INSERT DATA`, and — for `store-graph-update` — one inside a `GRAPH` block
+//!   naming the graph its fixture also passes, because a bare `INSERT DATA` writes the
+//!   default graph and that endpoint refuses it on purpose.
+//! - ⚠ **`AUTHORITY` (0.3.0) is silent here, and that is the correct result rather than
+//!   a gap.** It catches the fourth cell of the enforcement square — a `Sink` or
+//!   `Delete` that declares no `requires` and mutates anyway under a capability holding
+//!   no grants. All three Sinks here declare a scope, so `ENFORCED` holds them instead,
+//!   in both directions. What neither check can see is the *parameterized* half of
+//!   `urn:cap:store:write:graph:*`: the suite probes with no grants and with root, and
+//!   the interesting case is a caller holding a grant for **one** graph reaching for
+//!   another. `tests/graph_scope.rs` is that ablation, and it is where a regression in
+//!   the boundary would actually show.
 //! - **The reads are cacheable because the store is covered**, which is this crate's
 //!   central claim, and is declared here so `CACHEABLE` holds them to it. None of them
 //!   is `pure` — they read standing state — so the check also requires a non-empty
@@ -90,6 +101,14 @@ const INSERT_TURTLE: &str =
 const INSERT_UPDATE: &str = "INSERT DATA { <urn:example:conformance> \
                              <http://purl.org/dc/terms/title> \"conformance\" }";
 
+/// `urn:iki:store:graph-update` writes into a graph, so its fixture must name one and
+/// put the statement inside a `GRAPH` block — a bare `INSERT DATA` goes to the default
+/// graph and that endpoint refuses it, which is the whole point of it.
+const SCOPED_GRAPH: &str = "urn:example:conformance:graph";
+const SCOPED_UPDATE: &str = "INSERT DATA { GRAPH <urn:example:conformance:graph> { \
+                             <urn:example:conformance> \
+                             <http://purl.org/dc/terms/title> \"conformance\" } }";
+
 /// The fixtures both walks share. The cacheable/live DECLARATION is deliberately not
 /// here: it is the one thing the two modes disagree about, so each test states its own
 /// rather than the suite carrying both and contradicting itself.
@@ -102,6 +121,11 @@ fn fixtures() -> Suite {
     suite
         .fixture(Fixture::new("store-load", Verb::Sink).arg("content", INSERT_TURTLE))
         .fixture(Fixture::new("store-update", Verb::Sink).arg("content", INSERT_UPDATE))
+        .fixture(
+            Fixture::new("store-graph-update", Verb::Sink)
+                .arg("content", SCOPED_UPDATE)
+                .arg("graph", SCOPED_GRAPH),
+        )
 }
 
 /// Every read endpoint, for the declaration both walks make about all of them.

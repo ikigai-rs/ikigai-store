@@ -8,7 +8,7 @@
 #[cfg(all(feature = "persistent", not(target_family = "wasm")))]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use ikigai_core::{Error, Result};
 
@@ -67,6 +67,8 @@ pub struct DurableStore {
     store: Arc<Store>,
     backing: Backing,
     covered: bool,
+    /// Serializes every write this crate performs — see [`write_lock`](Self::write_lock).
+    writes: Arc<Mutex<()>>,
 }
 
 /// Hand-written because `oxigraph::store::Store` has no `Debug` — and because the two
@@ -87,6 +89,7 @@ impl DurableStore {
             store: Arc::new(Store::new().map_err(endpoint_err)?),
             backing: Backing::Memory,
             covered: true,
+            writes: Arc::new(Mutex::new(())),
         })
     }
 
@@ -122,6 +125,7 @@ impl DurableStore {
             store: Arc::new(open_rocksdb(path.as_ref())?),
             backing: Backing::Durable(path.as_ref().to_path_buf()),
             covered: true,
+            writes: Arc::new(Mutex::new(())),
         })
     }
 
@@ -151,6 +155,30 @@ impl DurableStore {
     /// type docs for why handing this out is a constructor-level decision.
     pub(crate) fn dataset(&self) -> &Store {
         &self.store
+    }
+
+    /// Serialize this crate's writes against each other.
+    ///
+    /// ★ **Needed because the graph-scoped write is a read-modify-write.**
+    /// `urn:iki:store:graph-update` runs the caller's UPDATE against a private copy of
+    /// one graph and then applies the delta (the mechanism is in `src/confine.rs`), so two
+    /// concurrent scoped writes to the same graph could otherwise lose one of them — and this
+    /// kernel really can run requests concurrently (`Kernel::into_scheduled`, and
+    /// `Invocation::fan_out`). Every write door in this crate takes the lock, including
+    /// the two that would be atomic without it, because a lock that only *some* writers
+    /// take orders nothing.
+    ///
+    /// ⚠ It covers the writes **this crate** performs, which is exactly the coverage
+    /// [`is_covered`](Self::is_covered) already describes: after `open_shared` the raw
+    /// handle is a writer that takes no lock, and a scoped write can then lose an update
+    /// to it. That is one more cost of handing out the handle, and the same one the
+    /// golden thread pays.
+    ///
+    /// A poisoned lock is treated as held-and-released rather than fatal: the data is an
+    /// `Arc<Store>` that no panic here can leave half-written, since every mutation goes
+    /// through an oxigraph transaction that either commits or does not.
+    pub(crate) fn write_lock(&self) -> MutexGuard<'_, ()> {
+        self.writes.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

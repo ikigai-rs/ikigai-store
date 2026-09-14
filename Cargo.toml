@@ -55,7 +55,17 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # crate — keep it that way. Publishing remains Brian's, always.
 # 0.2.0, not a patch onto 0.1.70: crates.io never re-uses a yanked version, and this code
 # has none of the shape the number 0.1.70 was attached to.
-version = "0.2.0"
+#
+# ★ 0.2.1 is a PATCH and that is deliberate, not laziness. Everything it adds is
+# additive — a `bindings` argument that is optional, a new `urn:iki:store:graph-update`
+# IRI and its capability, a third golden thread that only ever invalidates MORE, and the
+# `sparql` module. Nothing existing changed shape. Under cargo's 0.x rules the second
+# number is the BREAKING one, so bumping to 0.3.0 would force `ikigai-ledger` and
+# `ikigai-cli` — both live on `^0.2` — to edit a manifest for a release that breaks
+# nothing, which is exactly the ceiling trap constitution 5 warns about from the other
+# direction. A consumer that wants the new API pins `0.2.1`; one that does not, does
+# nothing.
+version = "0.2.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -101,6 +111,13 @@ oxigraph = { version = "0.5", default-features = false }
 # The layered `store.toml`. `deny_unknown_fields` on the layer type is what makes a
 # misspelled key loud instead of ignored. Both crates are pure Rust and wasm-clean.
 serde = { version = "1", features = ["derive"] }
+# The `bindings=` argument's wire shape is the SPARQL 1.1 Query Results JSON term object
+# — the same shape a row comes back in, so a value read out of one query binds into the
+# next without conversion. JSON rather than a line format because JSON's own types make
+# string/number/boolean/object unambiguous, and because a consumer's JSON library does
+# the escaping instead of the consumer. Pure Rust and wasm-clean, like everything else
+# here.
+serde_json = "1"
 toml = "0.8"
 
 # On wasm, Oxigraph needs its `js` feature (getrandom wasm backend) to build.
@@ -109,9 +126,15 @@ oxigraph = { version = "0.5", default-features = false, features = ["js"] }
 
 [dev-dependencies]
 futures = "0.3"
-# The module recipe as one test, from day one — condition 6. 0.2.0 is the published
-# version and the one whose DECLARATIONS check exists.
-ikigai-conformance = "0.2"
+# The module recipe as one test, from day one — condition 6. 0.3.0 for the AUTHORITY
+# check, which exists for Sinks like this crate's: a mutating action that declares no
+# `requires` and mutates anyway under a capability holding no grants. Both write doors
+# here declare a scope, so AUTHORITY is silent on them by design — it is ENFORCED that
+# holds those, in both directions, and `tests/graph_scope.rs` that ablates the
+# parameterized half the suite cannot see.
+# ⚠ 0.3 rather than 0.2 is a CEILING move as well as a floor: `"0.2"` means `<0.3.0`, so
+# the new check would never have arrived on its own.
+ikigai-conformance = "0.3"
 # `TurtleRenderer` for the `Meta` face the kernel routes. ⚠ Resolution consequence worth
 # knowing: vocab 0.1.70 requires core 0.1.66, so the TEST graph is pulled to that even
 # though the library above genuinely builds on 0.1.57.
