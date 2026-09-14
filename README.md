@@ -26,7 +26,8 @@ That `.clone()` is the whole point of the line and it is why this snippet change
 RocksDB refuses a second open of the same directory **from the same process**, through
 its own in-process registry — so a host with more than one kernel (several CLI modes, a
 test binary with a dozen), written the obvious way, gets `Error::Unavailable` on the
-second one. `ikigai-cli`'s binding arc hit exactly this and had to memoize the space.
+second one. This is not hypothetical: the first host to bind this crate hit exactly
+that and had to memoize the space.
 
 `DurableStore` is `Clone` and holds an `Arc<Store>`, so the fix is to open once and hand
 each kernel a clone: they share the dataset, the write lock, and the coverage flag.
@@ -135,8 +136,9 @@ interpolation with a longer name, in the one place where getting it wrong is `DR
 `urn:cap:store:write` is all-or-nothing and it means `DROP ALL`. Because a sub-request
 carries the caller's capability unchanged, a module layered over this store makes its
 callers hold that authority to append one triple — so the moment such a module is bound,
-any session that may file an item may also destroy everything. That is why `ikigai-cli`'s
-binding arc refused to put the store on the served space or the HTTP door at all.
+any session that may file an item may also destroy everything. That is why the first host
+to bind this crate kept the store off its served space and off its HTTP door entirely,
+and why a host that wants either should reach for the narrow door below instead.
 
 `urn:iki:store:graph-update` is the narrow door. It takes an arbitrary SPARQL UPDATE and
 a `graph=` IRI, and requires `urn:cap:store:write:graph:<that IRI>`.
@@ -331,8 +333,8 @@ and pays for it in cacheability, at the call site, on the line where the choice 
 
 `ikigai-core/docs/design/cache-ejection.md` works out cross-process cache export and stops
 because there is nowhere durable to put it. The obvious reading — two instances sharing
-one store — collides head-on with the one-writer rule above, so Brian settled it on
-2026-09-13: **the bundle is a file the second instance imports into its own store.**
+one store — collides head-on with the one-writer rule above, so the design settles the
+other way: **the bundle is a file the second instance imports into its own store.**
 
 Nothing exports and nothing imports yet. [`docs/design/cache-bundle.md`](docs/design/cache-bundle.md)
 records which of that design's constraints land here (four of its five are already
@@ -377,9 +379,9 @@ names the path**, ever — an env var is invisible to `ikigai config`, is not in
 a launchd agent, and two processes that disagree about it never meet. An unknown key, an
 empty `path` and an unwritable directory are all loud.
 
-## Status: publishable as of 2026-09-13; 0.2.1 and 0.2.2 are additive
+## Status
 
-0.2.2 adds the four `urn:iki:store:graph-{select,ask,construct,describe}` IRIs and
+**0.2.1 and 0.2.2 are purely additive.** 0.2.2 adds the four `urn:iki:store:graph-{select,ask,construct,describe}` IRIs and
 `urn:cap:store:read:graph:*`, closing the read half of the tenancy boundary. 0.2.1 added
 `bindings=`, `ikigai_store::sparql`, `urn:iki:store:graph-update` and its capability, and
 a third golden thread. **Nothing existing changed shape in either**, so the two live
@@ -391,11 +393,11 @@ side.
 
 
 
-`ikigai-core` #110 set seven conditions for lifting `publish = false`, and 0.2.0 meets all
+The crate carried `publish = false` until it met seven conditions, and 0.2.0 meets all
 seven — durable backend, a `Sink` that writes through the kernel, declared = enforced
 capabilities in both directions, a golden thread the writer cuts, typed inputs and an `as`
 selector that refuses rather than substitutes, an `ikigai-conformance` walk, and a
-namespace this crate owns. Brian yanked 0.1.70 and lifted the guard.
+namespace this crate owns. 0.1.70 was yanked and the guard came off.
 
 **Why 0.2.0 and not a patch.** 0.1.70 was the in-memory placeholder, shipped by a lockstep
 sweep on 2026-09-12 and yanked the next day at 9 downloads. crates.io never re-uses a
@@ -405,8 +407,8 @@ here is now a deliberate act on one crate rather than a side effect of a kernel 
 
 ## Where this lives, and why
 
-Its own repo since 2026-09-13 (`ikigai-core` #110/#111), with the crate's 13 commits of
-history carried across by `git subtree split`.
+Its own repo since 2026-09-13, split out of the `ikigai-core` workspace with the crate's
+13 commits of history carried across by `git subtree split`.
 
 **Not because of wasm** — that claim is false and should stop being repeated. Core's
 `wasm-check` runs with *default* features, and Oxigraph target-gates `oxrocksdb-sys` off
@@ -418,8 +420,8 @@ The reasons that survive that check: **native compile cost charged to the founda
 it is a build script, on the most-frequently-built workspace in the ecosystem, plus
 `libclang` in its toolchain expectations and an edge runbook that already records an
 OOM-killed compiler); **lockstep versioning**, which is how this crate got published by
-accident; and **precedent twice in that same workspace** — `ikigai-fs` (#21) and
-`ikigai-shacl` (#52), the latter a near-exact analogy.
+accident; and **precedent twice in that same workspace** — `ikigai-fs` and `ikigai-shacl`
+both left it the same way, the latter a near-exact analogy.
 
 ## License
 
