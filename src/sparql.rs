@@ -161,6 +161,12 @@ pub fn term(value: &Term) -> String {
 /// query does not mention is therefore *refused* rather than silently ignored — see
 /// [`crate::endpoints`] for why refusing is the right half of that choice.
 ///
+/// ⚠ **An RDF-star quoted triple panics.** It has no term object in the shape above, and
+/// the endpoint that parses this argument could not rebuild one, so there is nothing
+/// honest to emit; see `term_to_json` for why that arm exists at all and why it is a
+/// catch-all. The variant is only reachable in a build where some crate has enabled
+/// `oxrdf/rdf-12`.
+///
 /// ```
 /// // The term types come from here too, so a consumer needs no `oxigraph` dependency
 /// // of its own — and therefore cannot end up with a second, incompatible `Term`.
@@ -194,10 +200,48 @@ fn term_to_json(term: &Term) -> serde_json::Value {
                 json!({"type": "literal", "value": l.value(), "datatype": dt.as_str()})
             }
         },
-        // No catch-all: `Term` has exactly these three variants in the build this crate
-        // pins (the RDF-star triple term is behind a feature nothing here enables), and a
-        // wildcard arm would silently absorb a fourth into a wrong-but-plausible literal
-        // instead of failing to compile.
+        // ★ THIS ARM IS THE FIX FOR 0.2.2, WHICH DID NOT COMPILE FOR A REAL CONSUMER.
+        //
+        // What was here was a comment saying `Term` has exactly three variants "in the
+        // build this crate pins", because the RDF-star triple term is "behind a feature
+        // nothing here enables". Both halves were true of THIS crate's dependency graph
+        // and neither was true of a consumer's: cargo feature unification is global, so
+        // `oxrdf/rdf-12` turned on by ANY sibling in the build adds `Term::Triple` and
+        // this match stops being exhaustive. `ikigai-cli` is such a build (rudof, through
+        // `ikigai-shacl`), and 0.2.2 therefore failed to compile there with E0004 —
+        // published, and broken for everyone downstream of it.
+        //
+        // ⚠ **Exhaustiveness over a third-party enum with feature-gated variants is not a
+        // property a downstream crate can assert at all.** There is no build in which all
+        // of `Term`'s variants are simultaneously visible-and-required, and a crate cannot
+        // `cfg` on a dependency's feature, so no arm and no `cfg` can make the match both
+        // total and portable. A catch-all is not a preference here; it is the only shape
+        // that compiles in both configurations.
+        //
+        // So the original reasoning survives where it can: a wildcard must not COERCE. The
+        // failure it guarded against was a fourth variant silently becoming a
+        // wrong-but-plausible literal, and this arm refuses instead — loudly, naming the
+        // term. A quoted triple has no term object in the SPARQL 1.1 Query Results shape
+        // this module speaks, and — the part that settles it — `parse_bindings` could not
+        // rebuild one even if this side invented a shape, because constructing
+        // `Term::Triple` needs a feature this crate does not control. Emitting a shape we
+        // can never accept would break exactly the round-trip `bindings_json` promises
+        // (`bindings_json_round_trips_through_parse_bindings` is the pin).
+        //
+        // It panics because the signature is infallible and 0.2.3 is a patch: making this
+        // fallible would change `bindings_json`'s return type and break every consumer to
+        // fix a case none of them can currently reach. If a non-fatal path is ever wanted,
+        // the additive shape is a `try_bindings_json() -> Result<String>` sibling.
+        #[allow(unreachable_patterns)] // reachable only when a sibling crate enables `oxrdf/rdf-12`
+        other => panic!(
+            "ikigai-store: `bindings` cannot carry {other}. The SPARQL results term object \
+             has shapes for an IRI, a blank node and a literal and nothing else, and the \
+             endpoint that parses this argument can only rebuild those three — a shape \
+             emitted here that cannot be read back there is not a binding, it is a \
+             plausible-looking lie. Bind the parts separately, or put the term into the \
+             query text with `ikigai_store::sparql::term`, which serializes any term \
+             oxigraph can build"
+        ),
     }
 }
 
@@ -480,5 +524,26 @@ mod tests {
         assert_eq!(back["title"], r#""a \" b""#);
         assert_eq!(back["s"], "<urn:example:a>");
         assert_eq!(back["n"], integer(3));
+    }
+
+    /// ★ The fourth `Term` variant, in the ONLY build that can see it.
+    ///
+    /// ⚠ The `cfg` here is sound in the direction the arm's `cfg` would not be: this
+    /// crate's `rdf-12` feature enables `oxigraph/rdf-12`, so if the feature is on the
+    /// variant certainly exists. The converse fails — a consumer reaches the variant
+    /// through rudof without this feature — which is why `term_to_json`'s arm is a
+    /// catch-all and this test is not what protects that build. What this pins is the
+    /// BEHAVIOUR of the arm: a refusal naming the term, never a binding.
+    #[test]
+    #[cfg(feature = "rdf-12")]
+    #[should_panic(expected = "cannot carry")]
+    fn a_quoted_triple_is_refused_and_never_coerced_into_a_literal() {
+        use oxigraph::model::Triple;
+        let quoted = Term::Triple(Box::new(Triple::new(
+            NamedNode::new("urn:example:s").unwrap(),
+            NamedNode::new("urn:example:p").unwrap(),
+            NamedNode::new("urn:example:o").unwrap(),
+        )));
+        let _ = bindings_json([("t", quoted)]);
     }
 }

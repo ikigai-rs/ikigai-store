@@ -348,6 +348,7 @@ must *not* be built here.
 | --- | --- | --- |
 | *(default)* | in-memory only, wasm-clean | — |
 | `persistent` | `DurableStore::open`, the RocksDB backend | `oxrocksdb-sys` (~494 s of CPU on a cache miss) and `libclang` in the toolchain |
+| `rdf-12` | nothing you would use — it turns on `oxigraph/rdf-12` so CI compiles this crate the way a consumer's graph does | a few seconds of `oxrdfio`/`spareval` |
 
 The same trade `ikigai-cli` makes for `quic` and `web`: in-memory is the default so the
 wasm face and cheap tests survive, and the heavy backend is opted into.
@@ -359,9 +360,34 @@ backend, `ikigai-sparql`'s copy included. That is exactly what makes the
 `space_with_store` composition work — one `Store` type either way — and it means "off by
 default" is a property of the whole build, not of this crate.
 
-`ci.yml` passes `features: persistent`, and must keep doing so: the durable backend lives
-behind a `cfg(feature)` inside a *library*, which is not a target, so `--all-targets`
-never reaches it and `ci-drift`'s `required-features` check cannot see the omission.
+### ★ `rdf-12` is a gate, and 0.2.2 is what it is for
+
+Unification cuts the other way too, and that is how **0.2.2 shipped to crates.io not
+compiling for `ikigai-cli`**. `oxrdf::Term` grows a fourth variant under `rdf-12`;
+`ikigai-cli` has a crate that enables it (rudof, through `ikigai-shacl`); an exhaustive
+`match` here stopped being exhaustive there, with `error[E0004]`. Nothing this crate
+declared could see that, because the feature belonged to a *dependency* and was turned on
+by a *sibling*.
+
+`ci.yml` therefore passes `features: "*"` — `--all-features`, which keeps `persistent` on
+(the durable backend lives behind a `cfg(feature)` inside a *library*, which is not a
+target, so `--all-targets` never reaches it and `ci-drift`'s `required-features` check
+cannot see the omission) and additionally reaches `rdf-12`.
+
+⚠ **Know what that does not cover.** `--all-features` enables the features *this manifest
+declares*; it cannot enumerate what a consumer's graph might switch on. It catches this
+break because `rdf-12 = ["oxigraph/rdf-12"]` was added by hand for it to reach. A future
+unification break through a feature nobody declared here would be exactly as invisible as
+this one was, and the gate that covers the class is a build of this crate inside a real
+consumer's graph, run on a clock that ticks when nothing happens.
+
+⚠ **A consumer's graph can also change what lands on disk.** Oxigraph's binary encoder
+gives quoted triples and directional language strings their own on-disk type bytes, all
+of them `#[cfg(feature = "rdf-12")]`. Read from the encoder, not measured end to end: a
+build without the feature has no arm for those type bytes, and the decoder's answer to an
+unknown one is `CorruptionError`, so any quad an `rdf-12` build wrote using such a term
+cannot be read back by a build without it. For a *persistent* store that makes a sibling
+crate's feature a data-format decision, and dropping that sibling later a downgrade.
 
 ## Configuration
 
@@ -380,6 +406,11 @@ a launchd agent, and two processes that disagree about it never meet. An unknown
 empty `path` and an unwritable directory are all loud.
 
 ## Status
+
+**0.2.3 fixes a crate that did not compile for a real class of consumer** — one match arm
+over `oxrdf::Term`, plus the gate that should have caught it; see the Features section.
+Nothing in the API changed. **0.2.2 should be treated as broken** wherever `oxrdf/rdf-12`
+is enabled anywhere in the build.
 
 **0.2.1 and 0.2.2 are purely additive.** 0.2.2 adds the four `urn:iki:store:graph-{select,ask,construct,describe}` IRIs and
 `urn:cap:store:read:graph:*`, closing the read half of the tenancy boundary. 0.2.1 added

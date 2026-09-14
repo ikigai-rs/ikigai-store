@@ -992,6 +992,20 @@ fn serialize_solutions(results: QueryResults, as_type: Option<&str>) -> Result<(
         // Unreachable: the caller checked the shape against the IRI first, and that
         // check is the point — this arm is here so a future refactor that drops it
         // fails loudly rather than serving a graph as a result set.
+        //
+        // ★ This match is exhaustive over a THIRD-PARTY enum with no catch-all, which is
+        // the shape that broke 0.2.2 in `sparql.rs`. It is kept, and the difference is
+        // the whole rule: **`QueryResults`'s three variants are ungated**, while
+        // `oxrdf::Term`'s fourth is `#[cfg(feature = "rdf-12")]`. An ungated variant
+        // added upstream appears in THIS crate's build too, so exhaustiveness turns it
+        // into a compile error here — on our CI, before a consumer ever sees it, which
+        // is exactly what we want. A GATED variant appears only in builds we do not
+        // control, so the same exhaustiveness is a landmine that detonates downstream.
+        // ⚠ Nothing checks that distinction automatically: if spareval ever puts a
+        // variant behind a feature, this match joins the trap silently. Audited
+        // 2026-09-13 against spareval 0.2.7, along with `serde_json::Value` in
+        // `sparql::json_to_term` (no gated variants either) and `GraphName` in
+        // `confine.rs` (ungated, and it has a catch-all regardless).
         QueryResults::Graph(_) => {
             return Err(Error::Endpoint(
                 "internal: a graph reached the result-set serializer".to_string(),
