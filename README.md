@@ -329,6 +329,59 @@ There is no accessor that turns the first into the second. A host that wants
 and pays for it in cacheability, at the call site, on the line where the choice is made.
 `urn:iki:store:info` reports `covered: true|false` so an operator can see which it got.
 
+### …unless the host can say where the sharer writes (0.2.4)
+
+That blanket is one bit for the whole store, and it is expensive in a way nothing
+catches: expiry **propagates**, so a module whose reads are sub-requests to
+`urn:iki:store:graph-select` silently loses its own caching the day its host adds a
+second face over the same dataset. Measured here on a 250-item tenant graph: **1.05 ms
+per read shared, 32.5 µs owned** (`tests/shared_coverage.rs::measure_the_cost_of_sharing`).
+
+A **scoped** read is confined to one named graph by construction, and the default graph
+has no IRI, so no scoped read can reach it. A host that knows its sharer writes only the
+default graph therefore knows the sharer cannot change any scoped read's answer:
+
+```rust
+// `ikigai-browse` writes annotations, explanations and review passes into the default
+// graph, hard-coded. Say so, and every scoped read is cacheable again — 31.1 µs.
+let (store, handle) = DurableStore::open_shared_declaring(
+    &path,
+    SharerWrites::only_the_default_graph(),
+)?;
+
+// A sharer that also owns one named graph of its own names it; reads of THAT graph stay
+// bare, reads of every other named graph do not.
+let (store, handle) = DurableStore::open_shared_declaring(
+    &path,
+    SharerWrites::only_the_default_graph().and_named_graph("urn:iki:browse:notes"),
+)?;
+```
+
+The broad faces and `urn:iki:store:info` see the whole dataset, default graph included,
+so they stay `Expiry::Always` on any shared store whatever was declared.
+
+⚠⚠ **This is a promise, and a false one is silent, unbounded staleness** — the worst
+failure this crate has, and the exact thing `with_freshness` exists to prevent. Declare a
+graph the sharer does write and reads of it are cached against threads that write never
+cuts: pre-write bytes, for the life of the process, with no error and no signal. So the
+promise names every graph, there is no "trust me" form, and a host that does not know
+keeps `open_shared`, which costs only speed.
+
+**Pin it in your own tests** rather than trusting the prose —
+`DurableStore::reserved_graphs_fingerprint()` is the tripwire, taken before and after
+driving the sharer:
+
+```rust
+let before = store.reserved_graphs_fingerprint()?;
+// …drive the sharer exactly as this host does…
+let changed = store.reserved_graphs_fingerprint()?.changed_since(&before);
+assert!(changed.is_empty(), "the sharer wrote {changed:?}, which it promised not to");
+```
+
+It fingerprints **quads**, not the set of graph names, so it catches a sharer writing
+into a graph that already exists as well as one creating a new graph — and it refuses
+outright on a store that declared nothing, rather than passing vacuously.
+
 ## Cache ejection: a file, not a shared store
 
 `ikigai-core/docs/design/cache-ejection.md` works out cross-process cache export and stops

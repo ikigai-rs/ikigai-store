@@ -190,6 +190,54 @@ There is no accessor that turns the first into the second. A host that wants
 advertises — asks for `open_shared` and pays for it in cacheability, at the call site,
 visibly, on the line where the choice is made.
 
+## Narrowing the hole: which graphs the sharer writes (0.2.4)
+
+The blanket above is one bit for the whole store, and the price is not small. **Expiry
+propagates**, so a module whose reads are sub-requests into this crate loses its own
+caching the day its host shares the handle — even though the module declared
+`.cacheable()` and nothing about the module changed. `ikigai-gonk` measured ~1000× on a
+247-item ledger and recovered it by re-declaring the scoped faces cacheable from outside
+this crate (147 lines of `src/freshness.rs`), which is an argument about `ikigai-store`'s
+own concepts — scope confinement, graph names, the write threads — being reconstructed by
+someone who cannot see them.
+
+The argument it reconstructed is sound and belongs here:
+
+- A **scoped** read is confined to one named graph *by construction* — `src/scope.rs`
+  sets the prepared query's dataset specification to `[G]`, so the query's whole universe
+  is `G`.
+- The **default graph has no IRI**, so no `urn:cap:store:read:graph:` token names it and
+  no scoped query reaches it.
+- Therefore a sharer that writes only the default graph cannot change any scoped read's
+  answer, and those reads are as covered as they would be on an owned store.
+
+`open_shared_declaring(path, SharerWrites)` takes that as a promise from the host and
+`DurableStore::read_is_covered(graph)` applies it per read:
+
+| coverage | broad read / `info` | scoped read of `G` |
+| --- | --- | --- |
+| owned | covered | covered |
+| shared, undeclared | bare | bare |
+| shared, declaring `W` | **bare** | covered iff `G ∉ W` |
+
+The broad column is bare on both shared rows because a broad read sees the default graph
+and the sharer may always write it — that is what sharing the handle is *for*. Nothing
+`SharerWrites` can express changes that, and a host wanting cached broad reads wants
+`open`.
+
+**What this costs when it is wrong.** Everything the rule above `with_freshness` warns
+about: a thread that is right on some writes and wrong on others is worse than no thread.
+Declare a graph the sharer does write and the kernel serves pre-write bytes for the life
+of the process, with no error, no log line and no expiry to wait out
+(`a_declared_promise_that_is_broken_is_silent_staleness` asserts exactly that, so the cost
+is a fact in the suite rather than a warning in a paragraph). Hence: no "trust me" form,
+every graph named, and `reserved_graphs_fingerprint()` offered as the tripwire so the
+promise is something a host's test can pin rather than something it hopes.
+
+⚠ It also does **not** touch the other cost of a shared handle: `write_lock` still covers
+only this crate's writes, so a raw-handle write can still lose a scoped update's
+read-modify-write, declared or not. The declaration is about *freshness*, not atomicity.
+
 ## What would reopen this
 
 - A host genuinely needing two processes read-write against one directory. The answer is

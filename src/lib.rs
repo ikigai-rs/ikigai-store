@@ -133,6 +133,24 @@
 //! owned store into a shared one later. The choice is made at the call site, on the line
 //! where it is paid for.
 //!
+//! ★ **…unless the host can say WHERE the sharer writes.** One bit for the whole store
+//! is expensive in a way nothing catches — expiry propagates, so a module reading through
+//! `urn:iki:store:graph-select` loses its own caching when its host adds a second face
+//! over the same dataset (measured: 1.05 ms per read shared against 32.5 µs owned, on a
+//! 250-item graph; `tests/shared_coverage.rs`). A **scoped** read is confined to one
+//! named graph by construction and the default graph has no IRI, so a sharer that writes
+//! only the default graph cannot change any scoped read's answer.
+//! `DurableStore::open_shared_declaring` (feature `persistent`) takes that promise as a
+//! [`SharerWrites`] and
+//! [`DurableStore::read_is_covered`] applies it per read; the broad faces and
+//! `urn:iki:store:info` see everything and stay bare regardless.
+//!
+//! ⚠⚠ It is a **promise by the host**, and a false one is silent, unbounded staleness —
+//! reads cached against threads the sharer's write never cuts. Read [`SharerWrites`]
+//! before using it, and pin the promise in the host's own tests with
+//! [`DurableStore::reserved_graphs_fingerprint`], which is offered here precisely so
+//! that every host does not invent its own.
+//!
 //! # Cache ejection
 //!
 //! `ikigai-core`'s `cache-ejection.md` stops because there is nowhere durable to put an
@@ -179,4 +197,4 @@ pub use endpoints::{
     cap_read_graph, cap_write_graph, space, CAP_READ, CAP_READ_GRAPH, CAP_WRITE, CAP_WRITE_GRAPH,
     GRAPH_UPDATE_THREAD, LOAD_THREAD, UPDATE_THREAD,
 };
-pub use store::{Backing, DurableStore, Store};
+pub use store::{Backing, DurableStore, GraphFingerprint, SharerWrites, Store};
