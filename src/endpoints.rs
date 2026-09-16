@@ -61,7 +61,10 @@
 //! 2. **Reaching `space_with_store` means handing out the `Arc<Store>`**, which forfeits
 //!    golden-thread coverage for the life of the store (see [`crate::DurableStore`]).
 //!    A read through *this* face is covered and therefore cacheable; a read through that
-//!    one never can be.
+//!    one never can be. ★ And when the handle does leave, this face is the only one
+//!    that can take the host's [`SharerWrites`](crate::SharerWrites) declaration into
+//!    account — a scoped read of a graph the sharer cannot write is cacheable again,
+//!    which the other face has no way to know or to say.
 //!
 //! So the duplication is one `evaluate` and one `serialize` — and it is the price of a
 //! gated, cacheable read. The composition the README describes is still available and
@@ -272,15 +275,29 @@ pub fn space(store: DurableStore) -> EndpointSpace {
         .bind(Exact::new("urn:iki:store:load"), LoadEndpoint { store })
 }
 
-/// Cacheable under both write threads when the store is covered; `Expiry::Always` when
-/// the handle was handed out and an invisible writer may exist.
+/// Cacheable under all three write threads when this read is covered; `Expiry::Always`
+/// when an invisible writer may have changed what it read.
 ///
 /// ★ This is the one place the coverage decision has teeth. `ikigai-sparql` documents
 /// why a thread that is right on some writes and wrong on others is worse than no
 /// thread — "always fresh" becomes "fresh until someone writes the other way, then stale
 /// with no bound and no signal". A covered store has no other way to write.
-fn with_freshness(rep: Representation, store: &DurableStore) -> Representation {
-    if store.is_covered() {
+///
+/// ⚠ **`graph` is the whole difference between a right answer and a wrong one**, which
+/// is why it is threaded from the call sites rather than read off the store: on a store
+/// built with `open_shared_declaring` the answer is per-read, not per-store. `Some(g)`
+/// is a scoped read — its universe is that one named graph, by construction
+/// (`src/scope.rs`) — and `None` is every read that can see the whole dataset, the
+/// default graph included. Passing `None` where a graph was known is merely slow;
+/// passing `Some` where the read was NOT confined would cache a read of the whole
+/// dataset under a promise about one graph, which is the silent staleness above.
+/// [`DurableStore::read_is_covered`] holds the table.
+fn with_freshness(
+    rep: Representation,
+    store: &DurableStore,
+    graph: Option<&NamedNode>,
+) -> Representation {
+    if store.read_is_covered(graph.map(NamedNode::as_str)) {
         rep.cacheable()
             .depends_on(UPDATE_THREAD)
             .depends_on(LOAD_THREAD)
@@ -420,6 +437,9 @@ impl Endpoint for QueryEndpoint {
                         bytes,
                     ),
                     &self.store,
+                    // `target` is `Some` exactly when `confine` ran, so this is the
+                    // read's real universe and not a restatement of the IRI.
+                    target.as_ref(),
                 ))
             }
             other => Err(unsupported(self.id, other)),
@@ -623,17 +643,37 @@ impl Endpoint for InfoEndpoint {
                     .dataset()
                     .len()
                     .map_err(|e| Error::Endpoint(format!("counting quads: {e}")))?;
-                let text = format!(
+                let mut text = format!(
                     "backing: {}\nquads: {quads}\ncovered: {}\n",
                     self.store.backing(),
                     self.store.is_covered()
                 );
+                // ★ A fourth line ONLY when there is a declaration, so the bytes an
+                // existing host reads are unchanged — and so the line's presence is
+                // itself the signal that this store's scoped reads are cached under a
+                // promise, which is a thing an operator should be able to see from
+                // outside the process.
+                if let Some(writes) = self.store.sharer_writes() {
+                    let named: Vec<String> = writes
+                        .named_graphs()
+                        .map(|iri| format!("<{iri}>"))
+                        .collect();
+                    text.push_str("sharer writes: the default graph");
+                    if !named.is_empty() {
+                        text.push_str(&format!(" and {}", named.join(", ")));
+                    }
+                    text.push('\n');
+                }
                 Ok(with_freshness(
                     Representation::new(
                         ReprType::new("text/plain").with_param("charset", "utf-8"),
                         text.into_bytes(),
                     ),
                     &self.store,
+                    // `info` counts every quad in the dataset, the default graph
+                    // included, so it is never confined and never covered on a shared
+                    // store — whatever was declared.
+                    None,
                 ))
             }
             other => Err(unsupported("store-info", other)),
@@ -650,7 +690,10 @@ impl Endpoint for InfoEndpoint {
             .summary(
                 "Where this store's bytes live, how many quads it holds, and whether its \
                  golden-thread coverage is intact (`covered: false` means the raw handle \
-                 was handed out at construction and no read here can be cached).",
+                 was handed out at construction, so this face and the broad query faces \
+                 are never cached). A `sharer writes:` line, when present, names the \
+                 graphs the host declared that handle's holder may write — every OTHER \
+                 named graph is one whose scoped reads are cached under that promise.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)

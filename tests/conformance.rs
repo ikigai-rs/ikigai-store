@@ -54,7 +54,7 @@
 use futures::executor::block_on;
 use ikigai_conformance::{Fixture, Suite};
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
-use ikigai_store::{space, DurableStore};
+use ikigai_store::{space, DurableStore, SharerWrites};
 use std::sync::Arc;
 
 /// A kernel over `store`, **seeded through its own Sink** with the one triple the RDF
@@ -125,9 +125,10 @@ const SCOPED_UPDATE: &str = "INSERT DATA { GRAPH <urn:example:conformance:graph>
                              <urn:example:conformance> \
                              <http://purl.org/dc/terms/title> \"conformance\" } }";
 
-/// The fixtures both walks share. The cacheable/live DECLARATION is deliberately not
-/// here: it is the one thing the two modes disagree about, so each test states its own
-/// rather than the suite carrying both and contradicting itself.
+/// The fixtures all three walks share. The cacheable/live DECLARATION is deliberately
+/// not here: it is the one thing the three modes disagree about — and the third
+/// disagrees with itself, row by row — so each test states its own rather than the suite
+/// carrying them all and contradicting itself.
 fn fixtures() -> Suite {
     let suite = FORM_FIXTURES
         .iter()
@@ -156,7 +157,7 @@ fn scoped_id(id: &str) -> String {
     id.replace("store-", "store-graph-")
 }
 
-/// Every read endpoint, for the declaration both walks make about all of them. ★ A scoped
+/// Every read endpoint, for the declaration each walk makes about them. ★ A scoped
 /// read is cacheable exactly like a broad one — it depends on the same three write
 /// threads — and saying so here is what would catch a scoped face that quietly stopped
 /// being cached.
@@ -196,6 +197,32 @@ fn a_shared_store_conforms_as_a_live_one() {
         .iter()
         .fold(fixtures(), |suite, id| suite.live(*id))
         .run_blocking(&kernel(store));
+    println!("{report}");
+    assert!(report.is_clean(), "{report}");
+}
+
+/// ★ The third mode, walked the same way: a shared store whose host declared that the
+/// handle's holder writes only the default graph. The declaration splits the read list
+/// in two — the four SCOPED faces go back to `cacheable` (their universe is one named
+/// graph the sharer cannot write), the four broad ones and `store-info` stay `live`
+/// (they see the default graph).
+///
+/// This is the walk that would fail if the per-graph decision ever collapsed back into
+/// one bit in either direction: a blanket `bare` fails the scoped rows, a blanket
+/// `cacheable` fails the broad ones.
+#[test]
+fn a_declared_shared_store_conforms_as_cacheable_exactly_where_it_promised() {
+    let (store, handle) =
+        DurableStore::in_memory_shared_declaring(SharerWrites::only_the_default_graph()).unwrap();
+    drop(handle);
+    let suite = READS.iter().fold(fixtures(), |suite, id| {
+        if id.starts_with("store-graph-") {
+            suite.cacheable(*id)
+        } else {
+            suite.live(*id)
+        }
+    });
+    let report = suite.run_blocking(&kernel(store));
     println!("{report}");
     assert!(report.is_clean(), "{report}");
 }
