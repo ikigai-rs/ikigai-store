@@ -103,13 +103,31 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # only `store:info` and `with_freshness` read it), and both were moved.
 #
 # ★ 0.2.5 is a PATCH by the same argument the four before it made. It adds one resource
-# (`urn:iki:store:graph-list`), one exported constant (`CAP_READ_ANY`) and nothing else:
+# (`urn:iki:store:graphs`), one exported constant (`CAP_READ_ANY`) and nothing else:
 # no existing IRI, capability, thread, output or type changed shape, and the new read
 # reuses the three write threads rather than introducing a fourth. A consumer that wants
 # the enumeration pins `0.2.5`; one that does not, does nothing. ⚠ It DOES change what an
 # existing host's manifold offers — a thirteenth action appears — so a host with a test
 # that counts endpoints or diffs the catalog will see it; that is the only observable
 # effect on a caller who does not resolve the new IRI.
+#
+# ★ 0.2.5 also does the two things that are FREE NOW and flag days after it publishes,
+# which is the whole reason they are in this version and not the next:
+#   1. The new resource was drafted as `urn:iki:store:graph-list` and is named
+#      `urn:iki:store:graphs`. Resource names are nouns: the resource IS the graphs, and
+#      `-list` named the shape of one representation rather than the thing. Renamed
+#      OUTRIGHT — no alias, no shim, no window — because a name that never published has
+#      no consumers to keep faith with. The endpoint id moved with it
+#      (`store-graph-list` → `store-graphs`), which matters because that id is what an
+#      MCP tool list projects.
+#   2. `DurableStore::is_covered` is `#[deprecated]` in favour of `is_sole_writer`, an
+#      exact delegate — so this is additive too, and the version stays a patch. It is the
+#      one thing in 0.2.4 that a consumer could read wrong without any signal: same name,
+#      same signature, same return type, and an INVERTED meaning for
+#      `open_shared_declaring` stores. A doc warning only works on the reader who reads
+#      it; a `#[deprecated]` note works on the compiler. Checked before deciding: no
+#      consumer in the ecosystem calls it (`ikigai-cli`, `ikigai-gonk`, `ikigai-ledger`),
+#      so nobody's `-D warnings` build turns red on this.
 version = "0.2.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"

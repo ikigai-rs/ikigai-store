@@ -159,8 +159,9 @@ impl SharerWrites {
 
 /// What this crate can see of the writes to its dataset. Private: the three cases are
 /// reached through the constructors and read through
-/// [`is_covered`](DurableStore::is_covered), [`sharer_writes`](DurableStore::sharer_writes)
-/// and [`read_is_covered`](DurableStore::read_is_covered).
+/// [`is_sole_writer`](DurableStore::is_sole_writer),
+/// [`sharer_writes`](DurableStore::sharer_writes) and
+/// [`read_is_covered`](DurableStore::read_is_covered).
 #[derive(Clone, Debug)]
 enum Coverage {
     /// The handle never left: every write is a write the kernel saw.
@@ -200,9 +201,9 @@ enum Coverage {
 ///   promise is load-bearing and a false one is silent, unbounded staleness.
 ///
 /// The choice is therefore made at the call site, visibly, on the line where the cost
-/// is taken. [`is_covered`](DurableStore::is_covered) reports whether the handle stayed;
-/// [`read_is_covered`](DurableStore::read_is_covered) answers the per-read question the
-/// endpoints actually ask.
+/// is taken. [`is_sole_writer`](DurableStore::is_sole_writer) reports whether the handle
+/// stayed; [`read_is_covered`](DurableStore::read_is_covered) answers the per-read
+/// question the endpoints actually ask.
 #[derive(Clone)]
 pub struct DurableStore {
     store: Arc<Store>,
@@ -335,24 +336,54 @@ impl DurableStore {
         &self.backing
     }
 
-    /// Whether the golden-thread coverage holds for the WHOLE dataset: `true` when the
-    /// handle never left this crate, so every write is a write the kernel saw. `false`
-    /// after any of the `*_shared*` constructors.
+    /// **Whole-dataset provenance**: `true` when this crate is the only writer of this
+    /// dataset, because the handle never left it — so every write to it is a write the
+    /// kernel saw. `false` after any of the `*_shared*` constructors, declaring or not.
     ///
-    /// ⚠ **`false` no longer means "no read here is cacheable"** — that is what
-    /// [`read_is_covered`](Self::read_is_covered) answers, and on a store built with
-    /// `open_shared_declaring` a scoped read of a graph
-    /// the sharer cannot write is covered while this is still `false`. The two questions
-    /// were one bit until 0.2.4, and everything that reads this bit to decide *caching*
-    /// wants the other one.
-    pub fn is_covered(&self) -> bool {
+    /// It answers *did the handle escape*, and nothing else. In particular it is **not
+    /// the caching question**: [`read_is_covered`](Self::read_is_covered) is, and on a
+    /// store built with `open_shared_declaring` a scoped read of a graph the sharer
+    /// cannot write is cached while this is still `false`.
+    ///
+    /// ⚠ **The two were one bit until 0.2.4**, and separating them is why this method is
+    /// named for the handle rather than for coverage. `is_covered` was the old spelling
+    /// and is [deprecated](Self::is_covered): it kept its name, its signature and its
+    /// return type across a release that inverted what it means for one store mode, so a
+    /// caller reading it the obvious way — *may I cache, or do I need a freshness
+    /// wrapper* — gets the answer backwards on `open_shared_declaring` with no build
+    /// error, no lint and no failing test, because the wrong branch is slower rather than
+    /// wrong. `ikigai-gonk`'s `compose_with` asked exactly that and would have wrapped
+    /// precisely the store that needs no wrapper (~1076× pessimization dressed as a
+    /// correctness guard); it was caught by a human having written a warning down, which
+    /// is not a mechanism. The deprecation is that warning escalated to something the
+    /// compiler says.
+    pub fn is_sole_writer(&self) -> bool {
         matches!(self.coverage, Coverage::Owned)
+    }
+
+    /// The 0.2.0–0.2.4 spelling of [`is_sole_writer`](Self::is_sole_writer).
+    ///
+    /// Kept as an exact delegate — the value is unchanged for every store mode, so this
+    /// is a rename and not a behaviour change. See [`is_sole_writer`](Self::is_sole_writer)
+    /// for why the name moved.
+    #[deprecated(
+        since = "0.2.5",
+        note = "renamed to `is_sole_writer`. It answers WHOLE-DATASET PROVENANCE — did the \
+                handle leave this crate — and it is NOT the caching question. Its meaning \
+                inverted for `open_shared_declaring` stores in 0.2.4 while its name, \
+                signature and return type stayed identical: such a store is `false` here \
+                while its scoped reads ARE cached. For \"may I cache this read / do I need \
+                a freshness wrapper\", call `read_is_covered(Option<&str>)` with the graph \
+                the read is confined to (`None` for a read that sees the whole dataset)."
+    )]
+    pub fn is_covered(&self) -> bool {
+        self.is_sole_writer()
     }
 
     /// The graphs the host declared its sharer may write, or `None` — either because the
     /// handle never left (nothing to declare) or because it left undeclared.
     ///
-    /// [`is_covered`](Self::is_covered) tells those two apart.
+    /// [`is_sole_writer`](Self::is_sole_writer) tells those two apart.
     pub fn sharer_writes(&self) -> Option<&SharerWrites> {
         match &self.coverage {
             Coverage::SharedDeclaring(writes) => Some(writes),
@@ -419,7 +450,7 @@ impl DurableStore {
                  fingerprint to guard ({}). Build it with `open_shared_declaring` / \
                  `in_memory_shared_declaring` — an empty fingerprint here would let the \
                  host's tripwire pass without checking anything",
-                if self.is_covered() {
+                if self.is_sole_writer() {
                     "the handle never left this crate"
                 } else {
                     "the handle left undeclared, so no graph is reserved from it"
@@ -477,10 +508,10 @@ impl DurableStore {
     /// take orders nothing.
     ///
     /// ⚠ It covers the writes **this crate** performs, which is exactly the coverage
-    /// [`is_covered`](Self::is_covered) already describes: after `open_shared` the raw
-    /// handle is a writer that takes no lock, and a scoped write can then lose an update
-    /// to it. That is one more cost of handing out the handle, and the same one the
-    /// golden thread pays.
+    /// [`is_sole_writer`](Self::is_sole_writer) already describes: after `open_shared`
+    /// the raw handle is a writer that takes no lock, and a scoped write can then lose an
+    /// update to it. That is one more cost of handing out the handle, and the same one
+    /// the golden thread pays.
     ///
     /// A poisoned lock is treated as held-and-released rather than fatal: the data is an
     /// `Arc<Store>` that no panic here can leave half-written, since every mutation goes
@@ -602,17 +633,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_owned_in_memory_store_is_covered() {
+    fn an_owned_in_memory_store_is_the_sole_writer() {
         let store = DurableStore::in_memory().unwrap();
-        assert!(store.is_covered());
+        assert!(store.is_sole_writer());
         assert_eq!(store.backing(), &Backing::Memory);
+    }
+
+    /// The deprecated 0.2.0–0.2.4 spelling still answers, and answers identically, on
+    /// every mode — a rename is only free if the old name is an exact delegate, and that
+    /// is a property of a pair of values, so nothing else can assert it.
+    #[test]
+    // The one place in this crate that may name the deprecated method: pinning that it
+    // still delegates is the whole point of the test.
+    #[allow(deprecated)]
+    fn the_deprecated_spelling_delegates_exactly() {
+        let owned = DurableStore::in_memory().unwrap();
+        assert_eq!(owned.is_covered(), owned.is_sole_writer());
+        assert!(owned.is_covered());
+
+        let (shared, _h) = DurableStore::in_memory_shared().unwrap();
+        assert_eq!(shared.is_covered(), shared.is_sole_writer());
+        assert!(!shared.is_covered());
+
+        let (declared, _h) = DurableStore::in_memory_shared_declaring(
+            SharerWrites::only_the_default_graph().and_named_graph("urn:example:zenith"),
+        )
+        .unwrap();
+        assert_eq!(declared.is_covered(), declared.is_sole_writer());
+        assert!(
+            !declared.is_covered(),
+            "the mode the deprecation exists for: `false` here while its scoped reads \
+             ARE cached — see `read_is_covered`"
+        );
+        assert!(declared.read_is_covered(Some("urn:example:acme")));
     }
 
     #[test]
     fn handing_out_the_handle_forfeits_coverage_at_construction() {
         let (store, handle) = DurableStore::in_memory_shared().unwrap();
         assert!(
-            !store.is_covered(),
+            !store.is_sole_writer(),
             "a store that handed out its handle must never claim coverage"
         );
         // And the handle really is the same dataset — that is what was paid for.
@@ -661,8 +721,8 @@ mod tests {
             "the sharer may write this one, so a read of it must stay bare"
         );
         assert!(
-            !declared.is_covered(),
-            "the handle still left: `is_covered` is about the dataset, not about a read"
+            !declared.is_sole_writer(),
+            "the handle still left: `is_sole_writer` is about the dataset, not about a read"
         );
     }
 
