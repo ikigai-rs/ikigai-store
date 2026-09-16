@@ -56,6 +56,7 @@ one kernel per process where you can.
 | `urn:iki:store:graph-construct` | `Source` | SPARQL CONSTRUCT, one named graph | `urn:cap:store:read:graph:<iri>` |
 | `urn:iki:store:graph-describe` | `Source` | SPARQL DESCRIBE, one named graph | `urn:cap:store:read:graph:<iri>` |
 | `urn:iki:store:info` | `Source` | backing, quad count, coverage | `urn:cap:store:read` |
+| `urn:iki:store:graph-list` | `Source` | which named graphs you may read | `urn:cap:store:read*` (either form) |
 | `urn:iki:store:update` | `Sink` | SPARQL UPDATE, whole dataset | `urn:cap:store:write` |
 | `urn:iki:store:graph-update` | `Sink` | SPARQL UPDATE, one named graph | `urn:cap:store:write:graph:<iri>` |
 | `urn:iki:store:load` | `Sink` | bulk-load an RDF document | `urn:cap:store:write` |
@@ -258,6 +259,92 @@ both `graph` and `query` unnamed it refuses with `accepts multiple arguments; na
 with key=value`. Naming the graph — which a caller must do anyway — leaves `query` as the
 one unnamed required input, so `… | urn:iki:store:graph-select graph=<G>` pipes normally.
 
+## ★ Enumeration: `urn:iki:store:graph-list` (0.2.5)
+
+A graph-scoped read is confined to a graph the caller **already named**, so it enumerates
+nothing. That leaves a module partitioning its state by graph — a named ledger, a tenant, a
+layer — with no way to answer *which partitions are there*, and the workaround every such
+module writes is the same two-path branch: its own grant list as the candidate set, and a
+broad store query for root, through a door the module does not declare.
+
+`urn:iki:store:graph-list` is that answer, once, in the crate that owns the boundary.
+
+```text
+source urn:iki:store:graph-list
+urn:iki:ledger:graph:acme
+urn:iki:ledger:graph:bosatsu
+```
+
+Sorted IRIs, one per line, no angle brackets; an empty body when there is nothing to list.
+
+**It answers `exists AND may-read`, and the argument is that only one half is new.** The
+may-read half is already in the caller's hands — it *is* the caller's capability — so a
+resource serving it back would be a round trip for something the caller could compute.
+Existence is the half the caller cannot know, so it is the half worth serving, and the half
+that has to be gated. ("Both, distinguished" was considered and is not answerable
+uniformly: root's may-read set is not enumerable, which is what root means, so the
+granted-but-absent column would be empty for root and populated for a tenant — two
+different documents under one IRI.)
+
+**It is not an oracle**, and that is the property to re-check before changing anything
+about it. A tenant's lines are a subset of the graphs its own grants name: existence is
+disclosed only for a graph the caller may already read, and could already probe with
+`urn:iki:store:graph-ask`. A caller learns nothing about a graph it holds no grant for —
+not that it exists, not that it does not, not how many there are.
+
+**Two paths, one shape.** A caller holding `urn:cap:store:read` — the broad reader, and
+**root**, which allows every scope — may read the whole dataset, so its answer is every
+named graph in it, read from the store. Any other caller holding a per-graph grant gets its
+own candidates confirmed one point lookup each. Both produce the same bytes in the same
+order for the part of the store they can both see, so nothing that reads this resource has
+to know which kind of caller it is running as.
+
+⚠ **The default graph is never listed.** It has no IRI, so no grant names it and no scoped
+read reaches it — an empty answer does **not** mean an empty store. Blank-node graph names
+are skipped for the same reason.
+
+### The declared scope is `urn:cap:store:read*`, and the `*` is not at a segment boundary
+
+`Description::requires` is **all-of**, and the honest requirement here is **any-of**: a
+tenant holds `urn:cap:store:read:graph:<iri>` grants, a broad reader holds
+`urn:cap:store:read`, and both are asking the same question. Declaring both tokens would
+demand both and deny each of them; declaring one would deny the other at the kernel's
+pre-check, before the endpoint can say why. So the declaration names the family both tokens
+belong to, and the endpoint enforces which half the caller actually holds — the same
+declared-wildcard / enforced-exactly shape as `urn:cap:store:read:graph:*`, one segment
+further up.
+
+The predicate is a plain prefix match with the `*` stripped, so `urn:cap:store:read*` is
+satisfied by exactly the read family: `urn:cap:store:read:*` would miss the broad token (no
+trailing colon on it), and `urn:cap:store:*` would admit a write-only caller, who would
+then pass the pre-check and be handed an empty listing — which reads like an answer instead
+of the denial it should be. `tests/graph_list.rs` pins all three.
+
+⚠ **This is `ikigai-core` PENDING §57's any-of problem arriving in a third place.** With an
+any-of form in `requires`, the declaration would be `any_of([CAP_READ, CAP_READ_GRAPH])` and
+nothing else here would change.
+
+### Cacheable under the three write threads, per candidate
+
+The answer depends on which graphs exist, and on a covered store a graph can only come into
+existence through one of this crate's three write doors — so it is cacheable under exactly
+`urn:iki:store:{update,load,graph-update}` and needs no fourth thread. The kernel keys its
+cache on the capability fingerprint, which is what makes an answer that differs by caller
+safe to cache at all.
+
+On a **shared** store the root/broad listing is live, like every other read that sees the
+whole dataset: an invisible writer can create a graph. A tenant's listing under a
+`SharerWrites` declaration is cacheable **iff every one of its candidates** is a graph the
+sharer cannot write — one writable candidate is enough for an invisible write to change the
+answer.
+
+⚠ **Not to be confused with `DurableStore::reserved_graphs_fingerprint`.** That one
+enumerates graphs internally for a host's own tripwire, errors without a `SharerWrites`
+declaration, scans every quad and is documented test-time only. This one is public,
+capability-scoped and for production callers. Two different questions, and the reason no
+public `named_graphs()` accessor was ever added to `DurableStore`: a raw list on the store
+type bypasses the read boundary entirely.
+
 ## Three things a consumer cannot learn any other way
 
 Each of these cost a consumer real time, and none of them is visible from the API.
@@ -459,6 +546,16 @@ a launchd agent, and two processes that disagree about it never meet. An unknown
 empty `path` and an unwritable directory are all loud.
 
 ## Status
+
+**0.2.5 adds `urn:iki:store:graph-list`** — the enumeration a graph-scoped read cannot
+perform, and the reason every module that partitions by graph was writing the same two-path
+branch. One new resource, one new exported constant (`CAP_READ_ANY`), nothing existing
+changed: the new read reuses the three write threads rather than adding a fourth. The only
+observable effect on a host that never resolves it is a thirteenth action in the manifold.
+
+**0.2.4 lets a host say WHERE a shared handle's holder writes**, so a scoped read of a graph
+the sharer cannot write is cacheable again instead of the whole store forfeiting caching for
+one bit.
 
 **0.2.3 fixes a crate that did not compile for a real class of consumer** — one match arm
 over `oxrdf::Term`, plus the gate that should have caught it; see the Features section.

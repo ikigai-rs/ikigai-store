@@ -1,4 +1,4 @@
-//! The module recipe as one test: `ikigai-conformance` walks the twelve resources
+//! The module recipe as one test: `ikigai-conformance` walks the thirteen resources
 //! [`ikigai_store::space`] binds and reports every violation at once.
 //!
 //! # The fixture is a store, and the walk WRITES to it
@@ -26,6 +26,12 @@
 //!   the endpoints with TWO required by-value inputs, so a BARE pipe into one is
 //!   ambiguous — naming `graph=` leaves `query` as the single unnamed required input and
 //!   the pipe works. See `src/endpoints.rs`.
+//! - **`store-graph-list` needs no fixture and that is not an omission.** It declares no
+//!   inputs at all — the caller's capability IS its input — so the suite drives it with
+//!   nothing and gets a real answer. ⚠ The consequence worth knowing is upstream in
+//!   `ikigai-core`: `select_action` skips an action with no required inputs when a query
+//!   names present classes, so this resource (like `store-info`) is invisible to
+//!   class-driven selection and reachable only by name or by an unconstrained query.
 //! - ⚠ **`AUTHORITY` (0.3.0) is silent here, and that is the correct result rather than
 //!   a gap.** It catches the fourth cell of the enforcement square — a `Sink` or
 //!   `Delete` that declares no `requires` and mutates anyway under a capability holding
@@ -161,7 +167,7 @@ fn scoped_id(id: &str) -> String {
 /// read is cacheable exactly like a broad one — it depends on the same three write
 /// threads — and saying so here is what would catch a scoped face that quietly stopped
 /// being cached.
-const READS: [&str; 9] = [
+const READS: [&str; 10] = [
     "store-select",
     "store-ask",
     "store-construct",
@@ -171,6 +177,22 @@ const READS: [&str; 9] = [
     "store-graph-construct",
     "store-graph-describe",
     "store-info",
+    "store-graph-list",
+];
+
+/// The reads whose universe is ONE named graph, and therefore the exact set that a
+/// `SharerWrites` declaration can put back in the cache.
+///
+/// ⚠ **Spelled out rather than derived from the `store-graph-` prefix**, which is what it
+/// used to be. `store-graph-list` breaks that prefix: it is named for the graph-scoped
+/// FAMILY it completes, and its universe under a root probe is every graph name in the
+/// store, so it belongs with the broad faces here and a prefix test would have silently
+/// declared it cacheable in the one walk that exists to catch exactly that mistake.
+const SCOPED_READS: [&str; 4] = [
+    "store-graph-select",
+    "store-graph-ask",
+    "store-graph-construct",
+    "store-graph-describe",
 ];
 
 #[test]
@@ -216,7 +238,7 @@ fn a_declared_shared_store_conforms_as_cacheable_exactly_where_it_promised() {
         DurableStore::in_memory_shared_declaring(SharerWrites::only_the_default_graph()).unwrap();
     drop(handle);
     let suite = READS.iter().fold(fixtures(), |suite, id| {
-        if id.starts_with("store-graph-") {
+        if SCOPED_READS.contains(id) {
             suite.cacheable(*id)
         } else {
             suite.live(*id)
