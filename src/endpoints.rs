@@ -1,4 +1,4 @@
-//! The twelve resources this crate binds, under the namespace it owns.
+//! The thirteen resources this crate binds, under the namespace it owns.
 //!
 //! ```text
 //! urn:iki:store:select           Source  SPARQL SELECT            urn:cap:store:read
@@ -10,6 +10,7 @@
 //! urn:iki:store:graph-construct  Source  CONSTRUCT, one graph     urn:cap:store:read:graph:<iri>
 //! urn:iki:store:graph-describe   Source  DESCRIBE, one graph      urn:cap:store:read:graph:<iri>
 //! urn:iki:store:info             Source  backing, size, coverage  urn:cap:store:read
+//! urn:iki:store:graph-list       Source  readable graph names     urn:cap:store:read* (either)
 //! urn:iki:store:update           Sink    SPARQL UPDATE, all of it urn:cap:store:write
 //! urn:iki:store:graph-update     Sink    SPARQL UPDATE, one graph urn:cap:store:write:graph:<iri>
 //! urn:iki:store:load             Sink    bulk-load an RDF doc     urn:cap:store:write
@@ -83,7 +84,9 @@ use ikigai_core::{
     Representation, Result, Verb,
 };
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
-use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedNodeRef, Term, Variable};
+use oxigraph::model::{
+    GraphName, GraphNameRef, NamedNode, NamedNodeRef, NamedOrBlankNode, Term, Variable,
+};
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 
@@ -141,6 +144,33 @@ pub const CAP_WRITE_GRAPH: &str = "urn:cap:store:write:graph:*";
 /// mean something different from every other grant in the system. Three graphs is three
 /// grants.
 pub const CAP_READ_GRAPH: &str = "urn:cap:store:read:graph:*";
+
+/// **Some** read authority over this store, broad or per-graph — the declared scope of
+/// `urn:iki:store:graph-list`, and the only resource that needs it.
+///
+/// ★ **It is one token because `requires` is ALL-of and the honest requirement here is
+/// ANY-of.** `graph-list` answers the same question — *which named graphs may I read* —
+/// for two kinds of caller, and they hold different tokens for it: a tenant holds
+/// [`cap_read_graph`] grants, a broad reader (and root) holds [`CAP_READ`]. Declaring
+/// both would demand both and deny each of them; declaring one would deny the other at
+/// the kernel's pre-check, *before* this endpoint can say why. So the declaration names
+/// the family that both tokens belong to, and the endpoint enforces which half the
+/// caller actually holds — the same declared-wildcard / enforced-exactly shape as
+/// [`CAP_READ_GRAPH`], one segment further up. (`ikigai-core` PENDING §57's any-of
+/// problem: with an any-of form in `requires`, this constant would be
+/// `any_of([CAP_READ, CAP_READ_GRAPH])` and nothing else here would change.)
+///
+/// ⚠ **The `*` is NOT at a segment boundary, and that is deliberate.** The predicate is
+/// `crate::select::cap_satisfies`, which is a plain `starts_with` over the held scopes
+/// with the `*` stripped, so `urn:cap:store:read*` is satisfied by exactly
+/// `urn:cap:store:read` and `urn:cap:store:read:graph:<iri>` — the whole read family and
+/// nothing in the write one. `urn:cap:store:read:*` would miss the broad token (no
+/// trailing colon on it) and `urn:cap:store:*` would admit a write-only caller, who would
+/// then pass the pre-check and be told it may read no graphs instead of being denied.
+/// The cost of the spelling is that a token nobody mints — `urn:cap:store:readable`, say
+/// — would also satisfy it; this crate owns the grammar and mints its tokens through
+/// [`cap_read_graph`], so no such token exists.
+pub const CAP_READ_ANY: &str = "urn:cap:store:read*";
 
 /// The scope a caller must hold to write `graph` through `urn:iki:store:graph-update`.
 ///
@@ -223,7 +253,7 @@ const LOAD_FORMATS: [&str; 5] = [
     "application/rdf+xml",
 ];
 
-/// Bind this store's seven resources into a space.
+/// Bind this store's thirteen resources into a space.
 ///
 /// The store is moved in: this space and the endpoints in it are the only holders of the
 /// dataset unless the caller took a handle at construction (see
@@ -257,6 +287,12 @@ pub fn space(store: DurableStore) -> EndpointSpace {
         .bind(
             Exact::new("urn:iki:store:info"),
             InfoEndpoint {
+                store: Arc::clone(&store),
+            },
+        )
+        .bind(
+            Exact::new("urn:iki:store:graph-list"),
+            GraphListEndpoint {
                 store: Arc::clone(&store),
             },
         )
@@ -297,7 +333,16 @@ fn with_freshness(
     store: &DurableStore,
     graph: Option<&NamedNode>,
 ) -> Representation {
-    if store.read_is_covered(graph.map(NamedNode::as_str)) {
+    covered_by(rep, store.read_is_covered(graph.map(NamedNode::as_str)))
+}
+
+/// The three threads, or nothing — factored out because `urn:iki:store:graph-list` reaches
+/// the same decision a different way: its universe is a SET of graphs, so it asks
+/// [`DurableStore::read_is_covered`] once per graph and is covered only if every answer
+/// was yes. One place still holds which threads a cacheable read depends on, so a fourth
+/// write door cannot be added to one path and forgotten on the other.
+fn covered_by(rep: Representation, covered: bool) -> Representation {
+    if covered {
         rep.cacheable()
             .depends_on(UPDATE_THREAD)
             .depends_on(LOAD_THREAD)
@@ -700,6 +745,191 @@ impl Endpoint for InfoEndpoint {
             .requires(CAP_READ)
             .output("text/plain")
     }
+}
+
+// ----------------------------------------------------------------------- graph-list
+
+/// `urn:iki:store:graph-list` — the named graphs that **exist** in this store and that
+/// this capability **may read**, one IRI per line.
+///
+/// # ★ Why a resource for this at all
+///
+/// A scoped read is confined to a graph the caller already named, so it enumerates
+/// nothing, and a module that partitions its state by graph (`ikigai-ledger` is the first,
+/// and will not be the last) has no way to answer *which partitions are there*. Without
+/// this, every such module writes the same two-path branch — its own grant list as the
+/// candidate set, a broad store query for root — and the root half of that branch reaches
+/// through a door the module does not declare.
+///
+/// # ★ The answer is the INTERSECTION, and the argument is that only one half is new
+///
+/// Three answers were available: the graphs you may read (from the capability alone), the
+/// graphs that exist (from the store), or both, distinguished. This resource answers
+/// **exists AND may-read**, because:
+///
+/// - **The may-read half is already in the caller's hands.** It *is* the caller's
+///   capability — `Capability::scopes()`, the same set this endpoint reads. A resource
+///   whose whole output a caller can compute without asking is not worth a round trip, and
+///   `ikigai-ledger` #4 computed exactly that half for itself.
+/// - **Existence is the half that has to be gated**, because it is the half that is not
+///   the caller's own. That makes it the half worth serving.
+/// - **"Both, distinguished" cannot be answered uniformly.** Root's may-read set is not
+///   enumerable — that is what root means — so the granted-but-absent column would be
+///   empty for root and populated for a tenant, and a consumer would be reading two
+///   different documents under one IRI.
+///
+/// ⚠ **It is not an oracle**, and that is the property to re-check before changing
+/// anything here. The lines a tenant gets back are a subset of the graphs its own grants
+/// name: existence is disclosed only for a graph the caller may already read. A caller
+/// learns nothing whatsoever about a graph it holds no grant for — not that it exists, not
+/// that it does not, not how many there are.
+///
+/// ⚠ Precisely, because "it could already ask" is *nearly* true and the gap is worth
+/// stating: `urn:iki:store:graph-ask` over its own graph already tells a tenant whether
+/// that graph holds a quad. The one thing this adds is the **registered-but-empty** case —
+/// a graph created by `CREATE GRAPH` with nothing in it, which `contains_named_graph`
+/// reports and an `ASK` cannot see. That is still a graph the caller holds a grant for, so
+/// it crosses no boundary; it is simply not literally true that every line here was already
+/// reachable.
+///
+/// # The two paths, and why a consumer never branches on which one it got
+///
+/// - A caller holding [`CAP_READ`] — the broad reader, and **root**, which allows every
+///   scope — may read the whole dataset, so its answer is every named graph in it.
+///   `Capability::scopes()` is `None` for root and so cannot be the source of that answer;
+///   the store is.
+/// - Any other caller reaching this endpoint holds per-graph grants (the declared
+///   [`CAP_READ_ANY`] guarantees at least one grant in the read family), so its candidate
+///   set comes from the capability and each candidate costs one point lookup — never a
+///   scan, and never a cross-graph query.
+///
+/// Both produce the same bytes in the same order for the same visible store: sorted IRIs,
+/// one per line, no angle brackets, and an **empty body** when there is nothing to list.
+/// A consumer reads lines; nothing in the shape says which path produced them.
+///
+/// ⚠ **The default graph is never listed**, on either path. It has no IRI, so no
+/// `urn:cap:store:read:graph:` token can name it and no scoped read can reach it — which
+/// also means an empty answer does NOT mean an empty store. Blank-node graph names are
+/// skipped for the same reason: nothing can grant one, and `urn:iki:store:graph-*` takes
+/// an IRI.
+#[derive(Clone)]
+struct GraphListEndpoint {
+    store: Arc<DurableStore>,
+}
+
+#[async_trait]
+impl Endpoint for GraphListEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        match inv.request.verb {
+            Verb::Source => {
+                // ★ The parameterized half of the declared scope, and the whole branch:
+                // `allows` is exact, and it is TRUE for root, so this one predicate sorts
+                // root and the broad reader — who may read every graph — from a tenant,
+                // whose grants are its universe. A caller passing the pre-check with
+                // neither (a grant under the family prefix that names no graph) falls to
+                // the second arm and is told it may read nothing, which is true.
+                let (names, covered) = if inv.capability.allows(CAP_READ) {
+                    (self.every_named_graph()?, self.store.read_is_covered(None))
+                } else {
+                    let granted = granted_graphs(inv);
+                    // ⚠ Covered only if EVERY candidate is: this read's answer is a
+                    // function of each candidate's existence, so an invisible writer that
+                    // can reach any one of them can change it. Vacuously true for a caller
+                    // with no candidates, whose answer is empty whatever the store holds.
+                    let covered = granted
+                        .iter()
+                        .all(|graph| self.store.read_is_covered(Some(graph.as_str())));
+                    (self.existing_among(&granted)?, covered)
+                };
+                let mut text = String::new();
+                for name in &names {
+                    text.push_str(name);
+                    text.push('\n');
+                }
+                Ok(covered_by(plain(text), covered))
+            }
+            other => Err(unsupported("store-graph-list", other)),
+        }
+    }
+
+    fn name(&self) -> &str {
+        "store-graph-list"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("store-graph-list")
+            .title("Which named graphs this capability may read")
+            .summary(
+                "The named graphs that exist in this store and that this capability may \
+                 read, as sorted IRIs, one per line — the enumeration a graph-scoped read \
+                 cannot perform, because it is confined to a graph the caller already \
+                 named. A caller holding a per-graph grant sees exactly the graphs its own \
+                 grants name that something has been written to; a caller holding the \
+                 broad `urn:cap:store:read` (and root, which holds every scope) may read \
+                 the whole dataset and sees every named graph in it. The two answer the \
+                 same question in the same shape, so nothing that reads this has to know \
+                 which it is. The store's default graph is never listed: it has no IRI, so \
+                 no grant names it and no scoped read reaches it — an empty answer does \
+                 not mean an empty store.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .requires(CAP_READ_ANY)
+            .output("text/plain")
+    }
+}
+
+impl GraphListEndpoint {
+    /// Every named graph in the store, for a caller that may read all of them.
+    fn every_named_graph(&self) -> Result<Vec<String>> {
+        let mut names = std::collections::BTreeSet::new();
+        for name in self.store.dataset().named_graphs() {
+            let name = name.map_err(|e| Error::Endpoint(format!("listing graphs: {e}")))?;
+            // A blank-node graph name is skipped rather than rendered: no capability
+            // token can name one and no `urn:iki:store:graph-*` call can take one, so
+            // listing it would offer a caller a name it cannot use.
+            if let NamedOrBlankNode::NamedNode(iri) = name {
+                names.insert(iri.into_string());
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    /// Which of `granted` the store actually holds — one point lookup each, never a scan.
+    fn existing_among(&self, granted: &[NamedNode]) -> Result<Vec<String>> {
+        let mut names = std::collections::BTreeSet::new();
+        for graph in granted {
+            if self
+                .store
+                .dataset()
+                .contains_named_graph(graph.as_ref())
+                .map_err(|e| Error::Endpoint(format!("looking up <{graph}>: {e}")))?
+            {
+                names.insert(graph.as_str().to_string());
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+}
+
+/// The graphs this capability names in its own per-graph read grants.
+///
+/// ⚠ Root never reaches here (it takes the [`CAP_READ`] path, which it allows), and a
+/// root capability would enumerate nothing anyway — `Capability::scopes()` is `None` for
+/// it, which is what root means. The empty vector is the honest answer for any capability
+/// that names no graph: a *family* grant (`urn:cap:store:read:graph:*`, held rather than
+/// declared) says what may be reached and not what exists, so it names nothing and is
+/// skipped along with any other token under the prefix that is not an IRI.
+fn granted_graphs(inv: &Invocation<'_>) -> Vec<NamedNode> {
+    let Some(scopes) = inv.capability.scopes() else {
+        return Vec::new();
+    };
+    let prefix = CAP_READ_GRAPH.trim_end_matches('*');
+    scopes
+        .iter()
+        .filter_map(|scope| scope.strip_prefix(prefix))
+        .filter_map(|iri| NamedNode::new(iri).ok())
+        .collect()
 }
 
 // --------------------------------------------------------------------------- update

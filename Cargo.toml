@@ -101,7 +101,16 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # `read_is_covered(graph)` is. A consumer reading `is_covered` to decide whether to cache
 # something of its own now reads the wrong bit; nothing in the ecosystem did (checked:
 # only `store:info` and `with_freshness` read it), and both were moved.
-version = "0.2.4"
+#
+# ★ 0.2.5 is a PATCH by the same argument the four before it made. It adds one resource
+# (`urn:iki:store:graph-list`), one exported constant (`CAP_READ_ANY`) and nothing else:
+# no existing IRI, capability, thread, output or type changed shape, and the new read
+# reuses the three write threads rather than introducing a fourth. A consumer that wants
+# the enumeration pins `0.2.5`; one that does not, does nothing. ⚠ It DOES change what an
+# existing host's manifold offers — a thirteenth action appears — so a host with a test
+# that counts endpoints or diffs the catalog will see it; that is the only observable
+# effect on a caller who does not resolve the new IRI.
+version = "0.2.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]

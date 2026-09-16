@@ -22,6 +22,7 @@
 //! urn:iki:store:graph-construct  Source  CONSTRUCT, one graph     urn:cap:store:read:graph:<iri>
 //! urn:iki:store:graph-describe   Source  DESCRIBE, one graph      urn:cap:store:read:graph:<iri>
 //! urn:iki:store:info             Source  backing, size, coverage  urn:cap:store:read
+//! urn:iki:store:graph-list       Source  readable graph names     urn:cap:store:read* (either)
 //! urn:iki:store:update           Sink    SPARQL UPDATE, all of it urn:cap:store:write
 //! urn:iki:store:graph-update     Sink    SPARQL UPDATE, one graph urn:cap:store:write:graph:<iri>
 //! urn:iki:store:load             Sink    bulk-load an RDF doc     urn:cap:store:write
@@ -92,6 +93,21 @@
 //! `FROM <G> FROM NAMED <G>` and nothing is copied or diffed. `src/scope.rs` has the
 //! mechanism, the per-shape probes, and the one surprise — `DESCRIBE` reads the dataset's
 //! default graph and nothing else, upstream, in both doors.
+//!
+//! # Enumeration: the one question a scoped read cannot ask
+//!
+//! A graph-scoped read is confined to a graph the caller **already named**, so it can
+//! enumerate nothing — and a module that partitions its state by graph then has no way to
+//! answer *which partitions are there*. `urn:iki:store:graph-list` is that answer: the
+//! named graphs that exist in this store **and** that the caller may read, sorted, one IRI
+//! per line, for a tenant and for root alike.
+//!
+//! ★ It is deliberately the **intersection** and not "what you may read". The may-read
+//! half is already in the caller's hands — it *is* the caller's capability — so the only
+//! new information is existence, and existence is disclosed only for graphs the caller
+//! holds a grant for. A caller learns nothing about a graph it cannot read, not even that
+//! there is one. [`CAP_READ_ANY`] is the declared scope and why it is spelled the way it
+//! is; `GraphListEndpoint` in `src/endpoints.rs` carries the full argument.
 //!
 //! # One writer per directory — the constraint that shapes everything here
 //!
@@ -194,7 +210,7 @@ pub mod store;
 
 pub use config::StoreConfig;
 pub use endpoints::{
-    cap_read_graph, cap_write_graph, space, CAP_READ, CAP_READ_GRAPH, CAP_WRITE, CAP_WRITE_GRAPH,
-    GRAPH_UPDATE_THREAD, LOAD_THREAD, UPDATE_THREAD,
+    cap_read_graph, cap_write_graph, space, CAP_READ, CAP_READ_ANY, CAP_READ_GRAPH, CAP_WRITE,
+    CAP_WRITE_GRAPH, GRAPH_UPDATE_THREAD, LOAD_THREAD, UPDATE_THREAD,
 };
 pub use store::{Backing, DurableStore, GraphFingerprint, SharerWrites, Store};
