@@ -780,10 +780,17 @@ impl Endpoint for InfoEndpoint {
 ///
 /// ⚠ **It is not an oracle**, and that is the property to re-check before changing
 /// anything here. The lines a tenant gets back are a subset of the graphs its own grants
-/// name: existence is disclosed only for a graph the caller may already read (and may
-/// already probe with `urn:iki:store:graph-ask`). A caller learns nothing whatsoever about
-/// a graph it holds no grant for — not that it exists, not that it does not, not how many
-/// there are.
+/// name: existence is disclosed only for a graph the caller may already read. A caller
+/// learns nothing whatsoever about a graph it holds no grant for — not that it exists, not
+/// that it does not, not how many there are.
+///
+/// ⚠ Precisely, because "it could already ask" is *nearly* true and the gap is worth
+/// stating: `urn:iki:store:graph-ask` over its own graph already tells a tenant whether
+/// that graph holds a quad. The one thing this adds is the **registered-but-empty** case —
+/// a graph created by `CREATE GRAPH` with nothing in it, which `contains_named_graph`
+/// reports and an `ASK` cannot see. That is still a graph the caller holds a grant for, so
+/// it crosses no boundary; it is simply not literally true that every line here was already
+/// reachable.
 ///
 /// # The two paths, and why a consumer never branches on which one it got
 ///

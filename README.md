@@ -288,9 +288,15 @@ different documents under one IRI.)
 
 **It is not an oracle**, and that is the property to re-check before changing anything
 about it. A tenant's lines are a subset of the graphs its own grants name: existence is
-disclosed only for a graph the caller may already read, and could already probe with
-`urn:iki:store:graph-ask`. A caller learns nothing about a graph it holds no grant for —
-not that it exists, not that it does not, not how many there are.
+disclosed only for a graph the caller may already read. A caller learns nothing about a
+graph it holds no grant for — not that it exists, not that it does not, not how many there
+are.
+
+⚠ Precisely: `urn:iki:store:graph-ask` over its own graph already tells a tenant whether
+that graph holds a quad, so almost every line here was reachable before. The one thing this
+adds is the **registered-but-empty** case — a graph created by `CREATE GRAPH` with nothing
+in it, which an `ASK` cannot see. That is still a graph the caller holds a grant for, so it
+crosses no boundary; it is just not literally true that nothing new is disclosed.
 
 **Two paths, one shape.** A caller holding `urn:cap:store:read` — the broad reader, and
 **root**, which allows every scope — may read the whole dataset, so its answer is every
