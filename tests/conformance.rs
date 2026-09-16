@@ -26,7 +26,7 @@
 //!   the endpoints with TWO required by-value inputs, so a BARE pipe into one is
 //!   ambiguous — naming `graph=` leaves `query` as the single unnamed required input and
 //!   the pipe works. See `src/endpoints.rs`.
-//! - **`store-graph-list` needs no fixture and that is not an omission.** It declares no
+//! - **`store-graphs` needs no fixture and that is not an omission.** It declares no
 //!   inputs at all — the caller's capability IS its input — so the suite drives it with
 //!   nothing and gets a real answer. ⚠ The consequence worth knowing is upstream in
 //!   `ikigai-core`: `select_action` skips an action with no required inputs when a query
@@ -177,17 +177,20 @@ const READS: [&str; 10] = [
     "store-graph-construct",
     "store-graph-describe",
     "store-info",
-    "store-graph-list",
+    "store-graphs",
 ];
 
 /// The reads whose universe is ONE named graph, and therefore the exact set that a
 /// `SharerWrites` declaration can put back in the cache.
 ///
-/// ⚠ **Spelled out rather than derived from the `store-graph-` prefix**, which is what it
-/// used to be. `store-graph-list` breaks that prefix: it is named for the graph-scoped
-/// FAMILY it completes, and its universe under a root probe is every graph name in the
-/// store, so it belongs with the broad faces here and a prefix test would have silently
-/// declared it cacheable in the one walk that exists to catch exactly that mistake.
+/// ⚠ **Spelled out rather than derived from a prefix**, which is what it used to be, and
+/// the rename in 0.2.5 is a reason to keep it spelled out rather than to relax. Under the
+/// old name `store-graph-list` the `store-graph-` prefix admitted it outright; under
+/// `store-graphs` that exact prefix no longer matches, but `store-graph` (no hyphen)
+/// still does, so the hazard moved one character rather than going away. Its universe
+/// under a root probe is every graph name in the store, so it belongs with the broad
+/// faces here, and any prefix test would have silently declared it cacheable in the one
+/// walk that exists to catch exactly that mistake.
 const SCOPED_READS: [&str; 4] = [
     "store-graph-select",
     "store-graph-ask",

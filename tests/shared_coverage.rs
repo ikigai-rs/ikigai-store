@@ -310,7 +310,7 @@ fn an_undeclared_shared_store_still_caches_nothing_at_all() {
 #[test]
 fn an_owned_store_is_unaffected() {
     let store = DurableStore::in_memory().unwrap();
-    assert!(store.is_covered());
+    assert!(store.is_sole_writer());
     assert!(store.sharer_writes().is_none());
     assert!(store.read_is_covered(None) && store.read_is_covered(Some(G)));
 

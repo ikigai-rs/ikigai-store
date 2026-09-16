@@ -1,4 +1,4 @@
-//! `urn:iki:store:graph-list` — the enumeration a scoped read cannot perform.
+//! `urn:iki:store:graphs` — the enumeration a scoped read cannot perform.
 //!
 //! # What these tests are for
 //!
@@ -31,7 +31,7 @@ const ZENITH: &str = "urn:example:zenith";
 /// Granted below, and never written to: the case that separates "may read" from "exists".
 const EMPTY: &str = "urn:example:empty";
 
-const LIST: &str = "urn:iki:store:graph-list";
+const GRAPHS: &str = "urn:iki:store:graphs";
 
 /// Two tenants' graphs and one triple in the store's own default graph — the third is what
 /// makes "the default graph is never listed" testable rather than asserted.
@@ -75,7 +75,7 @@ fn issue(
 
 /// The listing as lines, so an assertion is about names and not about whitespace.
 fn list(kernel: &Kernel, cap: &Capability) -> Result<Vec<String>, Error> {
-    issue(kernel, Verb::Source, LIST, &[], cap)
+    issue(kernel, Verb::Source, GRAPHS, &[], cap)
         .map(|text| text.lines().map(str::to_string).collect())
 }
 
@@ -130,8 +130,8 @@ fn the_two_paths_produce_the_same_shape() {
     let kernel = kernel();
     let tenant = Capability::scoped([cap_read_graph(ACME), cap_read_graph(ZENITH)]);
     assert_eq!(
-        issue(&kernel, Verb::Source, LIST, &[], &tenant).unwrap(),
-        issue(&kernel, Verb::Source, LIST, &[], &Capability::root()).unwrap()
+        issue(&kernel, Verb::Source, GRAPHS, &[], &tenant).unwrap(),
+        issue(&kernel, Verb::Source, GRAPHS, &[], &Capability::root()).unwrap()
     );
 }
 
@@ -179,7 +179,7 @@ fn a_tenant_is_never_told_another_tenants_graph_exists() {
     // caller's own grants already name, so existence is disclosed only where the caller
     // could have probed it anyway (`urn:iki:store:graph-ask` over its own graph).
     let cap = Capability::scoped([cap_read_graph(ACME)]);
-    let text = issue(&kernel(), Verb::Source, LIST, &[], &cap).unwrap();
+    let text = issue(&kernel(), Verb::Source, GRAPHS, &[], &cap).unwrap();
     // Exactly the granted name and nothing else: no other name, and no count or summary
     // line that would say how much of the store is being withheld.
     assert_eq!(text, format!("{ACME}\n"));
@@ -234,7 +234,7 @@ fn a_listing_is_cached_and_a_write_that_creates_a_graph_cuts_it() {
     // this is the test that says the threads are really wired.
     let kernel = kernel();
     let cap = Capability::root();
-    let request = Request::new(Verb::Source, Iri::parse(LIST).unwrap());
+    let request = Request::new(Verb::Source, Iri::parse(GRAPHS).unwrap());
     assert!(!kernel.is_cached(&request, &cap));
     assert_eq!(list(&kernel, &cap).unwrap().len(), 2);
     assert!(kernel.is_cached(&request, &cap), "the listing is cacheable");
@@ -263,7 +263,7 @@ fn a_shared_store_forfeits_the_listing_the_way_it_forfeits_every_broad_read() {
     drop(handle);
     let kernel = kernel_over(store);
     let cap = Capability::root();
-    let request = Request::new(Verb::Source, Iri::parse(LIST).unwrap());
+    let request = Request::new(Verb::Source, Iri::parse(GRAPHS).unwrap());
     assert_eq!(list(&kernel, &cap).unwrap().len(), 2);
     assert!(
         !kernel.is_cached(&request, &cap),
@@ -281,7 +281,7 @@ fn a_declaration_makes_a_tenants_listing_cacheable_and_leaves_roots_live() {
         DurableStore::in_memory_shared_declaring(SharerWrites::only_the_default_graph()).unwrap();
     drop(handle);
     let kernel = kernel_over(store);
-    let request = Request::new(Verb::Source, Iri::parse(LIST).unwrap());
+    let request = Request::new(Verb::Source, Iri::parse(GRAPHS).unwrap());
 
     let tenant = Capability::scoped([cap_read_graph(ACME)]);
     assert_eq!(list(&kernel, &tenant).unwrap(), vec![ACME.to_string()]);
@@ -307,7 +307,7 @@ fn a_candidate_the_sharer_may_write_forfeits_the_whole_tenant_listing() {
     .unwrap();
     drop(handle);
     let kernel = kernel_over(store);
-    let request = Request::new(Verb::Source, Iri::parse(LIST).unwrap());
+    let request = Request::new(Verb::Source, Iri::parse(GRAPHS).unwrap());
 
     let safe = Capability::scoped([cap_read_graph(ACME)]);
     assert!(list(&kernel, &safe).is_ok());
@@ -339,7 +339,7 @@ fn only_source_is_answered() {
     let err = issue(
         &kernel(),
         Verb::Sink,
-        LIST,
+        GRAPHS,
         &[("content", "anything")],
         &Capability::root(),
     )

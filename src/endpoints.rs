@@ -10,7 +10,7 @@
 //! urn:iki:store:graph-construct  Source  CONSTRUCT, one graph     urn:cap:store:read:graph:<iri>
 //! urn:iki:store:graph-describe   Source  DESCRIBE, one graph      urn:cap:store:read:graph:<iri>
 //! urn:iki:store:info             Source  backing, size, coverage  urn:cap:store:read
-//! urn:iki:store:graph-list       Source  readable graph names     urn:cap:store:read* (either)
+//! urn:iki:store:graphs           Source  readable graph names     urn:cap:store:read* (either)
 //! urn:iki:store:update           Sink    SPARQL UPDATE, all of it urn:cap:store:write
 //! urn:iki:store:graph-update     Sink    SPARQL UPDATE, one graph urn:cap:store:write:graph:<iri>
 //! urn:iki:store:load             Sink    bulk-load an RDF doc     urn:cap:store:write
@@ -146,10 +146,10 @@ pub const CAP_WRITE_GRAPH: &str = "urn:cap:store:write:graph:*";
 pub const CAP_READ_GRAPH: &str = "urn:cap:store:read:graph:*";
 
 /// **Some** read authority over this store, broad or per-graph — the declared scope of
-/// `urn:iki:store:graph-list`, and the only resource that needs it.
+/// `urn:iki:store:graphs`, and the only resource that needs it.
 ///
 /// ★ **It is one token because `requires` is ALL-of and the honest requirement here is
-/// ANY-of.** `graph-list` answers the same question — *which named graphs may I read* —
+/// ANY-of.** `graphs` answers the same question — *which named graphs may I read* —
 /// for two kinds of caller, and they hold different tokens for it: a tenant holds
 /// [`cap_read_graph`] grants, a broad reader (and root) holds [`CAP_READ`]. Declaring
 /// both would demand both and deny each of them; declaring one would deny the other at
@@ -291,8 +291,8 @@ pub fn space(store: DurableStore) -> EndpointSpace {
             },
         )
         .bind(
-            Exact::new("urn:iki:store:graph-list"),
-            GraphListEndpoint {
+            Exact::new("urn:iki:store:graphs"),
+            GraphsEndpoint {
                 store: Arc::clone(&store),
             },
         )
@@ -336,7 +336,7 @@ fn with_freshness(
     covered_by(rep, store.read_is_covered(graph.map(NamedNode::as_str)))
 }
 
-/// The three threads, or nothing — factored out because `urn:iki:store:graph-list` reaches
+/// The three threads, or nothing — factored out because `urn:iki:store:graphs` reaches
 /// the same decision a different way: its universe is a SET of graphs, so it asks
 /// [`DurableStore::read_is_covered`] once per graph and is covered only if every answer
 /// was yes. One place still holds which threads a cacheable read depends on, so a fourth
@@ -688,10 +688,18 @@ impl Endpoint for InfoEndpoint {
                     .dataset()
                     .len()
                     .map_err(|e| Error::Endpoint(format!("counting quads: {e}")))?;
+                // ★ This is whole-dataset PROVENANCE — did the handle leave this crate —
+                // and not a caching verdict, which is why it reads `is_sole_writer` and
+                // not `read_is_covered`: an operator asking this face wants to know what
+                // kind of store the host built, and the per-read answer is not a property
+                // of the store at all. ⚠ The wire label stays `covered:` deliberately.
+                // 0.2.4 shipped it and a host or a runbook may be grepping for it, so
+                // renaming the method is free while renaming these bytes is not; the
+                // `describe` summary below says which question the line answers.
                 let mut text = format!(
                     "backing: {}\nquads: {quads}\ncovered: {}\n",
                     self.store.backing(),
-                    self.store.is_covered()
+                    self.store.is_sole_writer()
                 );
                 // ★ A fourth line ONLY when there is a declaration, so the bytes an
                 // existing host reads are unchanged — and so the line's presence is
@@ -747,9 +755,9 @@ impl Endpoint for InfoEndpoint {
     }
 }
 
-// ----------------------------------------------------------------------- graph-list
+// --------------------------------------------------------------------------- graphs
 
-/// `urn:iki:store:graph-list` — the named graphs that **exist** in this store and that
+/// `urn:iki:store:graphs` — the named graphs that **exist** in this store and that
 /// this capability **may read**, one IRI per line.
 ///
 /// # ★ Why a resource for this at all
@@ -813,12 +821,12 @@ impl Endpoint for InfoEndpoint {
 /// skipped for the same reason: nothing can grant one, and `urn:iki:store:graph-*` takes
 /// an IRI.
 #[derive(Clone)]
-struct GraphListEndpoint {
+struct GraphsEndpoint {
     store: Arc<DurableStore>,
 }
 
 #[async_trait]
-impl Endpoint for GraphListEndpoint {
+impl Endpoint for GraphsEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         match inv.request.verb {
             Verb::Source => {
@@ -848,16 +856,16 @@ impl Endpoint for GraphListEndpoint {
                 }
                 Ok(covered_by(plain(text), covered))
             }
-            other => Err(unsupported("store-graph-list", other)),
+            other => Err(unsupported("store-graphs", other)),
         }
     }
 
     fn name(&self) -> &str {
-        "store-graph-list"
+        "store-graphs"
     }
 
     fn describe(&self) -> Description {
-        Description::new("store-graph-list")
+        Description::new("store-graphs")
             .title("Which named graphs this capability may read")
             .summary(
                 "The named graphs that exist in this store and that this capability may \
@@ -879,7 +887,7 @@ impl Endpoint for GraphListEndpoint {
     }
 }
 
-impl GraphListEndpoint {
+impl GraphsEndpoint {
     /// Every named graph in the store, for a caller that may read all of them.
     fn every_named_graph(&self) -> Result<Vec<String>> {
         let mut names = std::collections::BTreeSet::new();

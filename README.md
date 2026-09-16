@@ -56,7 +56,7 @@ one kernel per process where you can.
 | `urn:iki:store:graph-construct` | `Source` | SPARQL CONSTRUCT, one named graph | `urn:cap:store:read:graph:<iri>` |
 | `urn:iki:store:graph-describe` | `Source` | SPARQL DESCRIBE, one named graph | `urn:cap:store:read:graph:<iri>` |
 | `urn:iki:store:info` | `Source` | backing, quad count, coverage | `urn:cap:store:read` |
-| `urn:iki:store:graph-list` | `Source` | which named graphs you may read | `urn:cap:store:read*` (either form) |
+| `urn:iki:store:graphs` | `Source` | which named graphs you may read | `urn:cap:store:read*` (either form) |
 | `urn:iki:store:update` | `Sink` | SPARQL UPDATE, whole dataset | `urn:cap:store:write` |
 | `urn:iki:store:graph-update` | `Sink` | SPARQL UPDATE, one named graph | `urn:cap:store:write:graph:<iri>` |
 | `urn:iki:store:load` | `Sink` | bulk-load an RDF document | `urn:cap:store:write` |
@@ -259,7 +259,7 @@ both `graph` and `query` unnamed it refuses with `accepts multiple arguments; na
 with key=value`. Naming the graph — which a caller must do anyway — leaves `query` as the
 one unnamed required input, so `… | urn:iki:store:graph-select graph=<G>` pipes normally.
 
-## ★ Enumeration: `urn:iki:store:graph-list` (0.2.5)
+## ★ Enumeration: `urn:iki:store:graphs` (0.2.5)
 
 A graph-scoped read is confined to a graph the caller **already named**, so it enumerates
 nothing. That leaves a module partitioning its state by graph — a named ledger, a tenant, a
@@ -267,10 +267,17 @@ layer — with no way to answer *which partitions are there*, and the workaround
 module writes is the same two-path branch: its own grant list as the candidate set, and a
 broad store query for root, through a door the module does not declare.
 
-`urn:iki:store:graph-list` is that answer, once, in the crate that owns the boundary.
+`urn:iki:store:graphs` is that answer, once, in the crate that owns the boundary.
+
+**The name is a noun, and that is the rule rather than a preference.** The resource *is*
+the graphs; `-list` would have named the shape of one representation instead of the thing,
+and the representation is the part of a resource that is free to change. It carried that
+name while 0.2.5 was being built and was renamed outright before publishing — the only
+window in which correcting a name costs nothing, because a name with no consumers has
+nobody to keep faith with.
 
 ```text
-source urn:iki:store:graph-list
+source urn:iki:store:graphs
 urn:iki:ledger:graph:acme
 urn:iki:ledger:graph:bosatsu
 ```
@@ -324,7 +331,7 @@ The predicate is a plain prefix match with the `*` stripped, so `urn:cap:store:r
 satisfied by exactly the read family: `urn:cap:store:read:*` would miss the broad token (no
 trailing colon on it), and `urn:cap:store:*` would admit a write-only caller, who would
 then pass the pre-check and be handed an empty listing — which reads like an answer instead
-of the denial it should be. `tests/graph_list.rs` pins all three.
+of the denial it should be. `tests/graphs.rs` pins all three.
 
 ⚠ **This is `ikigai-core` PENDING §57's any-of problem arriving in a third place.** With an
 any-of form in `requires`, the declaration would be `any_of([CAP_READ, CAP_READ_GRAPH])` and
@@ -553,11 +560,23 @@ empty `path` and an unwritable directory are all loud.
 
 ## Status
 
-**0.2.5 adds `urn:iki:store:graph-list`** — the enumeration a graph-scoped read cannot
+**0.2.5 adds `urn:iki:store:graphs`** — the enumeration a graph-scoped read cannot
 perform, and the reason every module that partitions by graph was writing the same two-path
 branch. One new resource, one new exported constant (`CAP_READ_ANY`), nothing existing
 changed: the new read reuses the three write threads rather than adding a fourth. The only
 observable effect on a host that never resolves it is a thirteenth action in the manifold.
+
+**0.2.5 also deprecates `DurableStore::is_covered` in favour of `is_sole_writer`**, an
+exact delegate with the same value on every store mode. The old name is the one thing in
+0.2.4 a consumer could read wrong with no signal at all: it kept its name, its signature
+and its return type across a release that **inverted** what it means for a store built
+with `open_shared_declaring` — `false` there, while that store's scoped reads *are*
+cached. A caller asking it the obvious question (*may I cache, or do I need a freshness
+wrapper*) gets the answer backwards, and the wrong branch is slower rather than wrong, so
+no build error, no lint and no test catches it. `is_sole_writer` answers whole-dataset
+provenance — *did the handle leave this crate* — and `read_is_covered(graph)` is, and
+always was, the caching question. The `covered:` line in `urn:iki:store:info` keeps its
+wire spelling: it reports provenance, and 0.2.4 shipped those bytes.
 
 **0.2.4 lets a host say WHERE a shared handle's holder writes**, so a scoped read of a graph
 the sharer cannot write is cacheable again instead of the whole store forfeiting caching for
