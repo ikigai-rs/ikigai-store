@@ -51,10 +51,10 @@ one kernel per process where you can.
 | `urn:iki:store:ask` | `Source` | SPARQL ASK | `urn:cap:store:read` |
 | `urn:iki:store:construct` | `Source` | SPARQL CONSTRUCT | `urn:cap:store:read` |
 | `urn:iki:store:describe` | `Source` | SPARQL DESCRIBE | `urn:cap:store:read` |
-| `urn:iki:store:graph-select` | `Source` | SPARQL SELECT, one named graph | `urn:cap:store:read:graph:<iri>` |
-| `urn:iki:store:graph-ask` | `Source` | SPARQL ASK, one named graph | `urn:cap:store:read:graph:<iri>` |
-| `urn:iki:store:graph-construct` | `Source` | SPARQL CONSTRUCT, one named graph | `urn:cap:store:read:graph:<iri>` |
-| `urn:iki:store:graph-describe` | `Source` | SPARQL DESCRIBE, one named graph | `urn:cap:store:read:graph:<iri>` |
+| `urn:iki:store:graph-select` | `Source` | SPARQL SELECT, named graphs (one or several) | `urn:cap:store:read:graph:<iri>`, every one |
+| `urn:iki:store:graph-ask` | `Source` | SPARQL ASK, named graphs (one or several) | `urn:cap:store:read:graph:<iri>`, every one |
+| `urn:iki:store:graph-construct` | `Source` | SPARQL CONSTRUCT, named graphs (one or several) | `urn:cap:store:read:graph:<iri>`, every one |
+| `urn:iki:store:graph-describe` | `Source` | SPARQL DESCRIBE, named graphs (one or several) | `urn:cap:store:read:graph:<iri>`, every one |
 | `urn:iki:store:info` | `Source` | backing, quad count, coverage | `urn:cap:store:read` |
 | `urn:iki:store:graphs` | `Source` | which named graphs you may read | `urn:cap:store:read*` (either form) |
 | `urn:iki:store:update` | `Sink` | SPARQL UPDATE, whole dataset | `urn:cap:store:write` |
@@ -64,6 +64,18 @@ one kernel per process where you can.
 One IRI per query form, following `ikigai-sparql`: the form fixes the result family, so
 it fixes the declared outputs and the default `as` too — and a query of another form is
 **refused**, not served under an IRI that promised something else.
+
+⚠ **Which dataset a query reads depends on the door, and neither door is "everything".**
+The broad forms read SPARQL's default dataset: a bare `{ ?s ?p ?o }` sees the store's
+**default graph only**, and a quad in a named graph is reached through `GRAPH` (ledger
+#373). A whole-dataset read is spelled
+
+```sparql
+SELECT ?s ?p ?o WHERE { { GRAPH ?g { ?s ?p ?o } } UNION { ?s ?p ?o } }
+```
+
+The scoped forms read exactly the graphs named in `graph=` — their merge is the default
+graph — and never the store's own default graph.
 
 **A read is not free here.** That is the difference from a query module: `ikigai-sparql`
 assembles its dataset per call from sources the caller already named, so gating it would
@@ -259,6 +271,51 @@ both `graph` and `query` unnamed it refuses with `accepts multiple arguments; na
 with key=value`. Naming the graph — which a caller must do anyway — leaves `query` as the
 one unnamed required input, so `… | urn:iki:store:graph-select graph=<G>` pipes normally.
 
+## ★ A scoped read over several graphs — the join (0.2.5, ledger #380)
+
+Until 0.2.5 a scoped read took ONE graph, so a caller holding the grants for a ledger and a
+browse graph could read each and never join them — and the join it did write came back
+**empty**, not refused, because `GRAPH <other>` inside a one-graph dataset matches nothing.
+The tenancy model could say "you may read A and you may read B" and could not run the one
+query anyone wants over both.
+
+`graph=` now takes **one IRI or several, separated by whitespace**:
+
+```text
+source urn:iki:store:graph-select \
+  graph="urn:iki:ledger:default urn:iki:browse:graph" \
+  query='SELECT ?item ?note WHERE { ?item <urn:annotated-by> ?note . ?note <urn:body> ?b }'
+```
+
+- **The dataset is the set, both halves.** `graph="G1 G2"` is exactly `FROM <G1> FROM <G2>
+  FROM NAMED <G1> FROM NAMED <G2>`: a bare pattern reads — and joins across — the merge,
+  `GRAPH ?g` binds only members, `GRAPH <other>` matches nothing, and the store's default
+  graph stays unreachable. One graph is the degenerate case of the same rule, so every
+  existing single-graph caller is unchanged. (Why not named graphs alone: `src/scope.rs`.)
+- ★ **Every graph must be granted, and one missing grant REFUSES the read** with a typed
+  `Denied` naming each missing `urn:cap:store:read:graph:<iri>`. It is never answered over
+  the graphs the caller does hold: a dataset quietly narrower than the one asked for
+  returns rows that look right and are wrong, which is the bug class this closes.
+- **Whitespace, not commas.** An IRI may contain a comma, so `graph=A,B` is one graph —
+  refused, with a note saying what was probably meant. And `graph=A graph=B` does NOT work:
+  a request carries one value per argument name and the engine keeps the last, so that
+  reaches the store as `graph=B`. Quote the list.
+- **Order and repetition do not matter**, to the answer or to the cache: a non-canonical
+  spelling is re-issued as the canonical one (sorted, single-spaced), so `"B A"`, `"A B"`
+  and `"A B A"` share one computed cache entry. An empty list is refused.
+- ⚠ **Duplicates across members are a bag, not a set.** oxigraph evaluates a several-graph
+  default graph once per member, so a triple present in two graphs matches a bare pattern
+  twice. Use `SELECT DISTINCT` where partitions can repeat a triple; under `GRAPH ?g` one
+  row per member is the right answer anyway.
+- ★ **A read over several graphs is cached only if EVERY graph in it is covered.** In a host
+  whose sharer writes one of the graphs — gonk's browse graph is exactly that — **a join
+  including that graph is never cached**, while a read of the covered graph alone still
+  is. That is correct, not a regression; it is written here for whoever wonders why the
+  join is slow.
+
+`tests/multi_graph_read.rs` is the evidence, and the escape probes over a set (property
+paths, sub-selects, `SERVICE`) are beside the mechanism in `src/scope.rs`.
+
 ## ★ Enumeration: `urn:iki:store:graphs` (0.2.5)
 
 A graph-scoped read is confined to a graph the caller **already named**, so it enumerates
@@ -437,8 +494,9 @@ catches: expiry **propagates**, so a module whose reads are sub-requests to
 second face over the same dataset. Measured here on a 250-item tenant graph: **1.05 ms
 per read shared, 32.5 µs owned** (`tests/shared_coverage.rs::measure_the_cost_of_sharing`).
 
-A **scoped** read is confined to one named graph by construction, and the default graph
-has no IRI, so no scoped read can reach it. A host that knows its sharer writes only the
+A **scoped** read is confined to the named graphs it names by construction, and the
+default graph has no IRI, so no scoped read can reach it. (Over several graphs, the read is
+covered only if every one of them is.) A host that knows its sharer writes only the
 default graph therefore knows the sharer cannot change any scoped read's answer:
 
 ```rust

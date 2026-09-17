@@ -5,10 +5,10 @@
 //! urn:iki:store:ask              Source  SPARQL ASK               urn:cap:store:read
 //! urn:iki:store:construct        Source  SPARQL CONSTRUCT         urn:cap:store:read
 //! urn:iki:store:describe         Source  SPARQL DESCRIBE          urn:cap:store:read
-//! urn:iki:store:graph-select     Source  SELECT, one graph        urn:cap:store:read:graph:<iri>
-//! urn:iki:store:graph-ask        Source  ASK, one graph           urn:cap:store:read:graph:<iri>
-//! urn:iki:store:graph-construct  Source  CONSTRUCT, one graph     urn:cap:store:read:graph:<iri>
-//! urn:iki:store:graph-describe   Source  DESCRIBE, one graph      urn:cap:store:read:graph:<iri>
+//! urn:iki:store:graph-select     Source  SELECT, named graph set  urn:cap:store:read:graph:<iri> each
+//! urn:iki:store:graph-ask        Source  ASK, named graph set     urn:cap:store:read:graph:<iri> each
+//! urn:iki:store:graph-construct  Source  CONSTRUCT, graph set     urn:cap:store:read:graph:<iri> each
+//! urn:iki:store:graph-describe   Source  DESCRIBE, graph set      urn:cap:store:read:graph:<iri> each
 //! urn:iki:store:info             Source  backing, size, coverage  urn:cap:store:read
 //! urn:iki:store:graphs           Source  readable graph names     urn:cap:store:read* (either)
 //! urn:iki:store:update           Sink    SPARQL UPDATE, all of it urn:cap:store:write
@@ -25,8 +25,27 @@
 //! bypass**: a caller holding the broad read grant could query another tenant's graph
 //! directly and go around the module that was enforcing access to it. The read half is
 //! confined **by construction** — the prepared query's dataset specification is set to
-//! the one graph before evaluation, so `graph=G` is exactly `FROM <G> FROM NAMED <G>` and
-//! nothing is copied (`src/scope.rs`).
+//! the named graphs before evaluation, so `graph=G` is exactly `FROM <G> FROM NAMED <G>`,
+//! `graph="G1 G2"` is `FROM <G1> FROM <G2> FROM NAMED <G1> FROM NAMED <G2>`, and nothing is
+//! copied (`src/scope.rs`).
+//!
+//! # ★ Which dataset each query face reads — stated because it is the bug class
+//!
+//! Two faces, two datasets, and neither is "everything":
+//!
+//! - **The broad forms** (`urn:iki:store:{select,ask,construct,describe}`) read SPARQL's
+//!   default dataset: the store's **default graph** for bare patterns, with every named
+//!   graph available to `GRAPH`. A bare `{ ?s ?p ?o }` therefore does NOT see a quad in a
+//!   named graph — ledger #373. The whole-dataset read is
+//!   `{ GRAPH ?g { ?s ?p ?o } } UNION { ?s ?p ?o }`.
+//! - **The scoped forms** read exactly the named graphs in `graph=`: their merge is the
+//!   default graph and they are the only named graphs, and the store's own default graph
+//!   is unreachable.
+//!
+//! ★ **Several graphs, and every one of them must be granted.** A caller naming a graph it
+//! holds no token for is REFUSED, with every missing token named — never answered over the
+//! subset it does hold. Quietly shrinking the dataset is the failure #380, #373 and #378
+//! share: a query that looks right, returns rows, and is wrong.
 //!
 //! ⚠ **A scoped query endpoint declares TWO required by-value inputs** (`graph` and
 //! `query`), so a bare pipe into one is ambiguous and the engine says so rather than
@@ -80,7 +99,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Invocation, ReprType,
+    ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Invocation, ReprType,
     Representation, Result, Verb,
 };
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
@@ -90,6 +109,7 @@ use oxigraph::model::{
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 
+use crate::scope::GraphSet;
 use crate::store::DurableStore;
 
 /// The capability a read requires. Declared, therefore enforced by the kernel before
@@ -319,21 +339,34 @@ pub fn space(store: DurableStore) -> EndpointSpace {
 /// thread — "always fresh" becomes "fresh until someone writes the other way, then stale
 /// with no bound and no signal". A covered store has no other way to write.
 ///
-/// ⚠ **`graph` is the whole difference between a right answer and a wrong one**, which
+/// ⚠ **`graphs` is the whole difference between a right answer and a wrong one**, which
 /// is why it is threaded from the call sites rather than read off the store: on a store
-/// built with `open_shared_declaring` the answer is per-read, not per-store. `Some(g)`
-/// is a scoped read — its universe is that one named graph, by construction
+/// built with `open_shared_declaring` the answer is per-read, not per-store. `Some(set)`
+/// is a scoped read — its universe is exactly those named graphs, by construction
 /// (`src/scope.rs`) — and `None` is every read that can see the whole dataset, the
-/// default graph included. Passing `None` where a graph was known is merely slow;
+/// default graph included.
+///
+/// ★ **A scoped read over several graphs is covered only if EVERY member is**, the same
+/// `.all` rule `urn:iki:store:graphs` applies: an invisible writer that can reach any one
+/// member can change the answer. The consequence worth knowing before someone wonders why
+/// a join is slow — in a host where one graph is uncovered (gonk's browse graph, which
+/// its sharer writes), **a join across that graph and a covered one is never cached**,
+/// while a read of the covered graph alone still is. Passing `None` where a graph was known is merely slow;
 /// passing `Some` where the read was NOT confined would cache a read of the whole
 /// dataset under a promise about one graph, which is the silent staleness above.
 /// [`DurableStore::read_is_covered`] holds the table.
 fn with_freshness(
     rep: Representation,
     store: &DurableStore,
-    graph: Option<&NamedNode>,
+    graphs: Option<&[NamedNode]>,
 ) -> Representation {
-    covered_by(rep, store.read_is_covered(graph.map(NamedNode::as_str)))
+    let covered = match graphs {
+        None => store.read_is_covered(None),
+        Some(graphs) => graphs
+            .iter()
+            .all(|graph| store.read_is_covered(Some(graph.as_str()))),
+    };
+    covered_by(rep, covered)
 }
 
 /// The three threads, or nothing — factored out because `urn:iki:store:graphs` reaches
@@ -388,8 +421,8 @@ struct QueryEndpoint {
     id: &'static str,
     /// Whether this form answers with a graph (CONSTRUCT/DESCRIBE) or a result set.
     graph_shaped: bool,
-    /// Whether this is the graph-scoped twin: takes `graph=`, requires a grant for that
-    /// graph, and sees nothing else. See `src/scope.rs`.
+    /// Whether this is the graph-scoped twin: takes `graph=` (one IRI or several),
+    /// requires a grant for every graph named, and sees nothing else. See `src/scope.rs`.
     scoped: bool,
 }
 
@@ -402,8 +435,14 @@ impl Endpoint for QueryEndpoint {
                 // ★ The parameterized half of the capability, checked before anything is
                 // parsed or evaluated: the kernel's pre-check can only see the wildcard
                 // (this caller holds SOME grant under `urn:cap:store:read:graph:`), and
-                // this is where it is checked that the grant names the graph asked for.
+                // this is where it is checked that a grant names EVERY graph asked for.
                 let target = self.scope(inv)?;
+                if let Some(set) = target.as_ref().filter(|set| !set.is_canonical()) {
+                    // ★ Only after the refusal above: a caller is told what it lacks under
+                    // the spelling it sent, not under one it never wrote.
+                    return self.reissue_canonical(inv, set).await;
+                }
+                let target = target.map(|set| set.graphs().to_vec());
                 let bound = match inv.inline_str("bindings") {
                     Ok(json) => crate::sparql::parse_bindings(json)?,
                     Err(_) => Vec::new(),
@@ -421,18 +460,25 @@ impl Endpoint for QueryEndpoint {
                     // graph's rows would label one tenant's data with another's graph
                     // name, so it is refused rather than silently overridden.
                     if crate::scope::names_its_own_dataset(&prepared) {
+                        let from: String = target
+                            .iter()
+                            .map(|g| format!("FROM <{}> ", g.as_str()))
+                            .collect();
+                        let named: Vec<String> = target
+                            .iter()
+                            .map(|g| format!("FROM NAMED <{}>", g.as_str()))
+                            .collect();
                         return Err(Error::InvalidArgument {
                             name: "query".to_string(),
                             detail: format!(
                                 "this query carries its own `FROM` / `FROM NAMED` clauses, and \
                                  `urn:iki:store:graph-{}` already fixes the dataset: `graph=` IS \
-                                 the dataset, exactly `FROM <{}> FROM NAMED <{}>`. The clauses \
-                                 are refused rather than overridden, because answering a `FROM` \
-                                 naming another graph with this graph's rows would be a wrong \
-                                 answer that looked right. Drop them",
+                                 the dataset, exactly `{from}{}`. The clauses are refused rather \
+                                 than overridden, because answering a `FROM` naming another graph \
+                                 with this graph's rows would be a wrong answer that looked right. \
+                                 Drop them, and name every graph you mean in `graph=`",
                                 self.form,
-                                target.as_str(),
-                                target.as_str(),
+                                named.join(" "),
                             ),
                         });
                     }
@@ -484,7 +530,7 @@ impl Endpoint for QueryEndpoint {
                     &self.store,
                     // `target` is `Some` exactly when `confine` ran, so this is the
                     // read's real universe and not a restatement of the IRI.
-                    target.as_ref(),
+                    target.as_deref(),
                 ))
             }
             other => Err(unsupported(self.id, other)),
@@ -504,15 +550,19 @@ impl Endpoint for QueryEndpoint {
         let form = self.form.to_uppercase();
         let desc = if self.scoped {
             Description::new(self.id)
-                .title(format!("SPARQL {form} confined to one named graph"))
+                .title(format!("SPARQL {form} confined to named graphs"))
                 .summary(format!(
-                    "Evaluate a SPARQL {form} against the named graph given by `graph` and \
-                     nothing else, under a grant for that graph alone. The confinement is the \
-                     evaluator's own dataset specification, not a check over the query text: \
-                     `graph=G` means exactly `FROM <G> FROM NAMED <G>`, so a `GRAPH <other>` \
-                     block matches nothing, a `GRAPH ?g` can only bind G, and the store's own \
-                     default graph is unreachable. A query of another form is refused, not \
-                     served here, and so is one carrying its own `FROM` clauses.",
+                    "Evaluate a SPARQL {form} against exactly the named graphs given by \
+                     `graph` — one, or several separated by whitespace — under a grant for \
+                     every one of them. The dataset is theirs alone: `graph=\"G1 G2\"` means \
+                     `FROM <G1> FROM <G2> FROM NAMED <G1> FROM NAMED <G2>`, so a bare pattern \
+                     reads (and joins across) the merge of the graphs, `GRAPH ?g` binds only \
+                     them, `GRAPH <other>` matches nothing, and the store's own default graph \
+                     is unreachable. Naming a graph the caller holds no grant for is refused \
+                     with the missing grant named, never answered over the rest. Covered — \
+                     and so cached — only when every graph named is. A query of another form \
+                     is refused, not served here, and so is one carrying its own `FROM` \
+                     clauses.",
                 ))
                 .verb(Verb::Source)
                 .verb(Verb::Meta)
@@ -520,17 +570,26 @@ impl Endpoint for QueryEndpoint {
                 .input(
                     ArgSpec::new("graph")
                         .summary(
-                            "The one named graph this query may read. The caller must hold \
-                             `urn:cap:store:read:graph:<this IRI>`.",
+                            "The named graphs this query may read: one IRI, or several \
+                             separated by whitespace (not commas — an IRI may contain one). \
+                             Order and repetition do not matter. The caller must hold \
+                             `urn:cap:store:read:graph:<IRI>` for EVERY graph named; one \
+                             missing grant refuses the whole read.",
                         )
-                        .class(XSD_ANY_URI),
+                        // A LIST of IRIs, and an ArgSpec has no way to say "many" — so the
+                        // wire's own class, as `ikigai-sparql` declares for its graph list.
+                        // `xsd:anyURI` would tell a validator `G1 G2` is malformed.
+                        .class(XSD_STRING),
                 )
         } else {
             Description::new(self.id)
                 .title(format!("SPARQL {form} over the durable store"))
                 .summary(format!(
-                    "Evaluate a SPARQL {form} against the store this host owns. A query of \
-                     another form is refused, not served here.",
+                    "Evaluate a SPARQL {form} against the store this host owns, under \
+                     SPARQL's default dataset: a bare pattern reads the store's DEFAULT \
+                     graph only, and a quad in a named graph is reached through `GRAPH`. \
+                     To read every quad write `{{ GRAPH ?g {{ ?s ?p ?o }} }} UNION {{ ?s ?p ?o \
+                     }}`. A query of another form is refused, not served here.",
                 ))
                 .verb(Verb::Source)
                 .verb(Verb::Meta)
@@ -584,40 +643,94 @@ impl QueryEndpoint {
         }
     }
 
-    /// The graph this invocation may read, or `None` on the broad form.
+    /// The graphs this invocation may read, or `None` on the broad form.
     ///
     /// ★ Declared and enforced are the same scope, which is the whole contract. The
     /// kernel checks the declared [`CAP_READ_GRAPH`] wildcard before `invoke`; this
-    /// checks the grant against the graph actually named, because an argument is not
+    /// checks a grant against EVERY graph actually named, because an argument is not
     /// visible to a pre-check.
+    ///
+    /// ⚠ **Refuse, never drop.** A caller naming `G1 G2` while holding only `G1`'s grant
+    /// is denied, and the denial names `G2`'s token. The alternative — confining to the
+    /// graphs it does hold — returns rows, looks right, and silently answers a different
+    /// question from the one asked; that is the bug class this door exists to close.
     ///
     /// ⚠ **[`CAP_READ`] does NOT satisfy this door and is not meant to.** A broad holder
     /// uses `urn:iki:store:select` and sees the whole dataset. Accepting both here would
     /// mean the declared scope was not the enforced one — and the ablation runs the other
     /// way too: a graph grant does not open the broad door, which is what makes it a
     /// boundary rather than a hint.
-    fn scope(&self, inv: &Invocation<'_>) -> Result<Option<NamedNode>> {
+    fn scope(&self, inv: &Invocation<'_>) -> Result<Option<GraphSet>> {
         if !self.scoped {
             return Ok(None);
         }
-        let graph = inv.inline_str("graph")?;
-        let target = NamedNode::new(graph).map_err(|e| Error::InvalidArgument {
-            name: "graph".to_string(),
-            detail: format!("`{graph}` is not an IRI: {e}"),
-        })?;
-        let scope = cap_read_graph(target.as_str());
-        if !inv.capability.allows(&scope) {
-            return Err(Error::Denied(format!(
-                "reading graph <{}> through `{}` needs the grant `{scope}`, which this \
-                 capability does not hold. A grant names exactly one graph; holding \
-                 `{CAP_READ}` does not imply it, and is instead the authority for \
-                 `urn:iki:store:{}` over the whole dataset",
-                target.as_str(),
-                self.iri(),
-                self.form,
-            )));
+        let set = GraphSet::parse(inv.inline_str("graph")?)?;
+        let missing: Vec<&NamedNode> = set
+            .graphs()
+            .iter()
+            .filter(|graph| !inv.capability.allows(&cap_read_graph(graph.as_str())))
+            .collect();
+        if missing.is_empty() {
+            return Ok(Some(set));
         }
-        Ok(Some(target))
+        let graphs: Vec<String> = missing
+            .iter()
+            .map(|g| format!("<{}>", g.as_str()))
+            .collect();
+        let tokens: Vec<String> = missing
+            .iter()
+            .map(|g| format!("`{}`", cap_read_graph(g.as_str())))
+            .collect();
+        // An IRI may contain a comma, so `graph=A,B` parses as ONE graph and demands a
+        // token nobody holds. Say what was probably meant rather than only that it failed.
+        let comma = if missing.iter().any(|g| g.as_str().contains(',')) {
+            " If a comma was meant to separate several graphs, separate them with whitespace \
+             instead: an IRI may contain a comma, so this was read as one graph."
+        } else {
+            ""
+        };
+        Err(Error::Denied(format!(
+            "reading {} through `{}` needs {} {}, which this capability does not hold. \
+             Every graph a scoped read names must be granted: the read is refused rather \
+             than answered over the graphs that are, because a narrower dataset than the one \
+             asked for returns rows that look right and are not. A grant names exactly one \
+             graph; holding `{CAP_READ}` does not imply it, and is instead the authority for \
+             `urn:iki:store:{}` over the whole dataset.{comma}",
+            graphs.join(", "),
+            self.iri(),
+            if tokens.len() == 1 {
+                "the grant"
+            } else {
+                "the grants"
+            },
+            tokens.join(", "),
+            self.form,
+        )))
+    }
+
+    /// Answer a non-canonical `graph=` spelling by resolving the canonical one.
+    ///
+    /// ★ **This is what makes the cache order-independent**, and it has to be done this
+    /// way because the kernel keys an entry on the request's raw argument bytes — which an
+    /// endpoint cannot rewrite. So `graph="B A"`, `graph="A B"` and `graph="A B A"` each
+    /// become a sub-request for `graph="A B"`: one evaluation, one computed entry, and the
+    /// outer spelling inherits its expiry and golden threads through `Invocation::issue`,
+    /// so a write still invalidates every spelling.
+    ///
+    /// ⚠ The canonical spelling never reaches here, so a single-graph read — the ledger's
+    /// hot path, spelled canonically by construction — pays nothing for any of this. A
+    /// trailing newline from a pipe (field guide 9h) is non-canonical and is normalized.
+    async fn reissue_canonical(
+        &self,
+        inv: &Invocation<'_>,
+        set: &GraphSet,
+    ) -> Result<Representation> {
+        let mut request = inv.request.clone();
+        request.args.insert(
+            "graph".to_string(),
+            ArgRef::Inline(set.canonical().into_bytes()),
+        );
+        inv.issue(request).await
     }
 
     /// Make oxigraph's refusal of an unusable binding say what to do about it.

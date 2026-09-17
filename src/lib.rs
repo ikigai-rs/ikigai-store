@@ -17,10 +17,10 @@
 //! urn:iki:store:ask              Source  SPARQL ASK               urn:cap:store:read
 //! urn:iki:store:construct        Source  SPARQL CONSTRUCT         urn:cap:store:read
 //! urn:iki:store:describe         Source  SPARQL DESCRIBE          urn:cap:store:read
-//! urn:iki:store:graph-select     Source  SELECT, one graph        urn:cap:store:read:graph:<iri>
-//! urn:iki:store:graph-ask        Source  ASK, one graph           urn:cap:store:read:graph:<iri>
-//! urn:iki:store:graph-construct  Source  CONSTRUCT, one graph     urn:cap:store:read:graph:<iri>
-//! urn:iki:store:graph-describe   Source  DESCRIBE, one graph      urn:cap:store:read:graph:<iri>
+//! urn:iki:store:graph-select     Source  SELECT, named graph set  urn:cap:store:read:graph:<iri> each
+//! urn:iki:store:graph-ask        Source  ASK, named graph set     urn:cap:store:read:graph:<iri> each
+//! urn:iki:store:graph-construct  Source  CONSTRUCT, graph set     urn:cap:store:read:graph:<iri> each
+//! urn:iki:store:graph-describe   Source  DESCRIBE, graph set      urn:cap:store:read:graph:<iri> each
 //! urn:iki:store:info             Source  backing, size, coverage  urn:cap:store:read
 //! urn:iki:store:graphs           Source  readable graph names     urn:cap:store:read* (either)
 //! urn:iki:store:update           Sink    SPARQL UPDATE, all of it urn:cap:store:write

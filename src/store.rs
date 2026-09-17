@@ -394,9 +394,10 @@ impl DurableStore {
     /// **The per-read question**: may a read whose universe is `graph` be cached under
     /// this crate's write threads?
     ///
-    /// `graph` is `Some(iri)` for a scoped read — confined to that one named graph by
+    /// `graph` is `Some(iri)` for a scoped read — confined to that named graph by
     /// `src/scope.rs`, by construction — and `None` for every read that sees the whole
-    /// dataset: the four broad query faces and `urn:iki:store:info`.
+    /// dataset: the four broad query faces and `urn:iki:store:info`. A scoped read over
+    /// SEVERAL graphs asks once per graph and is covered only if every answer is yes.
     ///
     /// | coverage | `None` (whole dataset) | `Some(G)` |
     /// | --- | --- | --- |
