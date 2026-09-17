@@ -128,6 +128,20 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 #      it; a `#[deprecated]` note works on the compiler. Checked before deciding: no
 #      consumer in the ecosystem calls it (`ikigai-cli`, `ikigai-gonk`, `ikigai-ledger`),
 #      so nobody's `-D warnings` build turns red on this.
+#
+# ★ 0.2.5 ALSO carries the multi-graph scoped read (ledger #380), and stays a patch by the
+# same argument — but this one has an edge worth naming rather than burying. What is
+# additive: `graph=` on `urn:iki:store:graph-{select,ask,construct,describe}` now accepts
+# SEVERAL whitespace-separated IRIs; a single IRI means exactly what it meant, reads
+# exactly what it read, caches under exactly the key it did, and is refused for exactly
+# the tokens it was. ⚠ What MOVED: that input's declared `class` went from `xsd:anyURI`
+# to `xsd:string`, because a list is not an anyURI and a class that is not TRUE tells
+# `urn:kernel:validate` to reject values the endpoint accepts. It is a WIDENING — every
+# value accepted before is accepted now — and checked against the ecosystem before
+# deciding: `urn:kernel:validate` does not check `anyURI` lexically, `ikigai-conformance`
+# is driven by explicit fixtures for these four, and class-driven selection
+# (`select_action`) is the one place a host could observe it (a query naming `anyURI` as
+# present no longer satisfies `graph`). If a consumer is found to depend on that, 0.3.0.
 version = "0.2.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
