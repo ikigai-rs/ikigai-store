@@ -222,6 +222,11 @@ pub fn cap_write_graph(graph: &str) -> String {
 /// write scope over a graph does not imply the read scope over it and vice versa — the
 /// two are separate grants for the same reason the broad pair are, and a host that means
 /// a module to do both grants both.
+///
+/// ★ **An update with a `WHERE` needs this as well as the write scope** (ledger #751),
+/// because a `WHERE` reads the graph: `urn:iki:store:graph-update` refuses one from a
+/// write-only caller on the grant, before evaluating anything. A write-only grant is
+/// enough for `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP` and `CREATE`.
 pub fn cap_read_graph(graph: &str) -> String {
     format!("urn:cap:store:read:graph:{graph}")
 }
@@ -1070,19 +1075,33 @@ impl Endpoint for UpdateEndpoint {
             Verb::Sink => {
                 let update = inv.inline_str("content")?;
                 no_bindings(inv, "urn:iki:store:update")?;
+                // ★ The same read rule as the scoped door (ledger #751): a `WHERE` reads
+                // the dataset, and here it can read ALL of it, so it needs the broad read
+                // grant. Decided on the text, before evaluation.
+                let prepared = crate::confine::parse(update)?;
+                let may_read = inv.capability.allows(CAP_READ);
+                if crate::confine::reads_the_dataset(&prepared) && !may_read {
+                    return Err(Error::Denied(format!(
+                        "this update has a `WHERE` clause, which reads the dataset, and reading \
+                         it through `urn:iki:store:update` needs `{CAP_READ}` as well as \
+                         `{CAP_WRITE}`; this capability does not hold it. Nothing was evaluated. \
+                         The write grant alone covers updates that read nothing: `INSERT DATA`, \
+                         `DELETE DATA`, `CLEAR`, `DROP`, `CREATE`, `LOAD`"
+                    )));
+                }
                 let _writes = self.store.write_lock();
                 let before = self.len()?;
-                SparqlEvaluator::new()
-                    .parse_update(update)
-                    .map_err(|e| Error::InvalidArgument {
-                        name: "content".to_string(),
-                        detail: format!("not a SPARQL update: {e}"),
-                    })?
+                prepared
                     .on_store(self.store.dataset())
                     .execute()
                     .map_err(|e| Error::Endpoint(format!("update: {e}")))?;
                 let after = self.len()?;
-                Ok(plain(format!("updated: {before} -> {after} quads\n")))
+                // The counts are a read of the dataset, so only for a caller that may read.
+                Ok(plain(if may_read {
+                    format!("updated: {before} -> {after} quads\n")
+                } else {
+                    "updated\n".to_string()
+                }))
             }
             other => Err(unsupported("store-update", other)),
         }
@@ -1096,9 +1115,12 @@ impl Endpoint for UpdateEndpoint {
         Description::new("store-update")
             .title("SPARQL UPDATE against the durable store")
             .summary(
-                "Apply a SPARQL 1.1 UPDATE to the store. Cuts the golden thread \
-                 `urn:iki:store:update`, so every cacheable read of this store \
-                 recomputes.",
+                "Apply a SPARQL 1.1 UPDATE to the store. An update with a `WHERE` clause \
+                 (including `DELETE WHERE`, `WITH`, `COPY`, `MOVE`, `ADD`) reads the \
+                 dataset and also needs `urn:cap:store:read`, refused on the grant before \
+                 evaluation; a caller without it is not told the quad counts. Cuts the \
+                 golden thread `urn:iki:store:update`, so every cacheable read of this \
+                 store recomputes.",
             )
             .verb(Verb::Sink)
             .verb(Verb::Meta)
@@ -1168,14 +1190,38 @@ impl Endpoint for GraphUpdateEndpoint {
                     )));
                 }
 
+                // ★ The READ half (ledger #751): a `WHERE` reads `G`, so an update with one
+                // needs the read grant too — decided here, on the update's text and the
+                // caller's grants, before anything is evaluated, so whether it is refused
+                // says nothing about what `G` holds. `src/confine.rs` has the argument.
+                let prepared = crate::confine::parse(update)?;
+                let may_read = may_read_graph(inv, &target);
+                if crate::confine::reads_the_dataset(&prepared) && !may_read {
+                    return Err(Error::Denied(format!(
+                        "this update has a `WHERE` clause, which reads graph <{}>, and reading it \
+                         needs the grant `{}` (or `{CAP_READ}`), which this capability does not \
+                         hold. Nothing was evaluated. A write grant alone covers updates that \
+                         read nothing: `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP`, `CREATE`",
+                        target.as_str(),
+                        cap_read_graph(target.as_str()),
+                    )));
+                }
+
                 let _writes = self.store.write_lock();
-                let applied = crate::confine::scoped_update(self.store.dataset(), &target, update)?;
-                Ok(plain(format!(
-                    "updated <{}>: +{} -{} quads\n",
-                    target.as_str(),
-                    applied.added,
-                    applied.removed
-                )))
+                let applied =
+                    crate::confine::scoped_update(self.store.dataset(), &target, prepared)?;
+                // ⚠ The counts only for a caller that may read `G`: `+0` after an
+                // `INSERT DATA` says the quad was already there, which is a read.
+                Ok(plain(if may_read {
+                    format!(
+                        "updated <{}>: +{} -{} quads\n",
+                        target.as_str(),
+                        applied.added,
+                        applied.removed
+                    )
+                } else {
+                    format!("updated <{}>\n", target.as_str())
+                }))
             }
             other => Err(unsupported("store-graph-update", other)),
         }
@@ -1192,10 +1238,16 @@ impl Endpoint for GraphUpdateEndpoint {
                 "Apply a SPARQL 1.1 UPDATE that can only affect the named graph given by \
                  `graph`, under a grant for that graph alone. The update is evaluated \
                  against a dataset containing that graph and nothing else, and is refused \
-                 in full — with the offending statement named — if anything would land in \
-                 another graph or in the default graph. It therefore cannot READ another \
-                 graph either, which is the point: this is a boundary, not a filter. Cuts \
-                 the golden thread `urn:iki:store:graph-update`.",
+                 in full — naming where it escaped to, never the data — if anything would \
+                 land in another graph or in the default graph. It therefore cannot READ \
+                 another graph either, which is the point: this is a boundary, not a \
+                 filter. An update with a `WHERE` clause (including `DELETE WHERE`, `WITH`, \
+                 `COPY`, `MOVE`, `ADD`) READS the graph, so it also needs \
+                 `urn:cap:store:read:graph:<IRI>` (or `urn:cap:store:read`) and is refused \
+                 on the grant, before evaluation, without it; `INSERT DATA`, `DELETE DATA`, \
+                 `CLEAR`, `DROP` and `CREATE` need the write grant alone, and a caller who \
+                 cannot read the graph is not told the quad counts. Cuts the golden thread \
+                 `urn:iki:store:graph-update`.",
             )
             .verb(Verb::Sink)
             .verb(Verb::Meta)
@@ -1205,7 +1257,8 @@ impl Endpoint for GraphUpdateEndpoint {
                     .summary(
                         "A SPARQL 1.1 UPDATE. Statements must be inside a `GRAPH <…>` \
                          block naming the scoped graph: a bare `INSERT DATA { … }` writes \
-                         the default graph and is refused.",
+                         the default graph and is refused. One with a `WHERE` clause also \
+                         needs the read grant on the graph.",
                     )
                     .class(XSD_STRING),
             )
@@ -1261,9 +1314,13 @@ impl Endpoint for LoadEndpoint {
                         detail: format!("parsing {media}: {e}"),
                     })?;
                 let after = self.len()?;
-                Ok(plain(format!(
-                    "loaded {media}: {before} -> {after} quads\n"
-                )))
+                // The counts are a read (a document whose quads were all there already
+                // adds nothing), so only for a caller that may read the dataset.
+                Ok(plain(if inv.capability.allows(CAP_READ) {
+                    format!("loaded {media}: {before} -> {after} quads\n")
+                } else {
+                    format!("loaded {media}\n")
+                }))
             }
             other => Err(unsupported("store-load", other)),
         }
@@ -1320,6 +1377,18 @@ impl LoadEndpoint {
 }
 
 // ---------------------------------------------------------------------------- shared
+
+/// Whether this caller may READ `graph` — its own per-graph grant, or the broad
+/// [`CAP_READ`], which reads every graph anyway.
+///
+/// ★ Asked by the scoped WRITE door, where accepting both is right: the question is
+/// "would answering this tell the caller something it could not already read", not
+/// "which door is this", so no authority is added. (The scoped READ doors are different:
+/// there the declared scope is the door, and [`CAP_READ`] is refused to keep declared and
+/// enforced the same.)
+fn may_read_graph(inv: &Invocation<'_>, graph: &NamedNode) -> bool {
+    inv.capability.allows(&cap_read_graph(graph.as_str())) || inv.capability.allows(CAP_READ)
+}
 
 fn plain(text: String) -> Representation {
     Representation::new(

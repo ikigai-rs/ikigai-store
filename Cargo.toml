@@ -197,7 +197,14 @@ ikigai-core = "0.1.57"
 # on wasm compiles to exactly the default build. That is deliberate: a wasm-only fallback
 # branch would be code no CI job can reach (checked: `cargo clippy --lib --target
 # wasm32-unknown-unknown --features persistent` is clean and adds nothing).
-oxigraph = { version = "0.5", default-features = false }
+# ★ 0.5.1 is the TRUE floor and it is a SECURITY floor (ledger #751): under oxigraph 0.5.0
+# (spareval 0.2.0) a scoped `SELECT ?g WHERE { GRAPH ?g {} }` enumerates EVERY registered
+# graph name, not only the ones `graph=` confines the query to — so a tenant could list
+# every other tenant's graphs. 0.5.1 (spareval 0.2.1) through 0.5.11 confine it (bisected
+# 2026-10-05). `"0.5"` admitted 0.5.0. `tests/graph_name_enumeration.rs` fails on any
+# resolution where that query leaks, so a later regression upstream is caught as well.
+# ⚠ `"0.5.1"` is still a CEILING at `<0.6.0`.
+oxigraph = { version = "0.5.1", default-features = false }
 # The layered `store.toml`. `deny_unknown_fields` on the layer type is what makes a
 # misspelled key loud instead of ignored. Both crates are pure Rust and wasm-clean.
 serde = { version = "1", features = ["derive"] }
@@ -212,7 +219,7 @@ toml = "0.8"
 
 # On wasm, Oxigraph needs its `js` feature (getrandom wasm backend) to build.
 [target.'cfg(target_family = "wasm")'.dependencies]
-oxigraph = { version = "0.5", default-features = false, features = ["js"] }
+oxigraph = { version = "0.5.1", default-features = false, features = ["js"] }
 
 [dev-dependencies]
 futures = "0.3"

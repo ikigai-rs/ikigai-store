@@ -83,6 +83,14 @@
 //! `DELETE WHERE { GRAPH ?g { … } }` and against a bare `INSERT DATA` that names no graph
 //! at all. The mechanism and its costs are in `src/confine.rs`.
 //!
+//! ★ **A `WHERE` is a read, so an update with one needs the read grant too** — on the
+//! scoped door `cap_read_graph(graph)` beside the write grant, on the broad door
+//! [`CAP_READ`] beside [`CAP_WRITE`]. It is decided on the update's text before anything
+//! is evaluated, a refusal never quotes data, and a caller that may not read is not told
+//! the quad counts. `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP` and `CREATE` stay
+//! write-only. (Ledger #751: a write-only grant could read `G` through the refusal text,
+//! and then through refused-or-not.)
+//!
 //! [`CAP_READ`] is the matching problem in the other direction, and leaving it unsolved
 //! left the boundary with a **documented bypass**: a module enforcing its own read
 //! capability over the graph it owns could be gone around by a caller who holds the broad
