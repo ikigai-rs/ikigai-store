@@ -100,11 +100,20 @@ use oxigraph::sparql::PreparedSparqlQuery;
 /// `graph=B`, and the join over A comes back empty. That is upstream of anything this
 /// crate can see, and is reported rather than worked around.
 ///
-/// Whitespace and not commas (which `ikigai-sparql` also accepts), because **no IRI can
-/// contain whitespace and an IRI CAN contain a comma**: `urn:a,urn:b` is one valid IRI.
-/// Splitting on whitespace alone is therefore exact — every graph string has one parse —
-/// and on a boundary that is the property worth having. The comma case is not silent
-/// either: it demands a token nobody holds, and the refusal says what was probably meant.
+/// ASCII whitespace and not commas (which `ikigai-sparql` also accepts), because **no IRI
+/// can contain ASCII whitespace and an IRI CAN contain a comma**: `urn:a,urn:b` is one
+/// valid IRI. Splitting on ASCII whitespace alone is therefore exact — every graph string
+/// has one parse — and on a boundary that is the property worth having. The comma case is
+/// not silent either: it demands a token nobody holds, and the refusal says what was
+/// probably meant.
+///
+/// ⚠ **ASCII whitespace, NOT Unicode whitespace** (ledger #751). RFC 3987's `ucschar`
+/// admits U+00A0, U+3000 and the other non-ASCII spaces, and oxiri accepts them, so
+/// `urn:a\u{3000}urn:b` is ONE IRI: the write door takes it as one graph and
+/// `urn:iki:store:graphs` lists it as one. `str::split_whitespace` split it into two, so
+/// the scoped read door demanded two grants nobody holds and the graph could be written
+/// and listed but never read. The separators are space, tab, line feed, form feed and
+/// carriage return — the ones no IRI can contain.
 ///
 /// # Order and repetition
 ///
@@ -128,7 +137,7 @@ impl GraphSet {
     /// plausible-looking wrong answer — exactly the failure this crate refuses elsewhere.
     pub(crate) fn parse(raw: &str) -> Result<Self> {
         let mut set = BTreeSet::new();
-        for token in raw.split_whitespace() {
+        for token in raw.split_ascii_whitespace() {
             let graph = NamedNode::new(token).map_err(|e| Error::InvalidArgument {
                 name: "graph".to_string(),
                 detail: format!("`{token}` is not an IRI: {e}"),
@@ -678,6 +687,26 @@ mod tests {
                 if name == "graph" && detail.contains("`not-an-iri`")),
             "{err:?}"
         );
+    }
+
+    /// The other half of the same rule: a non-ASCII space is legal inside an IRI too, so
+    /// it is not a separator either (ledger #751).
+    #[test]
+    fn a_unicode_space_inside_an_iri_does_not_separate_graphs() {
+        for g in [
+            "urn:a\u{3000}urn:b",
+            "urn:a\u{a0}urn:b",
+            "urn:a\u{2003}urn:b",
+        ] {
+            assert!(NamedNode::new(g).is_ok(), "oxiri takes {g:?} as one IRI");
+            let set = GraphSet::parse(g).unwrap();
+            assert_eq!(set.graphs().len(), 1, "{g:?}");
+            assert_eq!(set.graphs()[0].as_str(), g);
+            assert!(set.is_canonical());
+        }
+        // ASCII whitespace still separates, in every spelling.
+        let set = GraphSet::parse(&format!("{G}\t{OTHER}\n")).unwrap();
+        assert_eq!(set.graphs().len(), 2);
     }
 
     /// ⚠ The reason the separator is whitespace alone: a comma is legal inside an IRI, so
