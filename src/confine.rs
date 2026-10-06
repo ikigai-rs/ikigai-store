@@ -40,6 +40,10 @@
 //! | `DROP ALL`, `CLEAR ALL` | applied to `G` alone | the private store held only `G`, and emptying `G` is within a grant over `G` |
 //! | `DELETE WHERE { GRAPH ?g { … } }` | applied to `G` alone | the variable can only bind `G` |
 //!
+//! Every row whose update has a `WHERE` — the `WITH`, `COPY`/`MOVE`/`ADD` and
+//! `DELETE WHERE` rows — is reached only by a caller that may also READ `G`; a write-only
+//! caller is refused on the grant before any of this runs. See below.
+//!
 //! # ⚠ The scoped door also cannot READ outside its graph, and that is deliberate
 //!
 //! The private store contains `G` and nothing else, so a `WHERE` clause that reads
@@ -50,7 +54,34 @@
 //! boundary at all. It is stated on the endpoint, in the README, and here, because a
 //! silent difference in results is worse than a refusal.
 //!
-//! # What it costs
+//! # ★ …and a WRITE grant alone cannot read even `G` (ledger #751)
+//!
+//! A `WHERE` clause READS the graph it matches against, so an update with one is a read
+//! of `G` as well as a write. Until ledger #751 (2026-10-05) a caller holding only
+//! `urn:cap:store:write:graph:<G>` could read `G` two ways without changing anything:
+//! copy its quads into an escaping pattern (`INSERT { GRAPH <elsewhere> { ?s ?p ?o } }
+//! WHERE { GRAPH <G> { ?s ?p ?o } }`) and read them back out of the refusal, which quoted
+//! the first escaping quad; or, with the refusal redacted, guess a value and watch whether
+//! the update was refused — a boolean oracle over `G`'s contents, one guess per call.
+//!
+//! So the rule is **an update with a `WHERE` needs the read grant on every graph its
+//! `WHERE` reads** — here exactly `G`, so `urn:cap:store:read:graph:<G>` (or the broad
+//! `urn:cap:store:read`, which reads `G` anyway). Three properties make it hold:
+//!
+//! - **It is decided on the grant, before anything is evaluated.** Whether the update has
+//!   a `WHERE` is a property of its TEXT ([`reads_the_dataset`]), never of `G`'s contents,
+//!   so refused-or-not says nothing about the data.
+//! - **A refusal never quotes data.** It names the scoped graph, where the escape went,
+//!   and the grant — not the quad.
+//! - **A write-only caller is not told the counts.** `+N -M quads` is an oracle of its
+//!   own (an `INSERT DATA` of a quad already there adds 0), so the success line carries
+//!   them only for a caller that may read `G`.
+//!
+//! `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP`, `CREATE` and `LOAD` have no `WHERE` and
+//! stay write-only. `COPY`, `MOVE` and `ADD` are rewritten by the parser into
+//! `DELETE/INSERT … WHERE` over the source graph, so they read it, and need the grant.
+//!
+//! //! # What it costs
 //!
 //! Graph `G` is copied into memory on every scoped write, twice over (the before and
 //! after sets), so this door is priced for a graph a module owns — a ledger, a layer, an
@@ -65,7 +96,7 @@ use std::collections::HashSet;
 
 use ikigai_core::{Error, Result};
 use oxigraph::model::{GraphName, NamedNode, Quad};
-use oxigraph::sparql::SparqlEvaluator;
+use oxigraph::sparql::{PreparedSparqlUpdate, SparqlEvaluator};
 use oxigraph::store::Store;
 
 /// What a scoped update did to the real store.
@@ -74,11 +105,41 @@ pub(crate) struct Applied {
     pub removed: usize,
 }
 
+/// Parse a SPARQL update, refusing one that does not parse by the argument's name.
+pub(crate) fn parse(update: &str) -> Result<PreparedSparqlUpdate> {
+    SparqlEvaluator::new()
+        .parse_update(update)
+        .map_err(|e| Error::InvalidArgument {
+            name: "content".to_string(),
+            detail: format!("not a SPARQL update: {e}"),
+        })
+}
+
+/// Whether the update has a `WHERE` — i.e. READS the dataset it runs against.
+///
+/// ★ Decided on the update's TEXT, never on the data, which is what keeps the read-grant
+/// refusal from being an oracle. oxigraph keeps the parsed AST private, but it exposes one
+/// query dataset specification per `DELETE/INSERT … WHERE` operation (absent a `USING`
+/// clause, the default one), and none for any other operation: so "has at least one" is
+/// exactly "some operation in this request evaluates a graph pattern". That covers
+/// `DELETE WHERE`, `WITH … WHERE` and the `COPY`/`MOVE`/`ADD` rewrites, and excludes
+/// `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP`, `CREATE` and `LOAD`.
+/// `the_read_grant_rule_classifies_every_operation` pins the table, so an upstream change
+/// to that mapping fails a test rather than quietly reopening the oracle.
+pub(crate) fn reads_the_dataset(prepared: &PreparedSparqlUpdate) -> bool {
+    prepared.using_datasets().next().is_some()
+}
+
 /// Evaluate `update` confined to `graph`, applying it only if nothing escaped.
 ///
-/// The caller must already hold the per-graph capability and the store's write lock —
-/// this function is the mechanism, not the gate.
-pub(crate) fn scoped_update(store: &Store, graph: &NamedNode, update: &str) -> Result<Applied> {
+/// The caller must already hold the per-graph capability — the write grant always, and the
+/// read grant when [`reads_the_dataset`] — and the store's write lock: this function is
+/// the mechanism, not the gate.
+pub(crate) fn scoped_update(
+    store: &Store,
+    graph: &NamedNode,
+    update: PreparedSparqlUpdate,
+) -> Result<Applied> {
     let scope = GraphName::from(graph.clone());
     let scratch = Store::new().map_err(storage)?;
 
@@ -102,12 +163,7 @@ pub(crate) fn scoped_update(store: &Store, graph: &NamedNode, update: &str) -> R
         .map_err(storage)?;
 
     // 2. The caller's update, against the private dataset.
-    SparqlEvaluator::new()
-        .parse_update(update)
-        .map_err(|e| Error::InvalidArgument {
-            name: "content".to_string(),
-            detail: format!("not a SPARQL update: {e}"),
-        })?
+    update
         .on_store(&scratch)
         .execute()
         .map_err(|e| Error::Endpoint(format!("update: {e}")))?;
@@ -158,20 +214,22 @@ pub(crate) fn scoped_update(store: &Store, graph: &NamedNode, update: &str) -> R
 /// ⚠ `Denied`, not `InvalidArgument`: the update is well-formed and the caller simply
 /// lacks authority over the graph it reached for. That is the typed shape the kernel's
 /// denial observability and the conformance suite both read.
+///
+/// ★ **It never quotes the quad** (ledger #751). Until ledger #751 it did, and the quad could
+/// be one the update had copied out of `G` by a `WHERE` — so the refusal was a read
+/// channel. Where the escape went is named (the default graph, or a graph the caller's own
+/// text or readable data supplied); the data is not.
 fn escaped_quad(graph: &NamedNode, quad: &Quad) -> Error {
     let where_it_went = match &quad.graph_name {
         GraphName::DefaultGraph => "the DEFAULT graph".to_string(),
         other => format!("graph {other}"),
     };
     Error::Denied(format!(
-        "this write is scoped to graph <{}> and the update would have written {where_it_went} \
-         (`{} {} {}`). Nothing was applied. A statement with no `GRAPH` block goes to the \
-         default graph, which is not the scoped graph — wrap it in `GRAPH <{}> {{ … }}`, or \
-         hold `urn:cap:store:write` and use `urn:iki:store:update`",
+        "this write is scoped to graph <{}> and the update would have written {where_it_went}. \
+         Nothing was applied. A statement with no `GRAPH` block goes to the default graph, \
+         which is not the scoped graph — wrap it in `GRAPH <{}> {{ … }}`, or hold \
+         `urn:cap:store:write` and use `urn:iki:store:update`",
         graph.as_str(),
-        quad.subject,
-        quad.predicate,
-        quad.object,
         graph.as_str(),
     ))
 }

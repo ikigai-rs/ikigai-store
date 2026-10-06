@@ -164,8 +164,8 @@ sink urn:iki:store:graph-update \
 
 **The scope is enforced on effects, not on syntax**, which is the only way it can be
 exact. The update runs against a private copy of that one graph; if anything lands
-anywhere else the whole request is refused with the offending statement named, and
-otherwise the difference is applied to the real graph in one transaction. So the shapes
+anywhere else the whole request is refused, naming where it escaped to (never the data),
+and otherwise the difference is applied to the real graph in one transaction. So the shapes
 that defeat a syntactic check are handled by construction:
 
 | update | what happens |
@@ -180,6 +180,31 @@ that defeat a syntactic check are handled by construction:
 through `urn:iki:store:update` can behave differently. That is deliberate and it is the
 right way round: a grant that let one tenant's agent read another's graph in order to
 decide what to write in its own would be a filter, not a boundary.
+
+★ **And an update with a `WHERE` needs the READ grant too** (ledger #751). A `WHERE`
+reads the graph it matches against, so a caller holding only the write grant could once
+read `G` by copying its quads into an escaping pattern and reading them out of the
+refusal — or, with the refusal redacted, by guessing a value and watching whether the
+update was refused. So:
+
+| update | needs |
+| --- | --- |
+| `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP`, `CREATE` | `urn:cap:store:write:graph:<G>` |
+| anything with a `WHERE` — `INSERT/DELETE … WHERE`, `DELETE WHERE`, `WITH`, and `COPY`/`MOVE`/`ADD` (the parser rewrites them into one) | that, **and** `urn:cap:store:read:graph:<G>` (or `urn:cap:store:read`) |
+
+The decision is made on the update's text and the caller's grants **before anything is
+evaluated**, so whether it is refused says nothing about `G`. A refusal never quotes a
+quad, and a caller who may not read `G` gets `updated <G>` without the `+N -M` counts,
+which are a read of their own (`+0` after an `INSERT DATA` means the quad was already
+there). The broad door applies the same rule one level up: `urn:iki:store:update` with a
+`WHERE` needs `urn:cap:store:read` as well as `urn:cap:store:write`, and both broad write
+doors report counts only to a caller holding `urn:cap:store:read`.
+
+⚠ **The declared `requires` cannot say this, and is unchanged.** `requires` is ALL-of and
+unconditional, while this requirement depends on the update's shape; declaring the read
+grant would deny a write-only caller the `INSERT DATA` it is entitled to. So the manifold
+offers the door on the write grant — true for every update without a `WHERE` — and the
+summary and the `content` argument state the rest.
 
 Three more things, each of them a decision rather than an omission:
 

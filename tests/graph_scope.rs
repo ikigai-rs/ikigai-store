@@ -365,9 +365,11 @@ fn a_graph_that_is_not_an_iri_is_refused_by_name() {
 }
 
 /// The refusal names the graph the update reached for, because that is how an operator
-/// finds out what the update actually did.
+/// finds out what the update actually did — and NOT the statement: a quad in a refusal
+/// can be one a `WHERE` copied out of the graph, which made the refusal a read channel
+/// (ledger #751; `tests/update_read_grant.rs` holds the probes).
 #[test]
-fn the_refusal_names_the_offending_statement() {
+fn the_refusal_names_the_graph_and_never_the_statement() {
     let kernel = kernel();
     let err = scoped(
         &kernel,
@@ -377,6 +379,9 @@ fn the_refusal_names_the_offending_statement() {
     .expect_err("a write to the default graph");
     let text = err.to_string();
     assert!(text.contains("DEFAULT graph"), "{text}");
-    assert!(text.contains("urn:example:x"), "{text}");
+    assert!(
+        !text.contains("urn:example:x") && !text.contains("stray"),
+        "{text}"
+    );
     assert!(text.contains("Nothing was applied"), "{text}");
 }
