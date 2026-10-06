@@ -448,10 +448,16 @@ impl Endpoint for QueryEndpoint {
                     return self.reissue_canonical(inv, set).await;
                 }
                 let target = target.map(|set| set.graphs().to_vec());
-                let bound = match inv.inline_str("bindings") {
-                    Ok(json) => crate::sparql::parse_bindings(json)?,
-                    Err(_) => Vec::new(),
+                // ⚠ Absent and UNREADABLE are different answers (ledger #751): a `bindings`
+                // that is present but not inline UTF-8 is refused, never read as "no
+                // bindings" — which would run the query unfiltered and return every row.
+                let bound = match optional_inline_str(inv, "bindings")? {
+                    Some(json) => crate::sparql::parse_bindings(json)?,
+                    None => Vec::new(),
                 };
+                // Read here, before evaluation, so an unreadable `as` is refused rather
+                // than substituted with the default after the query has already run.
+                let as_type = optional_inline_str(inv, "as")?;
                 let mut prepared = SparqlEvaluator::new().parse_query(query).map_err(|e| {
                     Error::InvalidArgument {
                         name: "query".to_string(),
@@ -523,9 +529,9 @@ impl Endpoint for QueryEndpoint {
                 }
 
                 let (media, bytes) = if self.graph_shaped {
-                    serialize_graph(results, inv.inline_str("as").ok())?
+                    serialize_graph(results, as_type)?
                 } else {
-                    serialize_solutions(results, inv.inline_str("as").ok())?
+                    serialize_solutions(results, as_type)?
                 };
                 Ok(with_freshness(
                     Representation::new(
@@ -1287,7 +1293,7 @@ impl Endpoint for LoadEndpoint {
         match inv.request.verb {
             Verb::Sink => {
                 let bytes = inv.inline_arg("content")?;
-                let media = inv.inline_str("format").unwrap_or(LOAD_FORMATS[0]);
+                let media = optional_inline_str(inv, "format")?.unwrap_or(LOAD_FORMATS[0]);
                 let format =
                     RdfFormat::from_media_type(media).ok_or_else(|| Error::InvalidArgument {
                         name: "format".to_string(),
@@ -1298,7 +1304,9 @@ impl Endpoint for LoadEndpoint {
                     })?;
                 let _writes = self.store.write_lock();
                 let mut parser = RdfParser::from_format(format);
-                if let Ok(graph) = inv.inline_str("graph") {
+                // ⚠ A `graph` that is present but unreadable is refused: read as absent, it
+                // would load the document into the DEFAULT graph (ledger #751).
+                if let Some(graph) = optional_inline_str(inv, "graph")? {
                     let name = NamedNodeRef::new(graph).map_err(|e| Error::InvalidArgument {
                         name: "graph".to_string(),
                         detail: format!("`{graph}` is not an IRI: {e}"),
@@ -1378,6 +1386,46 @@ impl LoadEndpoint {
 
 // ---------------------------------------------------------------------------- shared
 
+/// An OPTIONAL by-value argument, read so that **absent and unreadable stay different
+/// answers**: absent → `Ok(None)`; an inline UTF-8 value → `Ok(Some(text))`; present in any
+/// other form — a reference, a content id, or bytes that are not UTF-8 — → refused, as
+/// [`Error::InvalidArgument`] naming the argument.
+///
+/// ★ **Why this exists (ledger #751).** `Invocation::inline_str` errors both when the
+/// argument is absent and when it is present but not inline UTF-8, so the obvious
+/// `inline_str(name).ok()` for an optional argument turns "unreadable" into "absent". On
+/// this crate that ran a query with its `bindings` silently dropped (every row instead of
+/// the filtered ones), loaded a document into the DEFAULT graph when `graph=` was passed
+/// by reference, and substituted the default for an unreadable `as` — each the opposite of
+/// what the caller asked for, with nothing said. Required arguments do not need it:
+/// `inline_str(name)?` already refuses both cases.
+///
+/// Matched on the request's own argument map rather than on `inline_str`'s error, so the
+/// distinction does not depend on which error variant core happens to use for "absent".
+fn optional_inline_str<'a>(inv: &Invocation<'a>, name: &str) -> Result<Option<&'a str>> {
+    match inv.request.args.get(name) {
+        None => Ok(None),
+        Some(ArgRef::Inline(bytes)) => {
+            std::str::from_utf8(bytes)
+                .map(Some)
+                .map_err(|e| Error::InvalidArgument {
+                    name: name.to_string(),
+                    detail: format!(
+                        "is present but not valid UTF-8 ({e}); it is refused rather than \
+                         treated as absent, because absent means something different here"
+                    ),
+                })
+        }
+        Some(_) => Err(Error::InvalidArgument {
+            name: name.to_string(),
+            detail: "is present but not an inline value (a reference or a content id); this \
+                     argument is read by value only, and is refused rather than treated as \
+                     absent, because absent means something different here"
+                .to_string(),
+        }),
+    }
+}
+
 /// Whether this caller may READ `graph` — its own per-graph grant, or the broad
 /// [`CAP_READ`], which reads every graph anyway.
 ///
@@ -1413,7 +1461,9 @@ fn unsupported(id: &str, verb: Verb) -> Error {
 /// both: a caller who believed the value was bound, and a query that interpolated
 /// nothing.
 fn no_bindings(inv: &Invocation<'_>, iri: &str) -> Result<()> {
-    if inv.inline_str("bindings").is_err() {
+    // PRESENT in any form is refused — a by-reference or non-UTF-8 `bindings` is still a
+    // caller who believes a value was bound (ledger #751).
+    if !inv.request.args.contains_key("bindings") {
         return Ok(());
     }
     Err(Error::InvalidArgument {
