@@ -38,10 +38,24 @@ let one = Kernel::new(Arc::new(space(store.clone())));
 let two = Kernel::new(Arc::new(space(store.clone())));
 ```
 
-⚠ **Each kernel still has its own cache.** A write through `one` cuts `one`'s golden
-threads, not `two`'s, so a second kernel over the same store can serve a stale cached
-read. That is a property of the kernel, not of this crate, and it is the reason to prefer
-one kernel per process where you can.
+⚠ **Each kernel still has its own cache**, and a write through `one` cuts `one`'s golden
+threads, not `two`'s. Until ledger #751 that let `two` serve a stale cached read with no
+bound while `urn:iki:store:info` said `covered: true` through both. Now the store counts
+the spaces bound over it (`DurableStore::spaces_bound`):
+
+- **Two live spaces forfeit coverage for both** — every read is `Expiry::Always` and
+  `info` says `covered: false` through each — exactly the cost of handing out the raw
+  handle. Drop one and caching resumes.
+- **A space bound AFTER another has cached a read refuses every request**, with a
+  sentence saying why. Nothing can evict the first kernel's cached answers, so a write
+  through the late space would leave them stale; refusing keeps the first kernel correct.
+  So **bind every space before the first read** — which a host does at startup anyway.
+- ⚠ One `Arc<EndpointSpace>` handed to two kernels is ONE binding to this crate and two
+  caches to the kernels, so it cannot be seen and is not covered by either rule. Bind a
+  space per kernel.
+
+That is still a property of the kernel and the reason to prefer one kernel per process
+where you can.
 
 ## What it binds
 
@@ -62,8 +76,20 @@ one kernel per process where you can.
 | `urn:iki:store:load` | `Sink` | bulk-load an RDF document | `urn:cap:store:write` |
 
 One IRI per query form, following `ikigai-sparql`: the form fixes the result family, so
-it fixes the declared outputs and the default `as` too — and a query of another form is
-**refused**, not served under an IRI that promised something else.
+it fixes the declared outputs and the default `as` too — and a query of the other
+**family** is **refused**, not served under an IRI that promised something else. SELECT
+and ASK are one family (result sets) and CONSTRUCT and DESCRIBE the other (graphs), so an
+ASK sent to `select` is answered, in a result-set syntax `select` declares; a CONSTRUCT
+sent to `select` is refused. That is deliberate — the promise is the outputs — and the
+docs once claimed more than the code did (ledger #751).
+
+★ **An argument that is present but unreadable is refused, never treated as absent.** A
+`bindings`, `as`, or `load`'s `graph`/`format` passed by reference, by content id, or as
+bytes that are not UTF-8 is an `InvalidArgument` naming it (ledger #751). Read as absent,
+each did the opposite of what was asked: a query ran unfiltered, a document landed in the
+default graph, the default serialization was substituted. `urn:iki:store:load` likewise
+refuses a `format` outside the five it declares, rather than parsing anything oxigraph
+recognizes (N3's formulas would land in blank-node graphs nothing can name).
 
 ⚠ **Which dataset a query reads depends on the door, and neither door is "everything".**
 The broad forms read SPARQL's default dataset: a bare `{ ?s ?p ?o }` sees the store's
@@ -304,7 +330,9 @@ browse graph could read each and never join them — and the join it did write c
 The tenancy model could say "you may read A and you may read B" and could not run the one
 query anyone wants over both.
 
-`graph=` now takes **one IRI or several, separated by whitespace**:
+`graph=` now takes **one IRI or several, separated by ASCII whitespace** (space, tab,
+newline — not commas, and not non-ASCII spaces such as U+3000, both of which an IRI may
+contain):
 
 ```text
 source urn:iki:store:graph-select \

@@ -10,6 +10,7 @@ use std::hash::{Hash, Hasher};
 #[cfg(all(feature = "persistent", not(target_family = "wasm")))]
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ikigai_core::{Error, Result};
@@ -211,6 +212,37 @@ pub struct DurableStore {
     coverage: Coverage,
     /// Serializes every write this crate performs — see [`write_lock`](Self::write_lock).
     writes: Arc<Mutex<()>>,
+    /// How many spaces are bound over this dataset right now, shared by every clone. Each
+    /// space is a kernel's door, and a kernel cannot see another kernel's writes — see
+    /// [`spaces_bound`](Self::spaces_bound).
+    spaces: Arc<AtomicUsize>,
+    /// Whether a bound space has committed a read to some kernel's cache since the count
+    /// above was last zero, shared by every clone — what decides whether a LATER space can
+    /// be bound safely. See [`spaces_bound`](Self::spaces_bound).
+    cached: Arc<AtomicBool>,
+    /// Held only by the copy `crate::space` moves into its endpoints: dropping that space
+    /// drops this, and the count above goes back down.
+    binding: Option<Arc<SpaceBinding>>,
+    /// Set only on the copy a space owns, when that space was bound too late to be safe:
+    /// every request through it is refused. See [`spaces_bound`](Self::spaces_bound).
+    refused: bool,
+}
+
+/// One bound space's place in [`DurableStore::spaces`]. Decrements on drop, so the count
+/// is of LIVE spaces: a kernel that is gone writes nothing — and when the last one goes,
+/// every cache that could have been stale went with it.
+#[derive(Debug)]
+struct SpaceBinding {
+    spaces: Arc<AtomicUsize>,
+    cached: Arc<AtomicBool>,
+}
+
+impl Drop for SpaceBinding {
+    fn drop(&mut self) {
+        if self.spaces.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.cached.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Hand-written because `oxigraph::store::Store` has no `Debug` — and because the two
@@ -232,6 +264,10 @@ impl DurableStore {
             backing: Backing::Memory,
             coverage: Coverage::Owned,
             writes: Arc::new(Mutex::new(())),
+            spaces: Arc::new(AtomicUsize::new(0)),
+            cached: Arc::new(AtomicBool::new(false)),
+            binding: None,
+            refused: false,
         })
     }
 
@@ -280,6 +316,10 @@ impl DurableStore {
             backing: Backing::Durable(path.as_ref().to_path_buf()),
             coverage: Coverage::Owned,
             writes: Arc::new(Mutex::new(())),
+            spaces: Arc::new(AtomicUsize::new(0)),
+            cached: Arc::new(AtomicBool::new(false)),
+            binding: None,
+            refused: false,
         })
     }
 
@@ -358,7 +398,86 @@ impl DurableStore {
     /// is not a mechanism. The deprecation is that warning escalated to something the
     /// compiler says.
     pub fn is_sole_writer(&self) -> bool {
-        matches!(self.coverage, Coverage::Owned)
+        matches!(self.coverage, Coverage::Owned) && self.spaces_bound() <= 1
+    }
+
+    /// How many spaces ([`crate::space`]) are bound over this dataset right now, across
+    /// every clone of this handle.
+    ///
+    /// ★ **More than one forfeits coverage, exactly as handing out the handle does**
+    /// (ledger #751). Each space is some kernel's door, each kernel keeps its own cache, and
+    /// a kernel cuts a golden thread only for a write IT served — so a write through one
+    /// space never invalidates a read another kernel cached, and that kernel would serve the
+    /// stale answer with no bound. So while a second space is bound,
+    /// [`is_sole_writer`](Self::is_sole_writer) is `false`,
+    /// [`read_is_covered`](Self::read_is_covered) is `false` for every read, and
+    /// `urn:iki:store:info` says `covered: false` through every one of them. The count is
+    /// of LIVE spaces: drop the second and caching resumes.
+    ///
+    /// ★ **…and a space bound TOO LATE refuses instead.** Coverage is decided per read, so
+    /// an answer the first kernel cached while it was the only space would stay in its
+    /// cache after a second space is bound — and a write through the newcomer could never
+    /// cut it, because nothing here can reach into a kernel's cache. So if any space over
+    /// this dataset has already cached a read, a new space is bound REFUSING: every request
+    /// through it fails with a sentence saying why, and it is not counted, so the first
+    /// kernel stays covered and correct. The rule is therefore simply **bind every space
+    /// before the first read** (a host builds its kernels at startup, and a test binds both
+    /// before it asks anything); once every space is dropped the slate is clean again.
+    ///
+    /// ⚠ **One space shared by several kernels is the same hazard, and this cannot see
+    /// it.** `Arc<EndpointSpace>` handed to two `Kernel`s is one binding here and two
+    /// caches there. The only shape this crate can vouch for is one space per kernel; a
+    /// host with several kernels over one dataset binds a space for each, up front.
+    pub fn spaces_bound(&self) -> usize {
+        self.spaces.load(Ordering::SeqCst)
+    }
+
+    /// The copy of this handle a space owns.
+    ///
+    /// ⚠ The order of the two atomic steps here and in
+    /// [`commit_to_caching`](Self::commit_to_caching) is the whole argument, Dekker-style
+    /// and `SeqCst` throughout: a bind announces itself (the count) and then looks for a
+    /// cached read; a read announces itself (the flag) and then looks for a second space.
+    /// In every interleaving at least one of them sees the other, so either the read is
+    /// not cached or the bind refuses — never a cached read beside a writer it cannot see.
+    pub(crate) fn bound_into_a_space(mut self) -> Self {
+        let before = self.spaces.fetch_add(1, Ordering::SeqCst);
+        if before >= 1 && self.cached.load(Ordering::SeqCst) {
+            self.spaces.fetch_sub(1, Ordering::SeqCst);
+            self.refused = true;
+            return self;
+        }
+        self.binding = Some(Arc::new(SpaceBinding {
+            spaces: Arc::clone(&self.spaces),
+            cached: Arc::clone(&self.cached),
+        }));
+        self
+    }
+
+    /// Refuse every request through a space bound too late — see
+    /// [`spaces_bound`](Self::spaces_bound).
+    pub(crate) fn serving(&self) -> Result<()> {
+        if !self.refused {
+            return Ok(());
+        }
+        Err(Error::Endpoint(
+            "this space was bound over a dataset that another space had already served a \
+             cached read from, so a write through this one could leave that kernel serving a \
+             stale answer with nothing able to evict it. It refuses every request instead. \
+             Bind every space over one dataset before the first read (or use one space)"
+                .to_string(),
+        ))
+    }
+
+    /// The last word on caching one read whose coverage was `covered`: `true` only if it is
+    /// covered AND no second space is bound — see
+    /// [`bound_into_a_space`](Self::bound_into_a_space) for why it records the read first.
+    pub(crate) fn commit_to_caching(&self, covered: bool) -> bool {
+        if !covered {
+            return false;
+        }
+        self.cached.store(true, Ordering::SeqCst);
+        self.spaces_bound() <= 1
     }
 
     /// The 0.2.0–0.2.4 spelling of [`is_sole_writer`](Self::is_sole_writer).
@@ -404,6 +523,7 @@ impl DurableStore {
     /// | owned | covered | covered |
     /// | shared, undeclared | bare | bare |
     /// | shared, declaring `W` | **bare** | covered iff `G ∉ W` |
+    /// | any, with a second space bound | **bare** | **bare** |
     ///
     /// ★ The `None` column is bare for BOTH shared modes and that is not conservatism
     /// for its own sake: a broad read sees the default graph, the sharer may always
@@ -411,6 +531,11 @@ impl DurableStore {
     /// type can express says otherwise. A host that wants its broad reads cached wants
     /// `open`.
     pub fn read_is_covered(&self, graph: Option<&str>) -> bool {
+        // A second live space is a writer this kernel cannot see, whatever the mode —
+        // see [`spaces_bound`](Self::spaces_bound).
+        if self.spaces_bound() > 1 {
+            return false;
+        }
         match (&self.coverage, graph) {
             (Coverage::Owned, _) => true,
             (Coverage::Shared, _) => false,

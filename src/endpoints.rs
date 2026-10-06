@@ -64,7 +64,15 @@
 //! three it can actually get. The conformance walk found that concretely: with both
 //! families on one endpoint, the RDF face could not be probed at all, because probing it
 //! means asking a SELECT to answer in N-Triples. Each form also **refuses** a query of
-//! the wrong shape rather than serving it under the wrong IRI.
+//! the wrong FAMILY rather than serving it under the wrong IRI.
+//!
+//! ⚠ **The check is on the result family, not the form, and that is intentional.** The
+//! IRI's promise is its declared `outputs` and its default `as`, and those are fixed by the
+//! family: an ASK served by `urn:iki:store:select` comes back in a result-set syntax that
+//! IRI declares, and a DESCRIBE served by `urn:iki:store:construct` in a graph syntax.
+//! What is refused is the crossing — a CONSTRUCT under `select`, a SELECT under
+//! `construct` — which would answer in a syntax the IRI never offered. (Ledger #751 found
+//! the docs claiming more than this; the docs were wrong, not the code.)
 //!
 //! # Why there is a query face here at all
 //!
@@ -284,7 +292,10 @@ const LOAD_FORMATS: [&str; 5] = [
 /// dataset unless the caller took a handle at construction (see
 /// [`DurableStore`]).
 pub fn space(store: DurableStore) -> EndpointSpace {
-    let store = Arc::new(store);
+    // ★ Counted for as long as this space lives, so a SECOND live space over the same
+    // dataset forfeits coverage for both — and one bound after a cached read refuses
+    // (ledger #751; `DurableStore::spaces_bound` has the argument).
+    let store = Arc::new(store.bound_into_a_space());
     let mut space = EndpointSpace::new();
     for (form, id, scoped_id, graph_shaped) in FORMS {
         space = space.bind(
@@ -371,7 +382,7 @@ fn with_freshness(
             .iter()
             .all(|graph| store.read_is_covered(Some(graph.as_str()))),
     };
-    covered_by(rep, covered)
+    covered_by(rep, store, covered)
 }
 
 /// The three threads, or nothing — factored out because `urn:iki:store:graphs` reaches
@@ -379,8 +390,12 @@ fn with_freshness(
 /// [`DurableStore::read_is_covered`] once per graph and is covered only if every answer
 /// was yes. One place still holds which threads a cacheable read depends on, so a fourth
 /// write door cannot be added to one path and forgotten on the other.
-fn covered_by(rep: Representation, covered: bool) -> Representation {
-    if covered {
+///
+/// ⚠ The final say goes through [`DurableStore::commit_to_caching`], which records that
+/// this dataset now has a cached read before re-checking for a second space — the half
+/// of the handshake that lets a late `space()` refuse instead of going stale under it.
+fn covered_by(rep: Representation, store: &DurableStore, covered: bool) -> Representation {
+    if store.commit_to_caching(covered) {
         rep.cacheable()
             .depends_on(UPDATE_THREAD)
             .depends_on(LOAD_THREAD)
@@ -434,6 +449,7 @@ struct QueryEndpoint {
 #[async_trait]
 impl Endpoint for QueryEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.store.serving()?;
         match inv.request.verb {
             Verb::Source => {
                 let query = inv.inline_str("query")?;
@@ -564,16 +580,18 @@ impl Endpoint for QueryEndpoint {
                 .title(format!("SPARQL {form} confined to named graphs"))
                 .summary(format!(
                     "Evaluate a SPARQL {form} against exactly the named graphs given by \
-                     `graph` — one, or several separated by whitespace — under a grant for \
+                     `graph` — one, or several separated by ASCII whitespace — under a grant for \
                      every one of them. The dataset is theirs alone: `graph=\"G1 G2\"` means \
                      `FROM <G1> FROM <G2> FROM NAMED <G1> FROM NAMED <G2>`, so a bare pattern \
                      reads (and joins across) the merge of the graphs, `GRAPH ?g` binds only \
                      them, `GRAPH <other>` matches nothing, and the store's own default graph \
                      is unreachable. Naming a graph the caller holds no grant for is refused \
                      with the missing grant named, never answered over the rest. Covered — \
-                     and so cached — only when every graph named is. A query of another form \
-                     is refused, not served here, and so is one carrying its own `FROM` \
-                     clauses.",
+                     and so cached — only when every graph named is. A query whose answer is \
+                     of the other family (a graph where this form answers with a result set, \
+                     or the reverse) is refused, and so is one carrying its own `FROM` \
+                     clauses; SELECT and ASK share a family, as CONSTRUCT and DESCRIBE do, \
+                     and either of a pair is answered under either IRI.",
                 ))
                 .verb(Verb::Source)
                 .verb(Verb::Meta)
@@ -582,7 +600,8 @@ impl Endpoint for QueryEndpoint {
                     ArgSpec::new("graph")
                         .summary(
                             "The named graphs this query may read: one IRI, or several \
-                             separated by whitespace (not commas — an IRI may contain one). \
+                             separated by ASCII whitespace — space, tab, newline (not commas, and \
+                             not non-ASCII spaces: an IRI may contain either). \
                              Order and repetition do not matter. The caller must hold \
                              `urn:cap:store:read:graph:<IRI>` for EVERY graph named; one \
                              missing grant refuses the whole read.",
@@ -600,7 +619,10 @@ impl Endpoint for QueryEndpoint {
                      SPARQL's default dataset: a bare pattern reads the store's DEFAULT \
                      graph only, and a quad in a named graph is reached through `GRAPH`. \
                      To read every quad write `{{ GRAPH ?g {{ ?s ?p ?o }} }} UNION {{ ?s ?p ?o \
-                     }}`. A query of another form is refused, not served here.",
+                     }}`. A query whose answer is of the other family (a graph where this \
+                     form answers with a result set, or the reverse) is refused; SELECT and \
+                     ASK share a family, as CONSTRUCT and DESCRIBE do, and either of a pair \
+                     is answered under either IRI.",
                 ))
                 .verb(Verb::Source)
                 .verb(Verb::Meta)
@@ -799,6 +821,7 @@ struct InfoEndpoint {
 #[async_trait]
 impl Endpoint for InfoEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.store.serving()?;
         match inv.request.verb {
             Verb::Source => {
                 // ⚠ `Store::len()` is a FULL SCAN, not metadata: measured 2.4 µs empty,
@@ -952,6 +975,7 @@ struct GraphsEndpoint {
 #[async_trait]
 impl Endpoint for GraphsEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.store.serving()?;
         match inv.request.verb {
             Verb::Source => {
                 // ★ The parameterized half of the declared scope, and the whole branch:
@@ -978,7 +1002,7 @@ impl Endpoint for GraphsEndpoint {
                     text.push_str(name);
                     text.push('\n');
                 }
-                Ok(covered_by(plain(text), covered))
+                Ok(covered_by(plain(text), &self.store, covered))
             }
             other => Err(unsupported("store-graphs", other)),
         }
@@ -1074,6 +1098,7 @@ struct UpdateEndpoint {
 #[async_trait]
 impl Endpoint for UpdateEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.store.serving()?;
         match inv.request.verb {
             // `content` by name: the engine routes a pipe's (or a trailing) value into
             // `content` for every Sink, so a mutating verb that can be piped into
@@ -1164,6 +1189,7 @@ struct GraphUpdateEndpoint {
 #[async_trait]
 impl Endpoint for GraphUpdateEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.store.serving()?;
         match inv.request.verb {
             Verb::Sink => {
                 let update = inv.inline_str("content")?;
@@ -1290,15 +1316,22 @@ struct LoadEndpoint {
 #[async_trait]
 impl Endpoint for LoadEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.store.serving()?;
         match inv.request.verb {
             Verb::Sink => {
                 let bytes = inv.inline_arg("content")?;
                 let media = optional_inline_str(inv, "format")?.unwrap_or(LOAD_FORMATS[0]);
-                let format =
-                    RdfFormat::from_media_type(media).ok_or_else(|| Error::InvalidArgument {
+                // ★ The declared `one_of` IS the contract (ledger #751): oxigraph recognizes
+                // more syntaxes than this door declares — N3 among them, whose formulas
+                // land in BLANK-NODE graphs that no grant, no scoped door and
+                // `urn:iki:store:graphs` can ever name. A media type oxigraph maps onto
+                // one of the declared five (a `;charset=` parameter, say) is that format.
+                let format = RdfFormat::from_media_type(media)
+                    .filter(|f| LOAD_FORMATS.contains(&bare_media(f.media_type())))
+                    .ok_or_else(|| Error::InvalidArgument {
                         name: "format".to_string(),
                         detail: format!(
-                            "unknown RDF syntax `{media}` — one of {}",
+                            "`{media}` is not a syntax this door loads — one of {}",
                             LOAD_FORMATS.join(", ")
                         ),
                     })?;
@@ -1356,7 +1389,10 @@ impl Endpoint for LoadEndpoint {
             )
             .input(
                 ArgSpec::new("format")
-                    .summary("The document's syntax.")
+                    .summary(
+                        "The document's syntax; one of the listed media types, and \
+                         anything else is refused.",
+                    )
                     .class(XSD_STRING)
                     .one_of(LOAD_FORMATS)
                     .default_value(LOAD_FORMATS[0])
@@ -1365,8 +1401,10 @@ impl Endpoint for LoadEndpoint {
             .input(
                 ArgSpec::new("graph")
                     .summary(
-                        "Load into this named graph instead of the default graph. \
-                         Ignored by quad syntaxes, which name their own graphs.",
+                        "Load into this named graph instead of the default graph. For a \
+                         quad syntax (N-Quads, TriG) it replaces the DOCUMENT's default \
+                         graph: statements with no graph of their own land here, and \
+                         statements that name a graph keep it.",
                     )
                     .class(XSD_ANY_URI)
                     .optional(),

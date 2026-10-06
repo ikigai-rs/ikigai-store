@@ -29,8 +29,10 @@
 //! ```
 //!
 //! One IRI per query form, following `ikigai-sparql`: the form fixes the result family,
-//! so it fixes the declared outputs and the default `as` too, and a query of another
-//! form is refused rather than served under an IRI that promised something else.
+//! so it fixes the declared outputs and the default `as` too, and a query of the other
+//! family is refused rather than served under an IRI that promised something else. SELECT
+//! and ASK are one family and CONSTRUCT and DESCRIBE the other, so either of a pair is
+//! answered under either IRI — deliberately; it is the crossing that is refused.
 //!
 //! **The namespace is `urn:iki:store:`, born migrated.** The ecosystem is moving 77
 //! namespaces under `urn:iki:` one at a time and a brand-new one is the only kind whose
@@ -59,8 +61,10 @@
 //! obvious way gets [`Error::Unavailable`](ikigai_core::Error::Unavailable) on the
 //! second. `DurableStore` is `Clone` over an `Arc<Store>`: clones share the dataset, the
 //! write lock and the coverage flag. Each kernel still keeps its own cache, though, so a
-//! write through one does not cut the other's golden threads — prefer one kernel per
-//! process where you can.
+//! write through one does not cut the other's golden threads: while two spaces are bound
+//! neither caches, and a space bound after another has cached a read refuses every
+//! request ([`DurableStore::spaces_bound`] has the rule). Bind every space before the
+//! first read, and prefer one kernel per process where you can.
 //!
 //! # Getting a value in without it becoming syntax
 //!
