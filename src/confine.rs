@@ -106,7 +106,13 @@ pub(crate) struct Applied {
 }
 
 /// Parse a SPARQL update, refusing one that does not parse by the argument's name.
+///
+/// ★ The one place an update reaches the parser, so the one place it is bounded first
+/// (ledger #915): [`crate::limits::check_sparql`] refuses text past the byte or nesting
+/// bound. Call it on [`crate::limits::on_sparql_stack`]: the parse and the evaluation that
+/// follows are recursive.
 pub(crate) fn parse(update: &str) -> Result<PreparedSparqlUpdate> {
+    crate::limits::check_sparql(update, "content")?;
     SparqlEvaluator::new()
         .parse_update(update)
         .map_err(|e| Error::InvalidArgument {

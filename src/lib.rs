@@ -76,6 +76,14 @@
 //! lets oxigraph serialize them, because the only correct escaper for a grammar is the
 //! one that owns the grammar.
 //!
+//! # SPARQL text is bounded before it is parsed
+//!
+//! oxigraph's parser and evaluator recurse, and a stack overflow aborts the whole process,
+//! so every door that parses caller text refuses one over [`limits::MAX_SPARQL_BYTES`] or
+//! nested deeper than [`limits::MAX_SPARQL_NESTING`], and parses and evaluates the rest on a
+//! thread whose stack is sized for it. [`limits`] has the measurements and the one subtle
+//! part — a `<` can be an IRI or a less-than, and the scan follows both (ledger #915).
+//!
 //! # A tenancy boundary: scopes narrower than the whole dataset
 //!
 //! [`CAP_WRITE`] is all-or-nothing, so a module layered over this store makes its callers
@@ -216,6 +224,7 @@
 pub mod config;
 pub(crate) mod confine;
 pub mod endpoints;
+pub mod limits;
 pub(crate) mod scope;
 pub mod sparql;
 pub mod store;

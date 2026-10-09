@@ -653,6 +653,61 @@ unknown one is `CorruptionError`, so any quad an `rdf-12` build wrote using such
 cannot be read back by a build without it. For a *persistent* store that makes a sibling
 crate's feature a data-format decision, and dropping that sibling later a downgrade.
 
+## ★ A query that would overflow the stack is refused, or run on one big enough (ledger #915)
+
+oxigraph's SPARQL parser and evaluator are recursive, and a stack overflow is not an error
+a caller gets back: Rust aborts the **whole process**. Through 0.2.6, `SELECT * WHERE {
+FILTER(((…1…))) }` with ~1,000 parentheses — 3 KB — aborted any host that handed it to
+this store, at every door that parses caller text (the eight query IRIs and both update
+IRIs), and a host's anonymous read grant was enough to reach it.
+
+Two layers now stand in front of the parser, at all ten doors:
+
+| bound | value | what it stops |
+| --- | --- | --- |
+| `limits::MAX_SPARQL_BYTES` | 1 MiB | any query or update larger, refused before parsing |
+| `limits::MAX_SPARQL_NESTING` | 64 | brackets `(` `{` `[` `<<`, and runs of `!`, nested deeper — refused before parsing |
+| the SPARQL thread | 16 MiB + 512 bytes per byte of text | everything else that recurses, run on a stack sized for it |
+
+**The bounds refuse, never truncate**: the refusal is an `InvalidArgument` on `query` (or
+`content`) that names the bound. Real queries nest about 5 deep (a scan of ~700 across the
+ecosystem); 64 is an order of magnitude of headroom, and the largest legitimate queries —
+`VALUES` lists, `INSERT DATA` — are flat and do not recurse at all, which is why the byte
+bound can be generous.
+
+**Why a thread as well.** Nesting is not the only recursion. On a 2 MiB thread (a tokio
+worker's), a release build overflows on 1,879 triple patterns, 2,087 `FILTER`s or a 2,086-way
+`||` — shapes a generated query can really have, so nothing lexical may refuse them. The
+parse, the evaluation and the serialization therefore run on a thread whose stack is
+reserved in proportion to the text (an ordinary query's thread is ~16 MiB of address space,
+touched only as deep as it recurses), sized from the worst cost per byte measured (~370
+bytes of stack per byte, a property path).
+
+**The scan follows every reading.** Counting brackets while skipping strings, IRIs and
+comments is wrong in a way an attacker can use: in an expression, `?a<'> ) '` is a
+less-than followed by a string, and a scan that skipped `<'>` as an IRI never sees the
+string open. So at each `<` where a less-than is grammatically possible, the scan follows
+both readings and refuses on the deeper (`src/limits.rs` has the argument).
+
+⚠ What this does **not** do, plainly:
+
+- **It is a release-build guarantee for the thread.** A debug build spends ~20–50× the stack
+  per level, so a long enough operator chain can still overflow a debug host. The nesting
+  bound holds in both.
+- **On wasm there are no threads**, so only the two bounds apply.
+- **It does not bound time.** The evaluator is quadratic in an operator chain: 40,000 `||1`
+  terms (120 KB) take ~30 s of a core, 80,000 more than two minutes. A host exposed to
+  untrusted queries needs its own budget.
+- **The bounds are constants, not configuration.** They protect the process, not a policy,
+  so a per-host knob would only be a way to turn the protection off; a host that needs a
+  tighter limit can refuse earlier at its own door with `ikigai_store::limits::check_sparql`,
+  which is public for that, and must parse on `limits::on_sparql_stack` if it parses
+  SPARQL itself.
+
+`tests/sparql_nesting.rs` reproduces the abort in a child process on a 2 MiB thread at all
+ten doors (it fails, with the child killed by `SIGABRT`, against 0.2.6);
+`tests/sparql_stack_measure.rs` re-measures every number above when oxigraph moves.
+
 ## Configuration
 
 `~/.config/ikigai/store.toml` (or `$XDG_CONFIG_HOME/ikigai/store.toml`), layered the way

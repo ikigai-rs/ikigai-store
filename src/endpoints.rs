@@ -464,6 +464,9 @@ impl Endpoint for QueryEndpoint {
                     return self.reissue_canonical(inv, set).await;
                 }
                 let target = target.map(|set| set.graphs().to_vec());
+                // ★ Bounded before the parser sees a byte (ledger #915): a stack overflow
+                // in the recursive parser or evaluator aborts the whole host.
+                crate::limits::check_sparql(query, "query")?;
                 // ⚠ Absent and UNREADABLE are different answers (ledger #751): a `bindings`
                 // that is present but not inline UTF-8 is refused, never read as "no
                 // bindings" — which would run the query unfiltered and return every row.
@@ -474,81 +477,88 @@ impl Endpoint for QueryEndpoint {
                 // Read here, before evaluation, so an unreadable `as` is refused rather
                 // than substituted with the default after the query has already run.
                 let as_type = optional_inline_str(inv, "as")?;
-                let mut prepared = SparqlEvaluator::new().parse_query(query).map_err(|e| {
-                    Error::InvalidArgument {
-                        name: "query".to_string(),
-                        detail: format!("not a SPARQL query: {e}"),
+                // ★ Parse, evaluate and serialize on a stack sized for the query: brackets
+                // are bounded above, but a long `FILTER` list or `||` chain recurses in the
+                // evaluator too, and does so legitimately. `src/limits.rs` has the numbers.
+                let (media, bytes) = crate::limits::on_sparql_stack(query, || {
+                    let mut prepared = SparqlEvaluator::new().parse_query(query).map_err(|e| {
+                        Error::InvalidArgument {
+                            name: "query".to_string(),
+                            detail: format!("not a SPARQL query: {e}"),
+                        }
+                    })?;
+                    if let Some(target) = &target {
+                        // ⚠ `FROM` / `FROM NAMED` is a SECOND way to name a dataset. It could
+                        // not widen the scope — `confine` overwrites the specification the
+                        // parser built from it — but answering `FROM <other>` with this
+                        // graph's rows would label one tenant's data with another's graph
+                        // name, so it is refused rather than silently overridden.
+                        if crate::scope::names_its_own_dataset(&prepared) {
+                            let from: String = target
+                                .iter()
+                                .map(|g| format!("FROM <{}> ", g.as_str()))
+                                .collect();
+                            let named: Vec<String> = target
+                                .iter()
+                                .map(|g| format!("FROM NAMED <{}>", g.as_str()))
+                                .collect();
+                            return Err(Error::InvalidArgument {
+                                name: "query".to_string(),
+                                detail: format!(
+                                    "this query carries its own `FROM` / `FROM NAMED` clauses, \
+                                     and `urn:iki:store:graph-{}` already fixes the dataset: \
+                                     `graph=` IS the dataset, exactly `{from}{}`. The clauses are \
+                                     refused rather than overridden, because answering a `FROM` \
+                                     naming another graph with this graph's rows would be a wrong \
+                                     answer that looked right. Drop them, and name every graph \
+                                     you mean in `graph=`",
+                                    self.form,
+                                    named.join(" "),
+                                ),
+                            });
+                        }
+                        crate::scope::confine(&mut prepared, target);
                     }
-                })?;
-                if let Some(target) = &target {
-                    // ⚠ `FROM` / `FROM NAMED` is a SECOND way to name a dataset. It could
-                    // not widen the scope — `confine` overwrites the specification the
-                    // parser built from it — but answering `FROM <other>` with this
-                    // graph's rows would label one tenant's data with another's graph
-                    // name, so it is refused rather than silently overridden.
-                    if crate::scope::names_its_own_dataset(&prepared) {
-                        let from: String = target
-                            .iter()
-                            .map(|g| format!("FROM <{}> ", g.as_str()))
-                            .collect();
-                        let named: Vec<String> = target
-                            .iter()
-                            .map(|g| format!("FROM NAMED <{}>", g.as_str()))
-                            .collect();
+                    for (name, term) in bound.iter().cloned() {
+                        // `Variable::new` cannot fail here: `parse_bindings` already held the
+                        // name to the same character set, and named the offending key when it
+                        // did — which the evaluator's own error does not.
+                        let variable =
+                            Variable::new(&name).map_err(|e| Error::InvalidArgument {
+                                name: "bindings".to_string(),
+                                detail: format!("`{name}` is not a variable name: {e}"),
+                            })?;
+                        prepared = prepared.substitute_variable(variable, term);
+                    }
+                    let results = prepared
+                        .on_store(self.store.dataset())
+                        .execute()
+                        .map_err(|e| self.query_error(e, &bound))?;
+
+                    // ★ Refuse a query of the wrong shape rather than serving it here. The
+                    // IRI is a promise about what comes back — it is what fixes this
+                    // action's declared `outputs` — and answering a CONSTRUCT under
+                    // `urn:iki:store:select` would make that promise true only by accident.
+                    let is_graph = matches!(results, QueryResults::Graph(_));
+                    if is_graph != self.graph_shaped {
                         return Err(Error::InvalidArgument {
                             name: "query".to_string(),
                             detail: format!(
-                                "this query carries its own `FROM` / `FROM NAMED` clauses, and \
-                                 `urn:iki:store:graph-{}` already fixes the dataset: `graph=` IS \
-                                 the dataset, exactly `{from}{}`. The clauses are refused rather \
-                                 than overridden, because answering a `FROM` naming another graph \
-                                 with this graph's rows would be a wrong answer that looked right. \
-                                 Drop them, and name every graph you mean in `graph=`",
-                                self.form,
-                                named.join(" "),
+                                "this is `{}`, which answers with {}; that query answers with \
+                                 {}. Resolve the IRI for its form instead",
+                                self.iri(),
+                                shape(self.graph_shaped),
+                                shape(is_graph)
                             ),
                         });
                     }
-                    crate::scope::confine(&mut prepared, target);
-                }
-                for (name, term) in bound.iter().cloned() {
-                    // `Variable::new` cannot fail here: `parse_bindings` already held the
-                    // name to the same character set, and named the offending key when it
-                    // did — which the evaluator's own error does not.
-                    let variable = Variable::new(&name).map_err(|e| Error::InvalidArgument {
-                        name: "bindings".to_string(),
-                        detail: format!("`{name}` is not a variable name: {e}"),
-                    })?;
-                    prepared = prepared.substitute_variable(variable, term);
-                }
-                let results = prepared
-                    .on_store(self.store.dataset())
-                    .execute()
-                    .map_err(|e| self.query_error(e, &bound))?;
 
-                // ★ Refuse a query of the wrong shape rather than serving it here. The
-                // IRI is a promise about what comes back — it is what fixes this
-                // action's declared `outputs` — and answering a CONSTRUCT under
-                // `urn:iki:store:select` would make that promise true only by accident.
-                let is_graph = matches!(results, QueryResults::Graph(_));
-                if is_graph != self.graph_shaped {
-                    return Err(Error::InvalidArgument {
-                        name: "query".to_string(),
-                        detail: format!(
-                            "this is `{}`, which answers with {}; that query answers with {}. \
-                             Resolve the IRI for its form instead",
-                            self.iri(),
-                            shape(self.graph_shaped),
-                            shape(is_graph)
-                        ),
-                    });
-                }
-
-                let (media, bytes) = if self.graph_shaped {
-                    serialize_graph(results, as_type)?
-                } else {
-                    serialize_solutions(results, as_type)?
-                };
+                    if self.graph_shaped {
+                        serialize_graph(results, as_type)
+                    } else {
+                        serialize_solutions(results, as_type)
+                    }
+                })?;
                 Ok(with_freshness(
                     Representation::new(
                         ReprType::new(&media).with_param("charset", "utf-8"),
@@ -1109,24 +1119,28 @@ impl Endpoint for UpdateEndpoint {
                 // ★ The same read rule as the scoped door (ledger #751): a `WHERE` reads
                 // the dataset, and here it can read ALL of it, so it needs the broad read
                 // grant. Decided on the text, before evaluation.
-                let prepared = crate::confine::parse(update)?;
                 let may_read = inv.capability.allows(CAP_READ);
-                if crate::confine::reads_the_dataset(&prepared) && !may_read {
-                    return Err(Error::Denied(format!(
-                        "this update has a `WHERE` clause, which reads the dataset, and reading \
-                         it through `urn:iki:store:update` needs `{CAP_READ}` as well as \
-                         `{CAP_WRITE}`; this capability does not hold it. Nothing was evaluated. \
-                         The write grant alone covers updates that read nothing: `INSERT DATA`, \
-                         `DELETE DATA`, `CLEAR`, `DROP`, `CREATE`, `LOAD`"
-                    )));
-                }
-                let _writes = self.store.write_lock();
-                let before = self.len()?;
-                prepared
-                    .on_store(self.store.dataset())
-                    .execute()
-                    .map_err(|e| Error::Endpoint(format!("update: {e}")))?;
-                let after = self.len()?;
+                // ★ Parsed and evaluated on a stack sized for the update (ledger #915);
+                // `confine::parse` refuses one past the bounds first. See `src/limits.rs`.
+                let (before, after) = crate::limits::on_sparql_stack(update, || {
+                    let prepared = crate::confine::parse(update)?;
+                    if crate::confine::reads_the_dataset(&prepared) && !may_read {
+                        return Err(Error::Denied(format!(
+                            "this update has a `WHERE` clause, which reads the dataset, and \
+                             reading it through `urn:iki:store:update` needs `{CAP_READ}` as well \
+                             as `{CAP_WRITE}`; this capability does not hold it. Nothing was \
+                             evaluated. The write grant alone covers updates that read nothing: \
+                             `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP`, `CREATE`, `LOAD`"
+                        )));
+                    }
+                    let _writes = self.store.write_lock();
+                    let before = self.len()?;
+                    prepared
+                        .on_store(self.store.dataset())
+                        .execute()
+                        .map_err(|e| Error::Endpoint(format!("update: {e}")))?;
+                    Ok((before, self.len()?))
+                })?;
                 // The counts are a read of the dataset, so only for a caller that may read.
                 Ok(plain(if may_read {
                     format!("updated: {before} -> {after} quads\n")
@@ -1226,22 +1240,25 @@ impl Endpoint for GraphUpdateEndpoint {
                 // needs the read grant too — decided here, on the update's text and the
                 // caller's grants, before anything is evaluated, so whether it is refused
                 // says nothing about what `G` holds. `src/confine.rs` has the argument.
-                let prepared = crate::confine::parse(update)?;
                 let may_read = may_read_graph(inv, &target);
-                if crate::confine::reads_the_dataset(&prepared) && !may_read {
-                    return Err(Error::Denied(format!(
-                        "this update has a `WHERE` clause, which reads graph <{}>, and reading it \
-                         needs the grant `{}` (or `{CAP_READ}`), which this capability does not \
-                         hold. Nothing was evaluated. A write grant alone covers updates that \
-                         read nothing: `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP`, `CREATE`",
-                        target.as_str(),
-                        cap_read_graph(target.as_str()),
-                    )));
-                }
-
-                let _writes = self.store.write_lock();
-                let applied =
-                    crate::confine::scoped_update(self.store.dataset(), &target, prepared)?;
+                // ★ Parsed and evaluated on a stack sized for the update (ledger #915);
+                // `confine::parse` refuses one past the bounds first. See `src/limits.rs`.
+                let applied = crate::limits::on_sparql_stack(update, || {
+                    let prepared = crate::confine::parse(update)?;
+                    if crate::confine::reads_the_dataset(&prepared) && !may_read {
+                        return Err(Error::Denied(format!(
+                            "this update has a `WHERE` clause, which reads graph <{}>, and \
+                             reading it needs the grant `{}` (or `{CAP_READ}`), which this \
+                             capability does not hold. Nothing was evaluated. A write grant \
+                             alone covers updates that read nothing: `INSERT DATA`, \
+                             `DELETE DATA`, `CLEAR`, `DROP`, `CREATE`",
+                            target.as_str(),
+                            cap_read_graph(target.as_str()),
+                        )));
+                    }
+                    let _writes = self.store.write_lock();
+                    crate::confine::scoped_update(self.store.dataset(), &target, prepared)
+                })?;
                 // ⚠ The counts only for a caller that may read `G`: `+0` after an
                 // `INSERT DATA` says the quad was already there, which is a read.
                 Ok(plain(if may_read {
