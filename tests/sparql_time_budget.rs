@@ -227,11 +227,15 @@ fn a_budget_grant_raises_the_budget_and_root_gets_the_ceiling() {
 
 /// The planner shapes ledger #964 measured — a 3 KB property path (19 s of planning), a
 /// 120 KB `||` chain (30 s), 250 triple patterns (13 s) — are refused BEFORE planning, by
-/// name, in well under a second: oxigraph's planner never looks at the token, so a deadline
-/// alone could not have stopped them.
+/// name: oxigraph's planner never looks at the token, so a deadline alone could not have
+/// stopped them.
+///
+/// ⚠ The budget here is generous on purpose. PARSING counts against the budget (it runs on
+/// the budgeted thread), and parsing the 120 KB chain in a debug build on a CI runner took
+/// longer than 300 ms — so with a small budget this test measured the runner, not the bound.
 #[test]
 fn the_shapes_oxigraph_plans_too_slowly_are_refused_before_planning() {
-    let (store, kernel) = store(TimeBudget::new(ms(300)));
+    let (store, kernel) = store(TimeBudget::new(Duration::from_secs(60)));
     let bgp: String = (0..250).map(|i| format!("?s <urn:p> ?o{i} . ")).collect();
     for (query, bound) in [
         (path(1000), "MAX_JOIN_OPERANDS"),
@@ -249,7 +253,12 @@ fn the_shapes_oxigraph_plans_too_slowly_are_refused_before_planning() {
             }
             other => panic!("expected {bound} to refuse, got {other:?}"),
         }
-        assert!(start.elapsed() < ms(300), "{:?}", start.elapsed());
+        // Refused before planning: nowhere near the minutes these shapes plan for.
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
     }
     assert_eq!(store.overdue_evaluations(), 0);
     // The update doors measure their WHERE the same way.
@@ -342,10 +351,11 @@ fn an_update_that_runs_out_of_time_writes_nothing_then_or_later() {
     settles(&store, Duration::from_secs(120));
     assert_eq!(quads(&kernel), before, "a timed-out update wrote");
     // The same update with time to run does write, so the assertion above is not vacuous.
+    // Root gets the ceiling: on a loaded CI runner a debug build can spend 100 ms on it.
     let small = "INSERT { ?s <urn:copied> ?o } WHERE { ?s <urn:p> ?o }";
     issue(
         &kernel,
-        &reader(),
+        &Capability::root(),
         Verb::Sink,
         "urn:iki:store:update",
         &[("content", small)],
