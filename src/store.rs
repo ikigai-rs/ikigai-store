@@ -629,7 +629,7 @@ impl DurableStore {
 
     /// Set how long this store's SPARQL evaluations may run (builder). Every clone made
     /// AFTER this carries it, so call it before [`space`](crate::space) — which a host does
-    /// at startup anyway. The default is [`TimeBudget::default`]: 10 s for every caller,
+    /// at startup anyway. The default is [`TimeBudget::default`]: 5 s for every caller,
     /// 120 s for root and as the most a `urn:cap:store:budget:<ms>` grant can lift a caller
     /// to. [`crate::budget`] has the whole story, including what it cannot stop.
     ///
@@ -664,16 +664,27 @@ impl DurableStore {
         self.overdue.load(Ordering::SeqCst)
     }
 
-    /// Run one evaluation of `text` for a caller holding `capability`, within the budget
-    /// that capability gets. See [`crate::budget::run`].
-    pub(crate) fn evaluate<T, F>(&self, text: &str, capability: &Capability, work: F) -> Result<T>
+    /// Run one evaluation of `text` (an update when `write`) for a caller holding
+    /// `capability`, within the budget that capability gets — or the request's own `budget=`
+    /// milliseconds (`requested`) when that is smaller. See [`crate::budget::run`].
+    pub(crate) fn evaluate<T, F>(
+        &self,
+        text: &str,
+        write: bool,
+        capability: &Capability,
+        requested: Option<&str>,
+        work: F,
+    ) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&Deadline) -> Result<T> + Send + 'static,
     {
+        let budget =
+            crate::budget::effective_budget(requested, self.budget.for_capability(capability))?;
         crate::budget::run(
             text,
-            self.budget.for_capability(capability),
+            write,
+            budget,
             &self.overdue,
             self.budget.max_overdue(),
             work,

@@ -15,74 +15,81 @@
 //! | a cross product of 6 patterns `?s0 ?p0 ?o0 . …` over 120 quads | 118 B | > 30 s, killed |
 //!
 //! — all inside [`crate::limits`]' byte and nesting bounds, and all reachable by any caller
-//! that may read. So every door that evaluates caller SPARQL runs it through `budget::run`, which
-//! gives it a deadline.
+//! that may read. Three layers now stand between a caller and that, at every door that
+//! evaluates caller SPARQL (the eight query IRIs and both update IRIs).
 //!
-//! # What the budget does, exactly
+//! # 1. The algebra is bounded before oxigraph plans it
 //!
-//! 1. **The caller is answered at the budget, never later.** The evaluation runs on its own
-//!    thread (the one [`crate::limits::on_sparql_stack`] would size), and the caller waits
-//!    for it at most the budget. Past that it gets a typed [`Error::Timeout`] naming the
-//!    budget — never a partial answer: a bound refuses, it does not truncate.
-//! 2. **The evaluation is told to stop**, through oxigraph's
-//!    [`CancellationToken`], and this crate's own
-//!    serializers check the same token on every row, so a query whose cost is in a huge
-//!    result stops between rows.
-//! 3. **An update that ran out of time writes nothing.** Its commit happens under the same
-//!    lock the caller takes to give up (`Deadline::settle`), so either the caller is told
-//!    it succeeded, or it is told it timed out and the transaction is dropped uncommitted. A
-//!    write never lands after its caller was told it did not.
+//! **oxigraph checks its cancellation token only where the evaluator touches the dataset**
+//! (a quad-pattern scan, a named-graph scan, internalizing a term). Its PLANNER touches none:
+//! `sparopt`'s greedy join reordering is about cubic in the operands of one join, and an
+//! `OPTIONAL` chain or a long `‖` is quadratic. Measured, a 1,000-step path whose token
+//! fired at 1 s returned "cancelled" 18 s later, and a 40,000-term `‖` chain finished 29 s
+//! after it. So the parsed query is measured first — [`MAX_JOIN_OPERANDS`] in any one join,
+//! [`MAX_ALGEBRA_NODES`] in the whole query or update — and refused past either with a typed
+//! `InvalidArgument` naming the bound, like the stack bounds. Inside both, the worst plan
+//! measured is ~125 ms. ([`check_query`], [`check_update`]; the walk and the constants are
+//! kept identical to `ikigai-sparql`'s, from which they come.)
 //!
-//! # ⚠ What it does NOT do: oxigraph does not always stop
+//! # 2. A deadline, and the caller is answered at it
 //!
-//! **The token is cooperative, and oxigraph checks it only when it reads a quad from the
-//! dataset.** Measured, same build: a cross product of 4 patterns stopped 43 ms after the
-//! token fired. But the expensive part of most of the shapes above never reads a quad —
-//! `sparopt`'s optimizer and the plan builder (the `‖` chain, the path, the long BGP: the
-//! time is spent inside `execute()`, before evaluation starts) and the join loops over
-//! already-materialized solutions (the cross product) — so there the token is not seen until
-//! that phase ends: the 1,000-step path returned "cancelled" 18 s after the token fired, the
-//! 40,000-term chain finished 29 s after it, and the 6-way cross product was still running
-//! when it was killed at 30 s. **There is no way to stop a Rust thread from outside it**, so
-//! for those shapes the core stays busy until oxigraph's phase ends, however long that is.
+//! - **The caller waits at most the budget.** The evaluation runs on its own thread (sized as
+//!   [`crate::limits::on_sparql_stack`] sizes one); past the budget the caller gets a typed
+//!   [`Error::Timeout`] naming it — never a partial answer: a bound refuses, it does not
+//!   truncate.
+//! - **The evaluation is told to stop** through oxigraph's [`CancellationToken`], and this
+//!   crate's serializers check the same token on every row, so a query whose cost is in its
+//!   rows stops between two of them.
+//! - **An update that ran out of time writes nothing**, then or later. Its commit happens
+//!   under the same lock the caller takes to give up (`Deadline::settle`), so either the
+//!   caller is told it succeeded, or it is told it timed out and the transaction is dropped
+//!   uncommitted. A write never lands after its caller was told it did not.
 //!
-//! What this crate does about the part it cannot stop:
+//! # 3. What still cannot be stopped is counted and capped
 //!
-//! - **The caller is still answered at the budget** (1. above), so an async executor thread
-//!   is no longer held for the life of the evaluation, and the caller learns what happened.
-//! - **It counts them.** An evaluation still running after its caller gave up is OVERDUE;
-//!   [`DurableStore::overdue_evaluations`](crate::DurableStore::overdue_evaluations) says
-//!   how many there are right now.
-//! - **It caps them.** While [`TimeBudget::max_overdue`] evaluations are overdue, every new
+//! Inside the algebra bounds, oxigraph's operators that consume their whole input before
+//! yielding — an aggregate, `ORDER BY`, the build side of a join, and its cross-product and
+//! hash-join loops over rows already in memory — do not check the token either: a 4-way
+//! cross product under `COUNT(*)` ran seconds past its cancellation, and a 6-way one was still
+//! running when killed at 30 s. **There is no way to stop a Rust thread from outside it.** So:
+//!
+//! - **The caller is still answered at the budget**, and an async executor thread is not held
+//!   for the life of the evaluation.
+//! - **It is counted.** An evaluation still running after its caller gave up is OVERDUE;
+//!   [`DurableStore::overdue_evaluations`](crate::DurableStore::overdue_evaluations) says how
+//!   many there are right now.
+//! - **It is capped.** While [`TimeBudget::max_overdue`] evaluations are overdue, every new
 //!   evaluation is refused at once with a transient [`Error::Unavailable`] saying why. That
-//!   bounds how many cores one store's callers can pin to that number, at the price of
-//!   refusing SPARQL (and only SPARQL) until one finishes. Without it, each request pins one
-//!   more core and the host as a whole is what stops answering.
+//!   bounds how many cores one store's callers can pin, at the price of refusing SPARQL (and
+//!   only SPARQL) until one finishes.
 //!
-//! The real fix is upstream: `spareval` checking its token in the optimizer, the plan
-//! builder, path evaluation and the join loops. Until then this is a bound on how long a
-//! CALLER waits and on how many cores runaway work may hold, not on how long one runs.
+//! The real fix for this layer is upstream: `spareval` checking its token in those loops.
 //!
-//! # Who sets the budget: the host, per door, through the capability
+//! # Who sets the budget
 //!
-//! A store has a [`TimeBudget`] (set with
-//! [`DurableStore::with_time_budget`](crate::DurableStore::with_time_budget)): a **base**
-//! every caller gets, and a **ceiling**. A capability holding
-//! `urn:cap:store:budget:<milliseconds>` ([`cap_budget`]) gets the largest such grant, up
-//! to the ceiling; **root** gets the ceiling.
+//! **The host, and a caller can only tighten it.** A store has a [`TimeBudget`] (set with
+//! [`DurableStore::with_time_budget`](crate::DurableStore::with_time_budget)):
 //!
-//! Why the capability and not an argument or a per-space option: the capability is the one
-//! thing a host already stamps per door that a caller cannot forge — and it follows a
-//! request down its sub-requests, attenuated, so a handler running a store query on its
-//! caller's behalf runs it on its caller's budget. A per-space option could not tell two
-//! doors on one kernel apart, and two spaces over one store forfeit caching (see
-//! [`DurableStore::spaces_bound`](crate::DurableStore::spaces_bound)).
+//! - a **base** every caller gets;
+//! - a capability holding `urn:cap:store:budget:<milliseconds>` ([`cap_budget`]) gets the
+//!   largest such grant instead, never above the **ceiling**; **root** gets the ceiling;
+//! - and any request may carry `budget=<milliseconds>`, which can only LOWER what its
+//!   capability gets ([`effective_budget`], the same rule and wording as `ikigai-sparql`'s).
+//!
+//! Why the capability: it is the one thing a host already stamps per door that a caller
+//! cannot forge, and it follows a request down its sub-requests, attenuated, so a handler
+//! running a store query on its caller's behalf runs it on its caller's budget. A per-space
+//! option (`ikigai-sparql`'s `space_with_budget`) cannot tell two doors on ONE kernel apart,
+//! and two spaces over one store forfeit caching (see
+//! [`DurableStore::spaces_bound`](crate::DurableStore::spaces_bound)) — which is why this
+//! crate's answer differs from that one's in where the ceiling comes from.
 //!
 //! ★ **It is monotone in grants, so a caller cannot raise its own budget.** Attenuating a
 //! capability can only REMOVE grants, and removing a budget grant can only lower the budget
-//! towards the base. That is why the grants raise and nothing lowers: a "you get less"
-//! grant would be one a caller could drop. So an anonymous door gets a small budget by the
-//! host setting a small BASE and giving its trusted doors a grant (or root).
+//! towards the base; `budget=` takes the smaller. That is why the grants raise and nothing in
+//! the capability lowers: a "you get less" grant would be one a caller could drop. So an
+//! anonymous door gets a small budget by the host setting a small BASE and giving its trusted
+//! doors a grant (or root) — or by the door stamping `budget=`, overwriting the caller's.
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
@@ -90,23 +97,30 @@ use std::time::Duration;
 
 use ikigai_core::{Capability, Error, Result};
 use oxigraph::sparql::CancellationToken;
+use spargebra::algebra::{
+    AggregateExpression, Expression, GraphPattern, OrderExpression, PropertyPathExpression,
+};
+use spargebra::{GraphUpdateOperation, Query, Update};
 
-/// The budget every caller gets unless the host says otherwise: **10 seconds**.
+/// The budget every caller gets unless the host says otherwise: **5 seconds**, the same as
+/// `ikigai-sparql`'s.
 ///
-/// The evidence, measured 2026-10-09 (release build, in-memory store) over a copy of gonk's
-/// live dataset — 361,607 quads, the heaviest store in the ecosystem: its BACKUP query (every
-/// quad in every graph, `ORDER BY ?g ?s ?p ?o`, serialized to 121 MB of JSON) takes 0.44 s;
-/// a whole-graph read of the 348,232-quad browse graph 0.30 s; the ledger's own bulk reads
-/// (a 43 KB `VALUES` of all 902 items) 11–21 ms. The slowest legitimate query is therefore
-/// about 20 times inside this, which leaves room for a RocksDB backing, a slower machine and
-/// a dataset several times larger — while the attack shapes in the module docs run for
-/// minutes. A host whose real queries are slower raises it; one serving anonymous callers
-/// lowers it for them (see the module docs).
-pub const DEFAULT_BUDGET: Duration = Duration::from_secs(10);
+/// The evidence, measured 2026-10-09 (release build) over a copy of gonk's live dataset —
+/// 361,607 quads, the largest store in the ecosystem — on the RocksDB backing gonk runs: the
+/// ledger's bulk reads (a 43 KB `VALUES` of all 902 items) take 44–232 ms, and reading the
+/// whole 348,232-quad browse graph 1.4 s. Every query a caller-facing door issues is inside
+/// that, so 5 s is 3.5 times the heaviest and over 20 times the ledger's, and ends an attack
+/// in seconds instead of minutes.
+///
+/// ⚠ **Whole-dataset owner work is NOT inside it, and is not meant to be.** gonk's BACKUP
+/// query — every quad, `ORDER BY ?g ?s ?p ?o`, 121 MB of JSON — takes **24.6 s** on that
+/// RocksDB copy (0.44 s in memory). It runs under a scoped job capability, so it gets the
+/// base unless the host grants more: a host running such a job grants it
+/// [`cap_budget`] (or runs it as root, which gets the [`DEFAULT_CEILING`]).
+pub const DEFAULT_BUDGET: Duration = Duration::from_secs(5);
 
 /// The most any caller may get, and what root gets, unless the host says otherwise:
-/// **120 seconds** — twelve times the base, for an owner's whole-dataset work as the
-/// dataset grows.
+/// **120 seconds** — about five times gonk's whole-dataset backup on RocksDB today.
 pub const DEFAULT_CEILING: Duration = Duration::from_secs(120);
 
 /// The family of budget grants: `urn:cap:store:budget:<milliseconds>`. Not a requirement of
@@ -121,6 +135,65 @@ pub const CAP_BUDGET: &str = "urn:cap:store:budget:*";
 /// ```
 pub fn cap_budget(millis: u64) -> String {
     format!("{}{millis}", CAP_BUDGET.trim_end_matches('*'))
+}
+
+/// The most operands one join may have after the planner flattens it: **32** — the same
+/// number, walk and reasoning as `ikigai-sparql`'s.
+///
+/// A join's operands are its triple patterns (a sequence path `:a/:b/:c` is parsed into one
+/// triple pattern per step) and every nested group, sub-`SELECT` and path pattern joined beside
+/// them; an `OPTIONAL`, `UNION` or `MINUS` side is a join of its own. oxigraph's greedy join
+/// reordering is about cubic in this number: measured (by the `ikigai-sparql` arc), 32
+/// patterns plan in ~4 ms, 64 in ~70 ms, 100 in ~350 ms, 200 in 7 s, and 1,000 path steps in
+/// 19 s. The largest join the ecosystem runs has 11 patterns (survey, 2026-10-09). 32 rather
+/// than 64 because joins multiply under [`MAX_ALGEBRA_NODES`]: sixteen 63-pattern UNION
+/// branches planned in 0.78 s, thirty-two 31-pattern ones in 0.1 s.
+pub const MAX_JOIN_OPERANDS: usize = 32;
+
+/// The most algebra nodes a query or update may have: **1024** — as `ikigai-sparql`'s.
+///
+/// A node is a triple pattern, a path operator, a graph-pattern operator (`OPTIONAL`, `UNION`,
+/// `FILTER`, `BIND`, a group, …) or an expression operator (`||`, `=`, a function call, …).
+/// Variables, IRIs and literals cost nothing, and neither do `VALUES` rows, `IN (…)` members
+/// that are constants, `INSERT DATA`/`DELETE DATA` quads or template triples: those are flat
+/// and cost the planner nothing measurable. What this bounds is the shapes the planner is
+/// quadratic in: at 4,096 of each, an `OPTIONAL` chain planned in 5 s, an `?o = <x> || …`
+/// chain in 3 s, a `BIND` list in 0.5 s. Inside both bounds the worst measured plan is
+/// ~125 ms. The largest query the ecosystem runs has about 60 (the work ledger's listing).
+pub const MAX_ALGEBRA_NODES: usize = 1024;
+
+/// The budget that applies to one request: what its capability gets (`ceiling` here), or
+/// the request's own `budget=` milliseconds when that is SMALLER. A request cannot raise its
+/// budget above what its capability gets; a budget that is not a positive whole number of
+/// milliseconds is refused, naming the argument. Identical to `ikigai-sparql`'s.
+///
+/// ```
+/// use ikigai_store::budget::effective_budget;
+/// use std::time::Duration;
+///
+/// let ceiling = Duration::from_secs(10);
+/// assert_eq!(effective_budget(None, ceiling).unwrap(), ceiling);
+/// assert_eq!(effective_budget(Some("250"), ceiling).unwrap(), Duration::from_millis(250));
+/// // Asking for more than the ceiling gets the ceiling.
+/// assert_eq!(effective_budget(Some("3600000"), ceiling).unwrap(), ceiling);
+/// assert!(effective_budget(Some("0"), ceiling).is_err());
+/// assert!(effective_budget(Some("1s"), ceiling).is_err());
+/// ```
+pub fn effective_budget(requested: Option<&str>, ceiling: Duration) -> Result<Duration> {
+    let Some(text) = requested else {
+        return Ok(ceiling);
+    };
+    match text.trim().parse::<u64>() {
+        Ok(ms) if ms > 0 => Ok(ceiling.min(Duration::from_millis(ms))),
+        _ => Err(Error::InvalidArgument {
+            name: "budget".to_string(),
+            detail: format!(
+                "`{text}` is not a time budget: give a positive whole number of milliseconds. \
+                 It can only lower the budget this space applies ({} ms), never raise it",
+                ceiling.as_millis()
+            ),
+        }),
+    }
 }
 
 /// How long a store's SPARQL evaluations may run, and how many may still be running after
@@ -243,6 +316,8 @@ pub(crate) struct Deadline {
     token: CancellationToken,
     state: Arc<Mutex<State>>,
     budget: Duration,
+    /// Whether this evaluation is an update, for the refusal's wording.
+    write: bool,
 }
 
 impl Deadline {
@@ -256,7 +331,7 @@ impl Deadline {
     /// between rows.
     pub(crate) fn check(&self) -> Result<()> {
         if self.token.is_cancelled() {
-            return Err(timeout(self.budget, false));
+            return Err(timeout(self.budget, self.write));
         }
         Ok(())
     }
@@ -267,7 +342,7 @@ impl Deadline {
     pub(crate) fn settle<R>(&self, commit: impl FnOnce() -> Result<R>) -> Result<R> {
         let mut state = lock(&self.state);
         if *state == State::Abandoned {
-            return Err(timeout(self.budget, true));
+            return Err(timeout(self.budget, self.write));
         }
         *state = State::Settled;
         commit()
@@ -281,17 +356,18 @@ fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
 }
 
 fn timeout(budget: Duration, write: bool) -> Error {
+    // The wording is `ikigai-sparql`'s, so a consumer reading both sees one sentence.
     Error::Timeout(format!(
-        "this SPARQL evaluation ran past its time budget of {} ms and was stopped; nothing \
-         was answered{}. The budget is the host's (`urn:cap:store:budget:<ms>` grants raise \
-         it, up to the store's ceiling) and a caller cannot raise its own. Narrow the query \
-         (fewer patterns, a shorter path or chain, a selective pattern first) or split it",
-        budget.as_millis(),
+        "{} ran past its time budget of {} ms and was stopped (ledger #964).{} The budget is \
+         set by the host, and a request's `budget=` can only lower it. Narrow the query — \
+         fewer joins, a bound subject, a LIMIT — or ask the host for a larger budget",
         if write {
-            " and nothing was written"
+            "this SPARQL update"
         } else {
-            ""
+            "this SPARQL query"
         },
+        budget.as_millis(),
+        if write { " Nothing was written." } else { "" },
     ))
 }
 
@@ -301,6 +377,7 @@ fn timeout(budget: Duration, write: bool) -> Error {
 /// at `max_overdue` this refuses before starting anything. See the module docs.
 pub(crate) fn run<T, F>(
     text: &str,
+    write: bool,
     budget: Duration,
     overdue: &Arc<AtomicUsize>,
     max_overdue: usize,
@@ -314,6 +391,7 @@ where
         token: CancellationToken::new(),
         state: Arc::new(Mutex::new(State::Running)),
         budget,
+        write,
     };
     on_its_own_thread(text, overdue, max_overdue, deadline, work)
 }
@@ -359,7 +437,7 @@ where
              rather than letting each request hold another core. Retry shortly"
         )));
     }
-    let budget = deadline.budget;
+    let (budget, write) = (deadline.budget, deadline.write);
     let stack = crate::limits::STACK_BASE
         .saturating_add(text.len().saturating_mul(crate::limits::STACK_PER_BYTE));
     let (tx, rx) = std::sync::mpsc::channel();
@@ -400,7 +478,7 @@ where
                     *state = State::Abandoned;
                     overdue.fetch_add(1, Ordering::SeqCst);
                     token.cancel();
-                    return Err(timeout(budget, false));
+                    return Err(timeout(budget, write));
                 }
             }
             // Settled: it reached its commit point in time, and its answer is on the way.
@@ -411,6 +489,241 @@ where
     match outcome {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// Refuse a parsed query whose algebra exceeds [`MAX_JOIN_OPERANDS`] or [`MAX_ALGEBRA_NODES`],
+/// naming the argument `arg` and the bound. Called after parsing and before planning.
+pub fn check_query(query: &Query, arg: &str) -> Result<()> {
+    let mut cost = Cost::default();
+    match query {
+        Query::Select { pattern, .. }
+        | Query::Ask { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Construct { pattern, .. } => cost.pattern(pattern),
+    }
+    cost.verdict(arg)
+}
+
+/// [`check_query`] for an update: the `WHERE` of every `DELETE`/`INSERT` operation counts
+/// toward one total, and each join is bounded on its own.
+pub fn check_update(update: &Update, arg: &str) -> Result<()> {
+    let mut cost = Cost::default();
+    for operation in &update.operations {
+        if let GraphUpdateOperation::DeleteInsert { pattern, .. } = operation {
+            cost.pattern(pattern);
+        }
+    }
+    cost.verdict(arg)
+}
+
+/// The algebra walk. ★ Kept identical to `ikigai-sparql`'s `budget::Cost` (ledger #964) so
+/// the hub can fold the two into one shared module; change both or neither.
+///
+/// ⚠ The matches are exhaustive over `spargebra`'s enums on purpose, and that is safe here
+/// for the reason `endpoints::serialize_solutions` gives: the only feature-gated variants in
+/// spargebra 0.4.7 are in `Function` (never matched — a call is walked by its arguments) and
+/// `GraphPattern::Lateral`, gated on `sep-0006`, which this crate's manifest enables itself.
+#[derive(Default)]
+struct Cost {
+    nodes: usize,
+    widest_join: usize,
+}
+
+impl Cost {
+    fn verdict(&self, arg: &str) -> Result<()> {
+        if self.widest_join > MAX_JOIN_OPERANDS {
+            return Err(Error::InvalidArgument {
+                name: arg.to_string(),
+                detail: format!(
+                    "this SPARQL text joins {} patterns in one group, and this endpoint refuses \
+                     more than {MAX_JOIN_OPERANDS} (MAX_JOIN_OPERANDS) before planning: the \
+                     planner's join ordering grows about with the cube of that number and \
+                     cannot be interrupted (ledger #964). A sequence path counts one pattern a \
+                     step. Split the query, or move a list of values into VALUES",
+                    self.widest_join
+                ),
+            });
+        }
+        if self.nodes > MAX_ALGEBRA_NODES {
+            return Err(Error::InvalidArgument {
+                name: arg.to_string(),
+                detail: format!(
+                    "this SPARQL text has {} algebra operators (patterns, OPTIONAL/UNION/FILTER/\
+                     BIND, path and expression operators), and this endpoint refuses more than \
+                     {MAX_ALGEBRA_NODES} (MAX_ALGEBRA_NODES) before planning: the planner is \
+                     quadratic in several of them and cannot be interrupted (ledger #964). \
+                     Constants in VALUES and IN (…) cost nothing; use them for long lists",
+                    self.nodes
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn pattern(&mut self, pattern: &GraphPattern) {
+        match pattern {
+            GraphPattern::Bgp { patterns } => {
+                self.nodes += patterns.len();
+                self.widest_join = self.widest_join.max(patterns.len());
+            }
+            GraphPattern::Join { .. } => {
+                // The planner flattens nested joins and reorders all their operands at once.
+                let mut operands = 0;
+                let mut todo = vec![pattern];
+                while let Some(next) = todo.pop() {
+                    match next {
+                        GraphPattern::Join { left, right } => {
+                            self.nodes += 1;
+                            todo.push(left);
+                            todo.push(right);
+                        }
+                        GraphPattern::Bgp { patterns } => {
+                            self.nodes += patterns.len();
+                            operands += patterns.len();
+                        }
+                        other => {
+                            operands += 1;
+                            self.pattern(other);
+                        }
+                    }
+                }
+                self.widest_join = self.widest_join.max(operands);
+            }
+            GraphPattern::Path { path, .. } => {
+                self.widest_join = self.widest_join.max(1);
+                self.path(path);
+            }
+            GraphPattern::LeftJoin {
+                left,
+                right,
+                expression,
+            } => {
+                self.nodes += 1;
+                self.pattern(left);
+                self.pattern(right);
+                if let Some(expression) = expression {
+                    self.expression(expression);
+                }
+            }
+            GraphPattern::Lateral { left, right }
+            | GraphPattern::Union { left, right }
+            | GraphPattern::Minus { left, right } => {
+                self.nodes += 1;
+                self.pattern(left);
+                self.pattern(right);
+            }
+            GraphPattern::Filter { expr, inner } => {
+                self.nodes += 1;
+                self.expression(expr);
+                self.pattern(inner);
+            }
+            GraphPattern::Extend {
+                inner, expression, ..
+            } => {
+                self.nodes += 1;
+                self.expression(expression);
+                self.pattern(inner);
+            }
+            GraphPattern::OrderBy { inner, expression } => {
+                self.nodes += 1;
+                for order in expression {
+                    match order {
+                        OrderExpression::Asc(e) | OrderExpression::Desc(e) => self.expression(e),
+                    }
+                }
+                self.pattern(inner);
+            }
+            GraphPattern::Group {
+                inner, aggregates, ..
+            } => {
+                self.nodes += 1;
+                for (_, aggregate) in aggregates {
+                    if let AggregateExpression::FunctionCall { expr, .. } = aggregate {
+                        self.expression(expr);
+                    }
+                }
+                self.pattern(inner);
+            }
+            GraphPattern::Graph { inner, .. }
+            | GraphPattern::Service { inner, .. }
+            | GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner }
+            | GraphPattern::Slice { inner, .. } => {
+                self.nodes += 1;
+                self.pattern(inner);
+            }
+            GraphPattern::Values { .. } => self.nodes += 1,
+        }
+    }
+
+    fn path(&mut self, path: &PropertyPathExpression) {
+        self.nodes += 1;
+        match path {
+            PropertyPathExpression::NamedNode(_)
+            | PropertyPathExpression::NegatedPropertySet(_) => {}
+            PropertyPathExpression::Reverse(p)
+            | PropertyPathExpression::ZeroOrMore(p)
+            | PropertyPathExpression::OneOrMore(p)
+            | PropertyPathExpression::ZeroOrOne(p) => self.path(p),
+            PropertyPathExpression::Sequence(a, b) | PropertyPathExpression::Alternative(a, b) => {
+                self.path(a);
+                self.path(b);
+            }
+        }
+    }
+
+    fn expression(&mut self, expression: &Expression) {
+        match expression {
+            Expression::NamedNode(_)
+            | Expression::Literal(_)
+            | Expression::Variable(_)
+            | Expression::Bound(_) => {}
+            Expression::In(e, members) => {
+                self.nodes += 1;
+                self.expression(e);
+                for member in members {
+                    self.expression(member);
+                }
+            }
+            Expression::Exists(pattern) => {
+                self.nodes += 1;
+                self.pattern(pattern);
+            }
+            Expression::Coalesce(args) | Expression::FunctionCall(_, args) => {
+                self.nodes += 1;
+                for arg in args {
+                    self.expression(arg);
+                }
+            }
+            Expression::If(a, b, c) => {
+                self.nodes += 1;
+                self.expression(a);
+                self.expression(b);
+                self.expression(c);
+            }
+            Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
+                self.nodes += 1;
+                self.expression(e);
+            }
+            Expression::Or(a, b)
+            | Expression::And(a, b)
+            | Expression::Equal(a, b)
+            | Expression::SameTerm(a, b)
+            | Expression::Greater(a, b)
+            | Expression::GreaterOrEqual(a, b)
+            | Expression::Less(a, b)
+            | Expression::LessOrEqual(a, b)
+            | Expression::Add(a, b)
+            | Expression::Subtract(a, b)
+            | Expression::Multiply(a, b)
+            | Expression::Divide(a, b) => {
+                self.nodes += 1;
+                self.expression(a);
+                self.expression(b);
+            }
+        }
     }
 }
 
@@ -458,7 +771,7 @@ mod tests {
     #[test]
     fn an_answer_inside_the_budget_is_returned() {
         let overdue = counter();
-        let got = run("q", Duration::from_secs(5), &overdue, 1, |_| Ok(7)).unwrap();
+        let got = run("q", false, Duration::from_secs(5), &overdue, 1, |_| Ok(7)).unwrap();
         assert_eq!(got, 7);
         assert_eq!(overdue.load(Ordering::SeqCst), 0);
     }
@@ -467,13 +780,20 @@ mod tests {
     fn past_the_budget_the_caller_is_answered_with_a_timeout_and_the_work_is_told_to_stop() {
         let overdue = counter();
         let start = Instant::now();
-        let err = run("q", Duration::from_millis(100), &overdue, 4, |deadline| {
-            // Cooperative work: stops when told.
-            while deadline.check().is_ok() {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Ok(())
-        })
+        let err = run(
+            "q",
+            false,
+            Duration::from_millis(100),
+            &overdue,
+            4,
+            |deadline| {
+                // Cooperative work: stops when told.
+                while deadline.check().is_ok() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(())
+            },
+        )
         .unwrap_err();
         assert!(
             matches!(&err, Error::Timeout(m) if m.contains("100 ms")),
@@ -496,14 +816,21 @@ mod tests {
         let overdue = counter();
         let (release, held) = std::sync::mpsc::channel::<()>();
         // Ignores the token entirely, like oxigraph's optimizer.
-        let err = run("q", Duration::from_millis(50), &overdue, 1, move |_| {
-            let _ = held.recv();
-            Ok(())
-        })
+        let err = run(
+            "q",
+            false,
+            Duration::from_millis(50),
+            &overdue,
+            1,
+            move |_| {
+                let _ = held.recv();
+                Ok(())
+            },
+        )
         .unwrap_err();
         assert!(matches!(err, Error::Timeout(_)));
         assert_eq!(overdue.load(Ordering::SeqCst), 1);
-        let refused = run("q", Duration::from_secs(5), &overdue, 1, |_| Ok(())).unwrap_err();
+        let refused = run("q", false, Duration::from_secs(5), &overdue, 1, |_| Ok(())).unwrap_err();
         assert!(
             matches!(&refused, Error::Unavailable(m) if m.contains("still running")),
             "{refused}"
@@ -514,7 +841,7 @@ mod tests {
             assert!(wait.elapsed() < Duration::from_secs(5));
             std::thread::sleep(Duration::from_millis(5));
         }
-        run("q", Duration::from_secs(5), &overdue, 1, |_| Ok(())).unwrap();
+        run("q", false, Duration::from_secs(5), &overdue, 1, |_| Ok(())).unwrap();
     }
 
     #[test]
@@ -525,6 +852,7 @@ mod tests {
         let (done, finished) = std::sync::mpsc::channel::<Result<()>>();
         let err = run(
             "q",
+            true,
             Duration::from_millis(50),
             &overdue,
             4,
@@ -542,7 +870,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Timeout(_)));
         let outcome = finished.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(matches!(outcome, Err(Error::Timeout(m)) if m.contains("nothing was written")));
+        assert!(matches!(outcome, Err(Error::Timeout(m)) if m.contains("Nothing was written")));
         assert_eq!(committed.load(Ordering::SeqCst), 0);
     }
 
@@ -552,6 +880,7 @@ mod tests {
         let caught = std::panic::catch_unwind(|| {
             let _ = run(
                 "q",
+                false,
                 Duration::from_secs(5),
                 &overdue,
                 1,
@@ -560,5 +889,113 @@ mod tests {
         });
         assert!(caught.is_err());
         assert_eq!(overdue.load(Ordering::SeqCst), 0);
+    }
+
+    fn cost(text: &str) -> (usize, usize) {
+        let mut cost = Cost::default();
+        match spargebra::SparqlParser::new().parse_query(text).unwrap() {
+            Query::Select { pattern, .. }
+            | Query::Ask { pattern, .. }
+            | Query::Describe { pattern, .. }
+            | Query::Construct { pattern, .. } => cost.pattern(&pattern),
+        }
+        (cost.widest_join, cost.nodes)
+    }
+
+    fn query(text: &str) -> Result<()> {
+        check_query(
+            &spargebra::SparqlParser::new().parse_query(text).unwrap(),
+            "query",
+        )
+    }
+
+    fn patterns(n: usize) -> String {
+        (0..n).map(|i| format!("?s <urn:p> ?o{i} . ")).collect()
+    }
+
+    #[test]
+    fn a_join_counts_its_patterns_its_path_steps_and_its_nested_groups() {
+        assert_eq!(cost("SELECT * WHERE { ?s ?p ?o }").0, 1);
+        assert_eq!(
+            cost(&format!("SELECT * WHERE {{ {} }}", patterns(10))).0,
+            10
+        );
+        // A sequence path is parsed into one pattern a step.
+        assert_eq!(
+            cost("SELECT * WHERE { ?s <urn:a>/<urn:b>/<urn:c> ?o }").0,
+            3
+        );
+        // Nested groups are flattened into one join, as the planner flattens them.
+        let nested = format!(
+            "SELECT * WHERE {{ {{ {} }} {{ {} }} {{ SELECT * {{ ?x ?y ?z }} }} }}",
+            patterns(5),
+            patterns(6)
+        );
+        assert_eq!(cost(&nested).0, 5 + 6 + 1);
+        // OPTIONAL and UNION are separate joins: each side is bounded on its own.
+        let split = format!(
+            "SELECT * WHERE {{ {} OPTIONAL {{ {} }} }}",
+            patterns(30),
+            patterns(30)
+        );
+        assert_eq!(cost(&split).0, 30);
+    }
+
+    #[test]
+    fn constants_in_values_and_in_lists_cost_nothing() {
+        let values = format!(
+            "SELECT * WHERE {{ VALUES ?s {{ {} }} ?s ?p ?o }}",
+            "<urn:x> ".repeat(5_000)
+        );
+        assert!(cost(&values).1 < 10);
+        let list = format!(
+            "SELECT * WHERE {{ ?s ?p ?o FILTER(?o IN ({})) }}",
+            vec!["<urn:x>"; 5_000].join(", ")
+        );
+        assert!(cost(&list).1 < 10);
+    }
+
+    #[test]
+    fn the_algebra_bounds_admit_at_the_bound_and_refuse_one_past_it_by_name() {
+        query(&format!(
+            "SELECT * WHERE {{ {} }}",
+            patterns(MAX_JOIN_OPERANDS)
+        ))
+        .unwrap();
+        let err = query(&format!(
+            "SELECT * WHERE {{ {} }}",
+            patterns(MAX_JOIN_OPERANDS + 1)
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument { name, detail } if name == "query"
+                && detail.contains("MAX_JOIN_OPERANDS")),
+            "{err}"
+        );
+        // `1||1||…`: n terms are n-1 operators, plus the FILTER and the empty group.
+        let chain = |terms: usize| format!("SELECT * WHERE {{ FILTER(1{}) }}", "||1".repeat(terms));
+        let (_, nodes) = cost(&chain(0));
+        query(&chain(MAX_ALGEBRA_NODES - nodes)).unwrap();
+        let err = query(&chain(MAX_ALGEBRA_NODES - nodes + 1)).unwrap_err();
+        assert!(err.to_string().contains("MAX_ALGEBRA_NODES"), "{err}");
+    }
+
+    #[test]
+    fn an_update_counts_every_where_clause_toward_one_total() {
+        let parse = |text: &str| spargebra::SparqlParser::new().parse_update(text).unwrap();
+        let half = MAX_ALGEBRA_NODES / 2 + 1;
+        let op = format!(
+            "DELETE {{ ?s ?p ?o }} WHERE {{ ?s ?p ?o FILTER({}) }}",
+            vec!["?o = 1"; half / 2].join(" || ")
+        );
+        check_update(&parse(&op), "content").unwrap();
+        let err = check_update(&parse(&format!("{op} ; {op} ; {op}")), "content").unwrap_err();
+        assert!(err.to_string().contains("MAX_ALGEBRA_NODES"), "{err}");
+        // INSERT DATA is flat, however long.
+        let data = format!(
+            "INSERT DATA {{ {} }}",
+            "<urn:s> <urn:p> <urn:o> . ".repeat(10_000)
+        );
+        check_update(&parse(&data), "content").unwrap();
     }
 }

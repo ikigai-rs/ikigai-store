@@ -360,7 +360,12 @@ fn measure_legitimate() {
         println!("set DATASET to an N-Quads file");
         return;
     };
-    let store = Store::new().unwrap();
+    // `ROCKSDB_DIR` (with `--features persistent`) measures the durable backing instead.
+    let store = match std::env::var("ROCKSDB_DIR") {
+        #[cfg(feature = "persistent")]
+        Ok(dir) => Store::open(dir).unwrap(),
+        _ => Store::new().unwrap(),
+    };
     let t = Instant::now();
     store
         .load_from_reader(

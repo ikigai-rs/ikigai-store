@@ -14,7 +14,10 @@
 //! `Update` keeps its `spargebra` AST private and exposes only the `USING` clauses, and
 //! taking a direct `spargebra` dependency would mean pinning `=0.4.7` beside oxigraph's
 //! own exact pin, so a stranger's fresh `cargo add ikigai-store` would stop compiling the
-//! day oxigraph bumps it. Not enough: `DELETE WHERE { GRAPH ?g { ?s ?p ?o } }` names its
+//! day oxigraph bumps it. (Since ledger #964 this crate does depend on `spargebra`, at a
+//! caret that unifies with oxigraph's pin, to bound a query's algebra before planning — see
+//! the note in `Cargo.toml`. The argument below, that a syntactic check would not be enough,
+//! stands either way.) Not enough: `DELETE WHERE { GRAPH ?g { ?s ?p ?o } }` names its
 //! graph with a *variable*, and `INSERT DATA { <s> <p> <o> }` names none at all and
 //! writes the default graph.
 //!
@@ -118,13 +121,18 @@ pub(crate) struct Applied {
 /// The update is evaluated under `deadline`'s cancellation token (ledger #964).
 pub(crate) fn parse(update: &str, deadline: &Deadline) -> Result<PreparedSparqlUpdate> {
     crate::limits::check_sparql(update, "content")?;
-    SparqlEvaluator::new()
-        .with_cancellation_token(deadline.token())
+    // ★ Parsed by the parser oxigraph uses, and measured before oxigraph plans it: the
+    // planner cannot be cancelled (ledger #964, `src/budget.rs`).
+    let parsed = spargebra::SparqlParser::new()
         .parse_update(update)
         .map_err(|e| Error::InvalidArgument {
             name: "content".to_string(),
             detail: format!("not a SPARQL update: {e}"),
-        })
+        })?;
+    crate::budget::check_update(&parsed, "content")?;
+    Ok(SparqlEvaluator::new()
+        .with_cancellation_token(deadline.token())
+        .for_update(parsed))
 }
 
 /// Whether the update has a `WHERE` — i.e. READS the dataset it runs against.

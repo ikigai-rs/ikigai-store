@@ -11,8 +11,10 @@
 //! - where oxigraph can be stopped, the worker IS stopped, and the store has no overdue
 //!   evaluation left a moment later (the core is released), and a second query answers
 //!   promptly;
-//! - where it cannot (a long property path: the time is in oxigraph's optimizer), the
-//!   evaluation is counted as overdue and, at the cap, new ones are refused;
+//! - the shapes oxigraph's planner is superlinear in (which no token reaches) are refused
+//!   before planning, by the algebra bounds;
+//! - where the evaluation still cannot be stopped (an aggregate over a cross product), it is
+//!   counted as overdue and, at the cap, new ones are refused;
 //! - an update that runs out of time writes nothing — not then, and not later when its
 //!   worker finally ends.
 //!
@@ -223,16 +225,86 @@ fn a_budget_grant_raises_the_budget_and_root_gets_the_ceiling() {
     settles(&store, Duration::from_secs(5));
 }
 
-/// ⚠ The half the budget cannot do, pinned so it is not mistaken for done: a long property
-/// path spends its time in oxigraph's optimizer, which never looks at the token. The caller
-/// is still answered at the budget, but the evaluation keeps its core — so it is COUNTED,
-/// and at the cap new evaluations are refused rather than each taking another core.
+/// The planner shapes ledger #964 measured — a 3 KB property path (19 s of planning), a
+/// 120 KB `||` chain (30 s), 250 triple patterns (13 s) — are refused BEFORE planning, by
+/// name, in well under a second: oxigraph's planner never looks at the token, so a deadline
+/// alone could not have stopped them.
+#[test]
+fn the_shapes_oxigraph_plans_too_slowly_are_refused_before_planning() {
+    let (store, kernel) = store(TimeBudget::new(ms(300)));
+    let bgp: String = (0..250).map(|i| format!("?s <urn:p> ?o{i} . ")).collect();
+    for (query, bound) in [
+        (path(1000), "MAX_JOIN_OPERANDS"),
+        (format!("SELECT * WHERE {{ {bgp} }}"), "MAX_JOIN_OPERANDS"),
+        (
+            format!("SELECT * WHERE {{ FILTER(1{}) }}", "||1".repeat(40_000)),
+            "MAX_ALGEBRA_NODES",
+        ),
+    ] {
+        let start = Instant::now();
+        match select(&kernel, &reader(), &query) {
+            Err(Error::InvalidArgument { name, detail }) => {
+                assert_eq!(name, "query");
+                assert!(detail.contains(bound), "{detail}");
+            }
+            other => panic!("expected {bound} to refuse, got {other:?}"),
+        }
+        assert!(start.elapsed() < ms(300), "{:?}", start.elapsed());
+    }
+    assert_eq!(store.overdue_evaluations(), 0);
+    // The update doors measure their WHERE the same way.
+    let update = format!("DELETE {{ ?s ?p ?o }} WHERE {{ {bgp} }}");
+    let refused = issue(
+        &kernel,
+        &reader(),
+        Verb::Sink,
+        "urn:iki:store:update",
+        &[("content", &update)],
+    );
+    assert!(
+        matches!(&refused, Err(Error::InvalidArgument { name, .. }) if name == "content"),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn a_request_budget_can_only_tighten() {
+    let (store, kernel) = store(TimeBudget::new(ms(300)));
+    let query = cross(4, "SELECT *");
+    let with = |budget: &str| {
+        issue(
+            &kernel,
+            &reader(),
+            Verb::Source,
+            "urn:iki:store:select",
+            &[("query", &query), ("budget", budget)],
+        )
+    };
+    assert_timeout(with("100"), 100);
+    settles(&store, Duration::from_secs(5));
+    // Asking for an hour gets what the capability gets.
+    assert_timeout(with("3600000"), 300);
+    settles(&store, Duration::from_secs(5));
+    match with("1s") {
+        Err(Error::InvalidArgument { name, .. }) => assert_eq!(name, "budget"),
+        other => panic!("expected `budget` refused, got {other:?}"),
+    }
+}
+
+/// ⚠ The half the budget cannot do, pinned so it is not mistaken for done: inside the
+/// algebra bounds, oxigraph's join and aggregate loops over rows already in memory never
+/// look at the token, so `COUNT(*)` over a cross product keeps its core long after the
+/// caller was answered. So it is COUNTED, and at the cap new evaluations are refused rather
+/// than each taking another core.
 #[test]
 fn a_shape_oxigraph_cannot_stop_is_counted_and_capped() {
     let (store, kernel) = store(TimeBudget::new(ms(200)).with_max_overdue(1));
-    // 3 KB: 19 s in a release build, far longer in a debug one.
+    // 120^6 rows counted: still running after 30 s in a release build.
     let start = Instant::now();
-    assert_timeout(select(&kernel, &reader(), &path(1000)), 200);
+    assert_timeout(
+        select(&kernel, &reader(), &cross(6, "SELECT (COUNT(*) AS ?n)")),
+        200,
+    );
     assert!(
         start.elapsed() < ms(200) + ms(1500),
         "{:?}",

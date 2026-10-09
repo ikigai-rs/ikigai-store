@@ -86,12 +86,13 @@
 //!
 //! # …and evaluated within a time budget
 //!
-//! Inside those bounds oxigraph is still superlinear (a 3 KB property path runs for 19 s, a
-//! 118-byte cross product for minutes), so every evaluation runs within a budget the host
-//! sets per door through the capability: the caller is answered with a typed
+//! Inside those bounds oxigraph is still superlinear (a 3 KB property path plans for 19 s, a
+//! 118-byte cross product runs for minutes). So the parsed algebra is bounded before oxigraph
+//! plans it, and every evaluation runs within a budget the host sets per door through the
+//! capability (a request's `budget=` can only lower it): the caller is answered with a typed
 //! `Error::Timeout` at the budget, the evaluation is cancelled, and an update that runs out
 //! of time writes nothing. [`budget`] has the numbers, the default and its evidence, and —
-//! as plainly — the shapes oxigraph cannot be stopped partway through (ledger #964).
+//! as plainly — what oxigraph still cannot be stopped partway through (ledger #964).
 //!
 //! # A tenancy boundary: scopes narrower than the whole dataset
 //!

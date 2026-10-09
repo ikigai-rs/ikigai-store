@@ -267,6 +267,7 @@ pub const GRAPH_UPDATE_THREAD: &str = "urn:iki:store:graph-update";
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_ANY_URI: &str = "http://www.w3.org/2001/XMLSchema#anyURI";
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
 /// Result serializations, SELECT/ASK first — index 0 is the default and the value a
 /// conformance walk synthesizes.
@@ -487,36 +488,47 @@ impl Endpoint for QueryEndpoint {
                 let this = self.clone();
                 let text = query.to_string();
                 let confined = target.clone();
-                let (media, bytes) =
-                    self.store
-                        .evaluate(query, inv.capability, move |deadline| {
-                            let query = text.as_str();
-                            let as_type = as_type.as_deref();
-                            let mut prepared = SparqlEvaluator::new()
-                                .with_cancellation_token(deadline.token())
+                let requested = optional_inline_str(inv, "budget")?;
+                let (media, bytes) = self.store.evaluate(
+                    query,
+                    false,
+                    inv.capability,
+                    requested,
+                    move |deadline| {
+                        let query = text.as_str();
+                        let as_type = as_type.as_deref();
+                        // ★ Parsed by the parser oxigraph uses, measured, and only then
+                        // handed to oxigraph: its planner cannot be cancelled, so the
+                        // algebra is bounded before it plans (ledger #964, `src/budget.rs`).
+                        let parsed =
+                            spargebra::SparqlParser::new()
                                 .parse_query(query)
                                 .map_err(|e| Error::InvalidArgument {
                                     name: "query".to_string(),
                                     detail: format!("not a SPARQL query: {e}"),
                                 })?;
-                            if let Some(target) = &confined {
-                                // ⚠ `FROM` / `FROM NAMED` is a SECOND way to name a dataset. It could
-                                // not widen the scope — `confine` overwrites the specification the
-                                // parser built from it — but answering `FROM <other>` with this
-                                // graph's rows would label one tenant's data with another's graph
-                                // name, so it is refused rather than silently overridden.
-                                if crate::scope::names_its_own_dataset(&prepared) {
-                                    let from: String = target
-                                        .iter()
-                                        .map(|g| format!("FROM <{}> ", g.as_str()))
-                                        .collect();
-                                    let named: Vec<String> = target
-                                        .iter()
-                                        .map(|g| format!("FROM NAMED <{}>", g.as_str()))
-                                        .collect();
-                                    return Err(Error::InvalidArgument {
-                                        name: "query".to_string(),
-                                        detail: format!(
+                        crate::budget::check_query(&parsed, "query")?;
+                        let mut prepared = SparqlEvaluator::new()
+                            .with_cancellation_token(deadline.token())
+                            .for_query(parsed);
+                        if let Some(target) = &confined {
+                            // ⚠ `FROM` / `FROM NAMED` is a SECOND way to name a dataset. It could
+                            // not widen the scope — `confine` overwrites the specification the
+                            // parser built from it — but answering `FROM <other>` with this
+                            // graph's rows would label one tenant's data with another's graph
+                            // name, so it is refused rather than silently overridden.
+                            if crate::scope::names_its_own_dataset(&prepared) {
+                                let from: String = target
+                                    .iter()
+                                    .map(|g| format!("FROM <{}> ", g.as_str()))
+                                    .collect();
+                                let named: Vec<String> = target
+                                    .iter()
+                                    .map(|g| format!("FROM NAMED <{}>", g.as_str()))
+                                    .collect();
+                                return Err(Error::InvalidArgument {
+                                    name: "query".to_string(),
+                                    detail: format!(
                                     "this query carries its own `FROM` / `FROM NAMED` clauses, \
                                      and `urn:iki:store:graph-{}` already fixes the dataset: \
                                      `graph=` IS the dataset, exactly `{from}{}`. The clauses are \
@@ -527,50 +539,51 @@ impl Endpoint for QueryEndpoint {
                                     this.form,
                                     named.join(" "),
                                 ),
-                                    });
-                                }
-                                crate::scope::confine(&mut prepared, target);
-                            }
-                            for (name, term) in bound.iter().cloned() {
-                                // `Variable::new` cannot fail here: `parse_bindings` already held the
-                                // name to the same character set, and named the offending key when it
-                                // did — which the evaluator's own error does not.
-                                let variable =
-                                    Variable::new(&name).map_err(|e| Error::InvalidArgument {
-                                        name: "bindings".to_string(),
-                                        detail: format!("`{name}` is not a variable name: {e}"),
-                                    })?;
-                                prepared = prepared.substitute_variable(variable, term);
-                            }
-                            let results = prepared
-                                .on_store(this.store.dataset())
-                                .execute()
-                                .map_err(|e| this.query_error(e, &bound))?;
-
-                            // ★ Refuse a query of the wrong shape rather than serving it here. The
-                            // IRI is a promise about what comes back — it is what fixes this
-                            // action's declared `outputs` — and answering a CONSTRUCT under
-                            // `urn:iki:store:select` would make that promise true only by accident.
-                            let is_graph = matches!(results, QueryResults::Graph(_));
-                            if is_graph != this.graph_shaped {
-                                return Err(Error::InvalidArgument {
-                                    name: "query".to_string(),
-                                    detail: format!(
-                                "this is `{}`, which answers with {}; that query answers with \
-                                 {}. Resolve the IRI for its form instead",
-                                this.iri(),
-                                shape(this.graph_shaped),
-                                shape(is_graph)
-                            ),
                                 });
                             }
+                            crate::scope::confine(&mut prepared, target);
+                        }
+                        for (name, term) in bound.iter().cloned() {
+                            // `Variable::new` cannot fail here: `parse_bindings` already held the
+                            // name to the same character set, and named the offending key when it
+                            // did — which the evaluator's own error does not.
+                            let variable =
+                                Variable::new(&name).map_err(|e| Error::InvalidArgument {
+                                    name: "bindings".to_string(),
+                                    detail: format!("`{name}` is not a variable name: {e}"),
+                                })?;
+                            prepared = prepared.substitute_variable(variable, term);
+                        }
+                        let results = prepared
+                            .on_store(this.store.dataset())
+                            .execute()
+                            .map_err(|e| this.query_error(e, &bound))?;
 
-                            if this.graph_shaped {
-                                serialize_graph(results, as_type, deadline)
-                            } else {
-                                serialize_solutions(results, as_type, deadline)
-                            }
-                        })?;
+                        // ★ Refuse a query of the wrong shape rather than serving it here. The
+                        // IRI is a promise about what comes back — it is what fixes this
+                        // action's declared `outputs` — and answering a CONSTRUCT under
+                        // `urn:iki:store:select` would make that promise true only by accident.
+                        let is_graph = matches!(results, QueryResults::Graph(_));
+                        if is_graph != this.graph_shaped {
+                            return Err(Error::InvalidArgument {
+                                name: "query".to_string(),
+                                detail: format!(
+                                    "this is `{}`, which answers with {}; that query answers with \
+                                 {}. Resolve the IRI for its form instead",
+                                    this.iri(),
+                                    shape(this.graph_shaped),
+                                    shape(is_graph)
+                                ),
+                            });
+                        }
+
+                        if this.graph_shaped {
+                            serialize_graph(results, as_type, deadline)
+                        } else {
+                            serialize_solutions(results, as_type, deadline)
+                        }
+                    },
+                )?;
                 Ok(with_freshness(
                     Representation::new(
                         ReprType::new(&media).with_param("charset", "utf-8"),
@@ -683,7 +696,8 @@ impl Endpoint for QueryEndpoint {
                     .one_of(outputs.iter().copied())
                     .default_value(outputs[0])
                     .optional(),
-            );
+            )
+            .input(budget_arg());
         outputs.iter().fold(desc, |desc, media| desc.output(*media))
     }
 }
@@ -1139,38 +1153,42 @@ impl Endpoint for UpdateEndpoint {
                 // nothing. See `src/budget.rs`.
                 let store = Arc::clone(&self.store);
                 let text = update.to_string();
-                let (before, after) =
-                    self.store
-                        .evaluate(update, inv.capability, move |deadline| {
-                            let prepared = crate::confine::parse(&text, deadline)?;
-                            if crate::confine::reads_the_dataset(&prepared) && !may_read {
-                                return Err(Error::Denied(format!(
-                            "this update has a `WHERE` clause, which reads the dataset, and \
+                let requested = optional_inline_str(inv, "budget")?;
+                let (before, after) = self.store.evaluate(
+                    update,
+                    true,
+                    inv.capability,
+                    requested,
+                    move |deadline| {
+                        let prepared = crate::confine::parse(&text, deadline)?;
+                        if crate::confine::reads_the_dataset(&prepared) && !may_read {
+                            return Err(Error::Denied(format!(
+                                "this update has a `WHERE` clause, which reads the dataset, and \
                              reading it through `urn:iki:store:update` needs `{CAP_READ}` as well \
                              as `{CAP_WRITE}`; this capability does not hold it. Nothing was \
                              evaluated. The write grant alone covers updates that read nothing: \
                              `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP`, `CREATE`, `LOAD`"
-                        )));
-                            }
-                            let _writes = store.write_lock();
-                            let before = count(&store)?;
-                            // ★ On a transaction this crate commits, not `on_store(…).execute()`,
-                            // which commits inside oxigraph: the commit has to be the deadline's.
-                            let mut transaction =
-                                store.dataset().start_transaction().map_err(|e| {
-                                    Error::Endpoint(format!("update: starting a transaction: {e}"))
-                                })?;
-                            prepared
-                                .on_transaction(&mut transaction)
-                                .execute()
-                                .map_err(|e| Error::Endpoint(format!("update: {e}")))?;
-                            deadline.settle(|| {
-                                transaction.commit().map_err(|e| {
-                                    Error::Endpoint(format!("update: committing: {e}"))
-                                })
-                            })?;
-                            Ok((before, count(&store)?))
+                            )));
+                        }
+                        let _writes = store.write_lock();
+                        let before = count(&store)?;
+                        // ★ On a transaction this crate commits, not `on_store(…).execute()`,
+                        // which commits inside oxigraph: the commit has to be the deadline's.
+                        let mut transaction = store.dataset().start_transaction().map_err(|e| {
+                            Error::Endpoint(format!("update: starting a transaction: {e}"))
                         })?;
+                        prepared
+                            .on_transaction(&mut transaction)
+                            .execute()
+                            .map_err(|e| Error::Endpoint(format!("update: {e}")))?;
+                        deadline.settle(|| {
+                            transaction
+                                .commit()
+                                .map_err(|e| Error::Endpoint(format!("update: committing: {e}")))
+                        })?;
+                        Ok((before, count(&store)?))
+                    },
+                )?;
                 // The counts are a read of the dataset, so only for a caller that may read.
                 Ok(plain(if may_read {
                     format!("updated: {before} -> {after} quads\n")
@@ -1205,6 +1223,7 @@ impl Endpoint for UpdateEndpoint {
                     .summary("A SPARQL 1.1 UPDATE request (INSERT DATA, DELETE WHERE, …).")
                     .class(XSD_STRING),
             )
+            .input(budget_arg())
             .output("text/plain")
     }
 }
@@ -1276,9 +1295,13 @@ impl Endpoint for GraphUpdateEndpoint {
                 let store = Arc::clone(&self.store);
                 let text = update.to_string();
                 let scope = target.clone();
-                let applied = self
-                    .store
-                    .evaluate(update, inv.capability, move |deadline| {
+                let requested = optional_inline_str(inv, "budget")?;
+                let applied = self.store.evaluate(
+                    update,
+                    true,
+                    inv.capability,
+                    requested,
+                    move |deadline| {
                         let target = scope;
                         let prepared = crate::confine::parse(&text, deadline)?;
                         if crate::confine::reads_the_dataset(&prepared) && !may_read {
@@ -1294,7 +1317,8 @@ impl Endpoint for GraphUpdateEndpoint {
                         }
                         let _writes = store.write_lock();
                         crate::confine::scoped_update(store.dataset(), &target, prepared, deadline)
-                    })?;
+                    },
+                )?;
                 // ⚠ The counts only for a caller that may read `G`: `+0` after an
                 // `INSERT DATA` says the quad was already there, which is a read.
                 Ok(plain(if may_read {
@@ -1355,6 +1379,7 @@ impl Endpoint for GraphUpdateEndpoint {
                     )
                     .class(XSD_ANY_URI),
             )
+            .input(budget_arg())
             .output("text/plain")
     }
 }
@@ -1527,6 +1552,19 @@ fn optional_inline_str<'a>(inv: &Invocation<'a>, name: &str) -> Result<Option<&'
 /// enforced the same.)
 fn may_read_graph(inv: &Invocation<'_>, graph: &NamedNode) -> bool {
     inv.capability.allows(&cap_read_graph(graph.as_str())) || inv.capability.allows(CAP_READ)
+}
+
+/// The `budget` input every SPARQL door declares (ledger #964), worded and typed as
+/// `ikigai-sparql`'s.
+fn budget_arg() -> ArgSpec {
+    ArgSpec::new("budget")
+        .summary(
+            "A time budget in milliseconds for this evaluation. It can only LOWER the budget \
+             the host gives this capability, never raise it; past the budget the request is \
+             refused with a timeout, never answered in part.",
+        )
+        .class(XSD_INTEGER)
+        .optional()
 }
 
 fn plain(text: String) -> Representation {
