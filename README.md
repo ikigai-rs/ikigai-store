@@ -696,8 +696,8 @@ both readings and refuses on the deeper (`src/limits.rs` has the argument).
   bound holds in both.
 - **On wasm there are no threads**, so only the two bounds apply.
 - **It does not bound time.** The evaluator is quadratic in an operator chain: 40,000 `||1`
-  terms (120 KB) take ~30 s of a core, 80,000 more than two minutes. A host exposed to
-  untrusted queries needs its own budget.
+  terms (120 KB) take ~30 s of a core, 80,000 more than two minutes. The next section does
+  (ledger #964).
 - **The bounds are constants, not configuration.** They protect the process, not a policy,
   so a per-host knob would only be a way to turn the protection off; a host that needs a
   tighter limit can refuse earlier at its own door with `ikigai_store::limits::check_sparql`,
@@ -707,6 +707,90 @@ both readings and refuses on the deeper (`src/limits.rs` has the argument).
 `tests/sparql_nesting.rs` reproduces the abort in a child process on a 2 MiB thread at all
 ten doors (it fails, with the child killed by `SIGABRT`, against 0.2.6);
 `tests/sparql_stack_measure.rs` re-measures every number above when oxigraph moves.
+
+## ★ Every evaluation has a time budget (ledger #964)
+
+Inside the byte and nesting bounds, oxigraph is still superlinear in shapes no lexical bound
+can refuse. Measured on 0.2.7 (release build, `tests/sparql_time_measure.rs`):
+
+| query | size | time |
+| --- | --- | --- |
+| `FILTER(1‖1‖…)`, 40,000 terms | 120 KB | 30 s |
+| a property path `:p/:p/…`, 1,000 steps | 3 KB | 19 s |
+| a property path, 2,000 steps | 6 KB | over 60 s (killed) |
+| 500 triple patterns sharing a subject | 9 KB | over 30 s (killed) |
+| a cross product of 6 unconstrained patterns, over 120 quads | 118 bytes | over 30 s (killed) |
+
+So every door that evaluates caller SPARQL (the eight query IRIs and both update IRIs) runs
+it within a **time budget**:
+
+- **The caller is answered at the budget**, with a typed `Error::Timeout` naming it — never
+  later, and never with a partial answer.
+- **The evaluation is told to stop** through oxigraph's cancellation token, and this crate's
+  serializers check the same token between rows (oxigraph evaluates lazily, so the rows are
+  the evaluation).
+- **An update that runs out of time writes nothing**, then or later: its transaction
+  commits only while the caller is still waiting, under the lock the caller takes to give
+  up. `tests/sparql_time_budget.rs` waits for the abandoned worker to end and checks the
+  store is unchanged, at both update doors.
+
+### The default, and why
+
+**10 s for every caller; 120 s for root**, and as the most any caller can be lifted to. The
+evidence, measured over a copy of gonk's live dataset (361,607 quads, the largest store in
+the ecosystem; release build, in memory): gonk's backup query — every quad in every graph,
+`ORDER BY ?g ?s ?p ?o`, serialized to 121 MB of JSON — takes 0.44 s; reading the whole
+348,232-quad browse graph 0.30 s; the ledger's bulk reads (a 43 KB `VALUES` of all 902
+items) 11–21 ms. The slowest legitimate query sits about 20 times inside the base, which
+leaves room for RocksDB, a slower machine and a larger dataset, while the shapes above run
+for minutes.
+
+### How a host sets it — per door, through the capability
+
+```rust
+use ikigai_store::{budget::{cap_budget, TimeBudget}, DurableStore};
+use std::time::Duration;
+
+let store = DurableStore::open(&config.path)?
+    .with_time_budget(
+        TimeBudget::new(Duration::from_millis(500))      // what EVERY caller gets
+            .with_ceiling(Duration::from_secs(120)),     // root, and the most a grant lifts to
+    );
+// The anonymous door's capability holds no budget grant: 500 ms.
+// The signed-in door's holds `cap_budget(10_000)` = `urn:cap:store:budget:10000`: 10 s.
+// The owner's socket holds root: 120 s.
+```
+
+A capability holding `urn:cap:store:budget:<milliseconds>` gets the largest such grant, never
+below the base and never above the ceiling; root gets the ceiling. The capability is the
+channel because it is the one thing a host already stamps per door that a caller cannot
+forge, and it follows a request down its sub-requests — a handler that queries the store on
+its caller's behalf runs on its caller's budget. ★ **A caller cannot raise its own budget**:
+attenuating a capability only removes grants, and removing a budget grant only lowers the
+budget towards the base. That is also why grants raise and nothing lowers — a "you get less"
+grant would be one a caller could drop. A budget grant is never REQUIRED, so it appears in
+no endpoint's declared `requires`.
+
+### ⚠ What it does not do
+
+- **oxigraph cannot always be stopped.** Its token is checked only when it reads a quad. The
+  optimizer and plan builder (where the `‖` chain, the long path and the long BGP spend their
+  time) and its join loops over already-materialized rows (the cross product, when counted)
+  never read one, so those keep their core until oxigraph's phase ends — the 1,000-step path
+  saw the token 18 s after it fired. There is no way to stop a Rust thread from outside it.
+  What this crate does instead: the caller is still answered at the budget; the evaluation is
+  counted as **overdue** (`DurableStore::overdue_evaluations`); and while
+  `TimeBudget::max_overdue` are overdue (default: a quarter of the machine's cores, at least
+  one), every new evaluation is refused with a transient `Error::Unavailable`. That bounds how
+  many cores one store's callers can pin, at the price of refusing SPARQL until one ends. The
+  real fix is upstream: `spareval` checking its token in the optimizer, path evaluation and
+  join loops.
+- **An overdue update keeps the write lock** until its worker ends, so other writes wait (and
+  time out) behind it. It still commits nothing.
+- **`urn:iki:store:load` is not budgeted**: it parses RDF, not SPARQL, and is linear.
+- **Memory is not budgeted.** A query that answers within its budget can still build a large
+  result (gonk's backup is 121 MB of JSON in under half a second).
+- **On wasm there are no threads**, so an evaluation runs inline and unbounded in time.
 
 ## Configuration
 

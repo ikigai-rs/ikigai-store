@@ -96,6 +96,8 @@ use std::collections::HashSet;
 
 use ikigai_core::{Error, Result};
 use oxigraph::model::{GraphName, NamedNode, Quad};
+
+use crate::budget::Deadline;
 use oxigraph::sparql::{PreparedSparqlUpdate, SparqlEvaluator};
 use oxigraph::store::Store;
 
@@ -109,11 +111,15 @@ pub(crate) struct Applied {
 ///
 /// ★ The one place an update reaches the parser, so the one place it is bounded first
 /// (ledger #915): [`crate::limits::check_sparql`] refuses text past the byte or nesting
-/// bound. Call it on [`crate::limits::on_sparql_stack`]: the parse and the evaluation that
-/// follows are recursive.
-pub(crate) fn parse(update: &str) -> Result<PreparedSparqlUpdate> {
+/// bound. Call it inside [`crate::DurableStore::evaluate`], which runs the parse and the
+/// evaluation that follows on a stack sized for them (both are recursive) and within the
+/// caller's time budget.
+///
+/// The update is evaluated under `deadline`'s cancellation token (ledger #964).
+pub(crate) fn parse(update: &str, deadline: &Deadline) -> Result<PreparedSparqlUpdate> {
     crate::limits::check_sparql(update, "content")?;
     SparqlEvaluator::new()
+        .with_cancellation_token(deadline.token())
         .parse_update(update)
         .map_err(|e| Error::InvalidArgument {
             name: "content".to_string(),
@@ -141,10 +147,15 @@ pub(crate) fn reads_the_dataset(prepared: &PreparedSparqlUpdate) -> bool {
 /// The caller must already hold the per-graph capability — the write grant always, and the
 /// read grant when [`reads_the_dataset`] — and the store's write lock: this function is
 /// the mechanism, not the gate.
+///
+/// ★ The real store is written only at `deadline`'s commit point (ledger #964): the scratch
+/// copy is private, so an update that runs out of time before step 4 has written nothing
+/// anywhere, and one that runs out at step 4 is not committed.
 pub(crate) fn scoped_update(
     store: &Store,
     graph: &NamedNode,
     update: PreparedSparqlUpdate,
+    deadline: &Deadline,
 ) -> Result<Applied> {
     let scope = GraphName::from(graph.clone());
     let scratch = Store::new().map_err(storage)?;
@@ -161,6 +172,7 @@ pub(crate) fn scoped_update(
             .map_err(storage)?;
     }
     for quad in store.quads_for_pattern(None, None, None, Some(graph.as_ref().into())) {
+        deadline.check()?;
         scratch.insert(&quad.map_err(storage)?).map_err(storage)?;
     }
     let before: HashSet<Quad> = scratch
@@ -209,7 +221,7 @@ pub(crate) fn scoped_update(
     } else if !registered && now_registered {
         txn.insert_named_graph(graph.as_ref());
     }
-    txn.commit().map_err(storage)?;
+    deadline.settle(|| txn.commit().map_err(storage))?;
 
     Ok(Applied {
         added: added.len(),
