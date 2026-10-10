@@ -801,10 +801,61 @@ budget grant is never REQUIRED, so it appears in no endpoint's declared `require
 - **An overdue update keeps the write lock** until its worker ends, so other writes wait (and
   time out) behind it. It still commits nothing.
 - **`urn:iki:store:load` is not budgeted**: it parses RDF, not SPARQL, and is linear.
-- **Memory is not budgeted.** A query that answers within its budget can still build a large
-  result (gonk's backup is 121 MB of JSON).
+- **Memory is not budgeted here** — the answer's SIZE is, in the next section (0.2.9).
 - **On wasm there are no threads**, so an evaluation runs inline: only the algebra bounds
   apply.
+
+## ★ Every answer has a size bound, and past it is refused (ledger #970)
+
+A deadline bounds how long, not how much. Measured (release build,
+`tests/answer_size_measure.rs`): over a 120-quad graph, the 49-byte
+`SELECT * WHERE { ?a ?b ?c . ?d ?e ?f . ?g ?h ?i }` serializes **1,728,000 rows — 567 MB of
+JSON — in 2.2 s**, well inside a 5 s budget, all of it held in memory before the first byte
+leaves. So every query door bounds the answer too, by the contract it shares with
+`ikigai-sparql` 0.1.13 — whose constants, `AnswerBound`, `effective_answer`, `inline_bound`,
+`too_large` and `CappedWriter` this crate's `budget` module copies verbatim, so ledger #976
+can fold the two mechanically:
+
+- **Counted:** rows for a SELECT, triples for a CONSTRUCT or DESCRIBE, and serialized
+  **bytes** for every form. **ASK is exempt.** Counting happens while serializing, and the
+  serializer writes into a buffer that refuses the write crossing the byte bound, so the
+  answer never grows past it. That query is now refused after **103 ms**.
+- **Refused, never truncated:** `InvalidArgument` on `query`, beginning
+  `the answer exceeds 100000 rows; add LIMIT, narrow the query, or ask the host for more`
+  (or `… 16777216 bytes; …`, or `… triples; …`). No partial body leaves.
+- **Base** `budget::DEFAULT_MAX_ROWS` = **100,000** and `budget::DEFAULT_MAX_BYTES` =
+  **16 MiB**; **ceiling** `budget::CEILING_MAX_ROWS` = **10,000,000** and
+  `budget::CEILING_MAX_BYTES` = **1 GiB**, which root gets.
+- **A grant raises it** — "ask the host for more" means this — monotone like a time grant:
+  `urn:cap:store:answer:<rows>` (`cap_answer`) and `urn:cap:store:answer:bytes:<bytes>`
+  (`cap_answer_bytes`), each never above its ceiling. A row grant does not raise bytes; an
+  export holds both. (Here the bound comes from the capability; in `ikigai-sparql` from the
+  space, as with the time budget.)
+- **A request can only lower it**, with `max_rows=` and `max_bytes=`. Either one present but
+  not inline (a reference, a content id, bytes that are not UTF-8) is refused, never ignored,
+  as `budget=` is: ignoring it would answer under the ceiling a door's stamp meant to lower.
+
+```rust
+use ikigai_store::budget::{cap_answer, cap_answer_bytes, AnswerBound, AnswerBudget};
+
+let store = DurableStore::open(&config.path)?
+    .with_answer_budget(
+        AnswerBudget::new(AnswerBound::new(10_000, 4 << 20)?)   // what EVERY caller gets
+            .with_ceiling(AnswerBound::CEILING),                 // root; the most a grant lifts to
+    );
+// A whole-dataset export job holds `cap_answer(10_000_000)` and `cap_answer_bytes(1 << 30)`.
+```
+
+⚠ **gonk's backup needs both grants.** Its query (every quad, sorted, SPARQL JSON) answers
+**361,607 rows and 121,625,465 bytes** (116 MiB) over the 2026-10-09 dataset, so under the
+base it is refused on bytes. Measured on a RocksDB store loaded from that backup: refused
+after 25.8–28.8 s under its job scopes as they are, answered in 23.4–23.7 s with
+`urn:cap:store:answer:10000000` and `urn:cap:store:answer:bytes:1073741824` added.
+
+⚠ **What it does not bound: memory oxigraph spends before the first row.** An `ORDER BY`,
+`DISTINCT`, `GROUP BY` or a join's build side materializes inside the evaluator, where no
+row has been serialized yet — which is why the backup above is refused only after its
+sort, 25 s in. That memory is bounded by time, not by this.
 
 ## Configuration
 

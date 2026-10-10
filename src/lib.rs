@@ -94,6 +94,16 @@
 //! of time writes nothing. [`budget`] has the numbers, the default and its evidence, and —
 //! as plainly — what oxigraph still cannot be stopped partway through (ledger #964).
 //!
+//! # …and answered within a size bound
+//!
+//! A deadline bounds how long, not how much: a 49-byte cross product serializes 567 MB in
+//! 2.2 s. So every query door counts its answer while serializing it — rows (triples for a
+//! graph) and bytes; ASK is exempt — and refuses past the bound with an `InvalidArgument`,
+//! never a truncated answer. The base is 100,000 rows and 16 MiB, a
+//! `urn:cap:store:answer:*` grant raises it to the ceiling (10,000,000 rows, 1 GiB; root gets
+//! that), and a request's `max_rows=` / `max_bytes=` can only lower it. [`budget`] section 4
+//! has the contract, shared with `ikigai-sparql` (ledger #970).
+//!
 //! # A tenancy boundary: scopes narrower than the whole dataset
 //!
 //! [`CAP_WRITE`] is all-or-nothing, so a module layered over this store makes its callers
@@ -240,7 +250,7 @@ pub(crate) mod scope;
 pub mod sparql;
 pub mod store;
 
-pub use budget::TimeBudget;
+pub use budget::{AnswerBudget, TimeBudget};
 pub use config::StoreConfig;
 pub use endpoints::{
     cap_read_graph, cap_write_graph, space, CAP_READ, CAP_READ_ANY, CAP_READ_GRAPH, CAP_WRITE,

@@ -90,17 +90,52 @@
 //! the capability lowers: a "you get less" grant would be one a caller could drop. So an
 //! anonymous door gets a small budget by the host setting a small BASE and giving its trusted
 //! doors a grant (or root) — or by the door stamping `budget=`, overwriting the caller's.
+//!
+//! # 4. The SIZE of the answer is bounded too (ledger #970)
+//!
+//! A deadline bounds how long, not how much: a 49-byte three-pattern cross product over a
+//! 120-quad graph serializes 1,728,000 rows — 567 MB of JSON — in 2.2 s, well inside a 5 s
+//! budget, all of it held in memory before the first byte leaves (release build,
+//! `tests/answer_size_measure.rs`; it is now refused after ~100 ms). So the answer is bounded
+//! as well, by the contract this crate shares with `ikigai-sparql`, whose items it copies
+//! verbatim ([`DEFAULT_MAX_ROWS`] through [`CappedWriter`]):
+//!
+//! - **What is counted:** rows for a SELECT, triples for a CONSTRUCT or DESCRIBE, and the
+//!   serialized BYTES for every form. **ASK is exempt** (its answer is one boolean). Counting
+//!   happens WHILE serializing: the row past the bound is refused before it is written, and
+//!   the serializer writes into a [`CappedWriter`], which refuses the write that would cross
+//!   the byte bound. Nothing is collected first and measured after.
+//! - **Refuse, never truncate.** Past either bound the request is refused with
+//!   [`Error::InvalidArgument`] on `query` ([`too_large`]); no partial body ever leaves.
+//! - **The base** every caller gets is [`AnswerBound::DEFAULT`] ([`DEFAULT_MAX_ROWS`],
+//!   [`DEFAULT_MAX_BYTES`]); **the ceiling** is [`AnswerBound::CEILING`] ([`CEILING_MAX_ROWS`],
+//!   [`CEILING_MAX_BYTES`]), and root gets it. Both are a host's to lower ([`AnswerBudget`],
+//!   set with [`DurableStore::with_answer_budget`](crate::DurableStore::with_answer_budget)).
+//! - **A grant raises it** — this crate's half, where `ikigai-sparql` takes the bound from the
+//!   space — monotone in grants for the reason the time budget is:
+//!   `urn:cap:store:answer:<rows>` ([`cap_answer`]) and `urn:cap:store:answer:bytes:<bytes>`
+//!   ([`cap_answer_bytes`]), each never above its ceiling. "Ask the host for more", in the
+//!   refusal, means one of these.
+//! - **A request can only lower it**, with `max_rows=` and `max_bytes=` ([`effective_answer`]),
+//!   read with [`inline_bound`] as `budget=` is: present but not inline is refused, never
+//!   ignored, because ignoring it would answer under the capability's bound where a host's
+//!   door meant to stamp a smaller one.
+//!
+//! ⚠ **What it does not bound: memory oxigraph spends BEFORE the first row.** An `ORDER BY`,
+//! `DISTINCT`, `GROUP BY` or the build side of a join materializes its input inside the
+//! evaluator, where this crate cannot count it; that is bounded by time (above), not by this.
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ikigai_core::{Capability, Error, Result};
+use ikigai_core::{ArgRef, Capability, Error, Invocation, Result};
 use oxigraph::sparql::CancellationToken;
 use spargebra::algebra::{
     AggregateExpression, Expression, GraphPattern, OrderExpression, PropertyPathExpression,
 };
 use spargebra::{GraphUpdateOperation, Query, Update};
+use std::io::Write;
 
 /// The budget every caller gets unless the host says otherwise: **5 seconds**, the same as
 /// `ikigai-sparql`'s.
@@ -489,6 +524,421 @@ where
     match outcome {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+// ------------------------------------------------------------------ the size of an answer
+
+// ★ COPY: from `ikigai-sparql` 0.1.13's `budget` module (ikigai-rs/ikigai-linkeddata PR #29),
+// VERBATIM from `DEFAULT_MAX_ROWS` through `CappedWriter`, apart from the crate name in the
+// doctests — so ledger #976 can fold both into one crate mechanically. Change both or neither.
+// What is this crate's own is below the copy: where a caller's bound comes from (a capability,
+// `AnswerBudget`) rather than from the space.
+
+/// The most rows an answer may hold when its host names no other bound: **100,000**.
+///
+/// A row is a solution of a `SELECT` or a triple of a `CONSTRUCT` or `DESCRIBE`; an `ASK` has
+/// none. The heaviest legitimate query found in the ecosystem (the survey behind
+/// [`DEFAULT_BUDGET`]) answers with 11,445 triples, so this is almost nine times that. A
+/// caller that wants more pages with `LIMIT` and `OFFSET`, which is what a bound should make
+/// it do. Counted while the answer is serialized, and the row past the bound is refused, never
+/// dropped.
+pub const DEFAULT_MAX_ROWS: u64 = 100_000;
+
+/// The most serialized bytes an answer may hold when its host names no other bound:
+/// **16 MiB**.
+///
+/// Rows vary in width far more than in count, so rows alone do not bound memory: a
+/// three-variable `SELECT` row of small literals is about 275 bytes as SPARQL JSON results
+/// (measured: 1,000,000 rows, 274,760,059 bytes), and a row of long literals can be any size.
+/// At that width this bound binds first, at about 61,000 rows. Counted at every write the
+/// serializer makes, and the write past the bound is refused, never cut.
+pub const DEFAULT_MAX_BYTES: u64 = 16 << 20;
+
+/// The most rows any host may allow an answer: **10,000,000**. A host asking for more when
+/// it builds its bound is refused ([`AnswerBound::new`]).
+pub const CEILING_MAX_ROWS: u64 = 10_000_000;
+
+/// The most serialized bytes any host may allow an answer: **1 GiB**. A host asking for more
+/// when it builds its bound is refused ([`AnswerBound::new`]).
+pub const CEILING_MAX_BYTES: u64 = 1 << 30;
+
+/// How large one answer may be: at most [`rows`](AnswerBound::rows) rows and at most
+/// [`bytes`](AnswerBound::bytes) serialized bytes, both at least 1 and at most
+/// [`AnswerBound::CEILING`].
+///
+/// ```
+/// use ikigai_store::budget::{AnswerBound, CEILING_MAX_ROWS, DEFAULT_MAX_BYTES};
+///
+/// let bound = AnswerBound::new(1_000_000, DEFAULT_MAX_BYTES).unwrap();
+/// assert_eq!(bound.rows(), 1_000_000);
+/// assert!(AnswerBound::new(CEILING_MAX_ROWS + 1, DEFAULT_MAX_BYTES).is_err());
+/// assert!(AnswerBound::new(0, DEFAULT_MAX_BYTES).is_err());
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnswerBound {
+    rows: u64,
+    bytes: u64,
+}
+
+impl AnswerBound {
+    /// [`DEFAULT_MAX_ROWS`] and [`DEFAULT_MAX_BYTES`]: the bound of a space whose host named
+    /// none.
+    pub const DEFAULT: AnswerBound = AnswerBound {
+        rows: DEFAULT_MAX_ROWS,
+        bytes: DEFAULT_MAX_BYTES,
+    };
+
+    /// [`CEILING_MAX_ROWS`] and [`CEILING_MAX_BYTES`]: the largest bound a host may set.
+    pub const CEILING: AnswerBound = AnswerBound {
+        rows: CEILING_MAX_ROWS,
+        bytes: CEILING_MAX_BYTES,
+    };
+
+    /// A bound of `rows` rows and `bytes` bytes. Either one zero or over its ceiling is
+    /// refused, naming `max_rows` or `max_bytes`: a host configuration that asks for more than
+    /// the ceiling is a mistake to say out loud, not one to quietly clamp.
+    pub fn new(rows: u64, bytes: u64) -> Result<Self> {
+        let check = |name: &str, value: u64, ceiling: u64, unit: &str| {
+            if value == 0 || value > ceiling {
+                Err(Error::InvalidArgument {
+                    name: name.to_string(),
+                    detail: format!(
+                        "an answer bound of {value} {unit} is out of range: it must be at least \
+                         1 and at most {ceiling} {unit}"
+                    ),
+                })
+            } else {
+                Ok(value)
+            }
+        };
+        Ok(AnswerBound {
+            rows: check("max_rows", rows, CEILING_MAX_ROWS, "rows")?,
+            bytes: check("max_bytes", bytes, CEILING_MAX_BYTES, "bytes")?,
+        })
+    }
+
+    /// The most rows (solutions, or triples) an answer may hold.
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// The most serialized bytes an answer may hold.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Default for AnswerBound {
+    fn default() -> Self {
+        AnswerBound::DEFAULT
+    }
+}
+
+/// The bound that applies to one answer: the space's, with each of the request's `max_rows=`
+/// and `max_bytes=` applied when it is SMALLER. Like [`effective_budget`], a request can only
+/// lower its bound, and a value that is not a positive whole number is refused, naming the
+/// argument.
+///
+/// ```
+/// use ikigai_store::budget::{effective_answer, AnswerBound};
+///
+/// let space = AnswerBound::DEFAULT;
+/// assert_eq!(effective_answer(None, None, space).unwrap(), space);
+/// let lowered = effective_answer(Some("10"), Some("4096"), space).unwrap();
+/// assert_eq!((lowered.rows(), lowered.bytes()), (10, 4096));
+/// // Asking for more than the space's bound gets the space's bound.
+/// let asked = effective_answer(Some("999999999"), None, space).unwrap();
+/// assert_eq!(asked.rows(), space.rows());
+/// assert!(effective_answer(Some("0"), None, space).is_err());
+/// assert!(effective_answer(None, Some("16MiB"), space).is_err());
+/// ```
+pub fn effective_answer(
+    max_rows: Option<&str>,
+    max_bytes: Option<&str>,
+    space: AnswerBound,
+) -> Result<AnswerBound> {
+    let lower = |name: &str, requested: Option<&str>, bound: u64, unit: &str| {
+        let Some(text) = requested else {
+            return Ok(bound);
+        };
+        match text.trim().parse::<u64>() {
+            Ok(n) if n > 0 => Ok(bound.min(n)),
+            _ => Err(Error::InvalidArgument {
+                name: name.to_string(),
+                detail: format!(
+                    "`{text}` is not an answer bound: give a positive whole number of {unit}. \
+                     It can only lower the bound this space applies ({bound} {unit}), never \
+                     raise it"
+                ),
+            }),
+        }
+    };
+    Ok(AnswerBound {
+        rows: lower("max_rows", max_rows, space.rows, "rows")?,
+        bytes: lower("max_bytes", max_bytes, space.bytes, "bytes")?,
+    })
+}
+
+/// A bounding argument (`budget=`, `max_rows=`, `max_bytes=`) as inline text: `None` when
+/// the request does not carry it, and a refusal naming it when it is given any other way — by
+/// reference, as content, or as bytes that are not UTF-8.
+///
+/// Refused, not ignored: an ignored bound falls back to the space's own, and a host door that
+/// stamps a smaller bound only when the caller sent none would see one present and stamp
+/// nothing. The caller would have bypassed the door by sending its bound as a reference.
+pub fn inline_bound<'a>(inv: &Invocation<'a>, name: &str) -> Result<Option<&'a str>> {
+    let request = inv.request;
+    let refuse = |how: &str| Error::InvalidArgument {
+        name: name.to_string(),
+        detail: format!(
+            "`{name}=` was given {how}: a bound is read only as an inline value, and one given \
+             any other way is refused rather than ignored, because ignoring it would apply this \
+             space's own bound in place of the one a host's door meant to stamp (ledger #970)"
+        ),
+    };
+    match request.args.get(name) {
+        None => Ok(None),
+        Some(ArgRef::Inline(bytes)) => std::str::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| refuse("as bytes that are not UTF-8 text")),
+        Some(ArgRef::Reference(_)) => Err(refuse("by reference")),
+        Some(ArgRef::Content(_)) => Err(refuse("as interned content")),
+    }
+}
+
+/// What an answer bound counts, for [`too_large`]'s wording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Measure {
+    /// Solutions of a `SELECT`.
+    Rows,
+    /// Triples of a `CONSTRUCT` or `DESCRIBE`; bounded by `max_rows=` all the same.
+    Triples,
+    /// Serialized bytes, of any form but `ASK`.
+    Bytes,
+}
+
+/// The refusal for an answer over its [`AnswerBound`]: [`Error::InvalidArgument`] on `query`,
+/// naming the bound, its value and the cure. Never cached, like every refusal.
+///
+/// ```
+/// use ikigai_store::budget::{too_large, Measure};
+///
+/// let text = too_large(Measure::Rows, 100_000).to_string();
+/// assert!(text.contains(
+///     "the answer exceeds 100000 rows; add LIMIT, narrow the query, or ask the host for more"
+/// ));
+/// ```
+pub fn too_large(measure: Measure, bound: u64) -> Error {
+    let (unit, arg) = match measure {
+        Measure::Rows => ("rows", "max_rows"),
+        Measure::Triples => ("triples", "max_rows"),
+        Measure::Bytes => ("bytes", "max_bytes"),
+    };
+    Error::InvalidArgument {
+        name: "query".to_string(),
+        detail: format!(
+            "the answer exceeds {bound} {unit}; add LIMIT, narrow the query, or ask the host for \
+             more. It was refused, not truncated: no part of it was sent (ledger #970). A \
+             request's `{arg}=` can only lower this bound"
+        ),
+    }
+}
+
+/// A [`Write`] that keeps what is written in memory and refuses the write that would take it
+/// past `cap` bytes, remembering that it did. An answer serializer writes into one, so the
+/// byte bound is enforced as the answer is produced, not measured after it was all held.
+///
+/// The serializer's own error for the refused write is not the answer's refusal: check
+/// [`over`](CappedWriter::over) and refuse with [`too_large`].
+///
+/// ```
+/// use ikigai_store::budget::CappedWriter;
+/// use std::io::Write;
+///
+/// let mut out = CappedWriter::new(8);
+/// out.write_all(b"12345678").unwrap();
+/// assert!(!out.over());
+/// assert!(out.write_all(b"9").is_err());
+/// assert!(out.over());
+/// assert_eq!(out.into_bytes(), b"12345678");
+/// ```
+#[derive(Debug)]
+pub struct CappedWriter {
+    bytes: Vec<u8>,
+    cap: u64,
+    over: bool,
+}
+
+impl CappedWriter {
+    /// An empty writer that holds at most `cap` bytes.
+    pub fn new(cap: u64) -> Self {
+        CappedWriter {
+            bytes: Vec::new(),
+            cap,
+            over: false,
+        }
+    }
+
+    /// Whether a write was refused for passing the cap.
+    pub fn over(&self) -> bool {
+        self.over
+    }
+
+    /// What was written, never more than the cap.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for CappedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len() as u64 + buf.len() as u64 > self.cap {
+            self.over = true;
+            return Err(std::io::Error::other(format!(
+                "the answer passed its bound of {} bytes",
+                self.cap
+            )));
+        }
+        // Grow by doubling, as a Vec would, but never past the cap: the bound is on memory,
+        // and a plain Vec's doubling would reserve up to twice the cap.
+        let needed = self.bytes.len() + buf.len();
+        if needed > self.bytes.capacity() {
+            let target = (self.bytes.capacity() * 2)
+                .max(needed)
+                .min(usize::try_from(self.cap).unwrap_or(usize::MAX));
+            self.bytes.reserve_exact(target - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// ★ END COPY. What follows is this crate's own: the bound comes from the CAPABILITY.
+
+/// The family of answer-size grants: `urn:cap:store:answer:<rows>` and
+/// `urn:cap:store:answer:bytes:<bytes>`. Like [`CAP_BUDGET`], required by no endpoint —
+/// holding none is the ordinary case, and gets the base.
+pub const CAP_ANSWER: &str = "urn:cap:store:answer:*";
+
+/// The grant that lets an answer have up to `rows` rows or triples (clamped to the store's
+/// ceiling).
+///
+/// ```
+/// assert_eq!(ikigai_store::budget::cap_answer(500_000), "urn:cap:store:answer:500000");
+/// ```
+pub fn cap_answer(rows: u64) -> String {
+    format!("{}{rows}", CAP_ANSWER.trim_end_matches('*'))
+}
+
+/// The grant that lets an answer serialize to up to `bytes` bytes (clamped to the store's
+/// ceiling).
+///
+/// ```
+/// assert_eq!(
+///     ikigai_store::budget::cap_answer_bytes(268_435_456),
+///     "urn:cap:store:answer:bytes:268435456"
+/// );
+/// ```
+pub fn cap_answer_bytes(bytes: u64) -> String {
+    format!("{}bytes:{bytes}", CAP_ANSWER.trim_end_matches('*'))
+}
+
+/// How large a store's SPARQL answers may be: a base every caller gets, and a ceiling that
+/// root gets and grants are clamped to. See the module docs, section 4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnswerBudget {
+    base: AnswerBound,
+    ceiling: AnswerBound,
+}
+
+impl Default for AnswerBudget {
+    /// [`AnswerBound::DEFAULT`] for every caller, under [`AnswerBound::CEILING`].
+    fn default() -> Self {
+        AnswerBudget {
+            base: AnswerBound::DEFAULT,
+            ceiling: AnswerBound::CEILING,
+        }
+    }
+}
+
+impl AnswerBudget {
+    /// A base of `base` for every caller, under [`AnswerBound::CEILING`].
+    pub fn new(base: AnswerBound) -> Self {
+        AnswerBudget {
+            base,
+            ceiling: AnswerBound::CEILING,
+        }
+    }
+
+    /// Set the ceiling: what root gets, and the most a grant can lift a caller to. A ceiling
+    /// below the base lowers the base to it, so no caller ever gets more than this.
+    pub fn with_ceiling(mut self, ceiling: AnswerBound) -> Self {
+        self.ceiling = ceiling;
+        self.base = AnswerBound {
+            rows: self.base.rows.min(ceiling.rows),
+            bytes: self.base.bytes.min(ceiling.bytes),
+        };
+        self
+    }
+
+    /// What every caller gets.
+    pub fn base(&self) -> AnswerBound {
+        self.base
+    }
+
+    /// What root gets, and the most anyone gets.
+    pub fn ceiling(&self) -> AnswerBound {
+        self.ceiling
+    }
+
+    /// The bound a caller holding `capability` gets: the ceiling for root; otherwise, for rows
+    /// and bytes each, the largest grant it holds ([`cap_answer`], [`cap_answer_bytes`]),
+    /// never below the base and never above the ceiling.
+    ///
+    /// ```
+    /// use ikigai_core::Capability;
+    /// use ikigai_store::budget::{cap_answer, cap_answer_bytes, AnswerBound, AnswerBudget};
+    ///
+    /// let budget = AnswerBudget::new(AnswerBound::new(1_000, 1 << 20)?)
+    ///     .with_ceiling(AnswerBound::new(50_000, 64 << 20)?);
+    /// let anonymous = Capability::scoped(["urn:cap:store:read"]);
+    /// let export = Capability::scoped([cap_answer(20_000), cap_answer_bytes(32 << 20)]);
+    /// let greedy = Capability::scoped([cap_answer(u64::MAX)]);
+    /// assert_eq!(budget.for_capability(&anonymous), budget.base());
+    /// assert_eq!(budget.for_capability(&export), AnswerBound::new(20_000, 32 << 20)?);
+    /// // A row grant raises rows and nothing else.
+    /// assert_eq!(budget.for_capability(&greedy), AnswerBound::new(50_000, 1 << 20)?);
+    /// assert_eq!(budget.for_capability(&Capability::root()), budget.ceiling());
+    /// # Ok::<(), ikigai_core::Error>(())
+    /// ```
+    pub fn for_capability(&self, capability: &Capability) -> AnswerBound {
+        let Some(scopes) = capability.scopes() else {
+            return self.ceiling;
+        };
+        let prefix = CAP_ANSWER.trim_end_matches('*');
+        let (mut rows, mut bytes) = (0u64, 0u64);
+        for grant in scopes
+            .iter()
+            .filter(|scope| capability.allows(scope))
+            .filter_map(|scope| scope.strip_prefix(prefix))
+        {
+            if let Some(n) = grant.strip_prefix("bytes:") {
+                if let Ok(n) = n.parse::<u64>() {
+                    bytes = bytes.max(n);
+                }
+            } else if let Ok(n) = grant.parse::<u64>() {
+                rows = rows.max(n);
+            }
+        }
+        AnswerBound {
+            rows: rows.max(self.base.rows).min(self.ceiling.rows),
+            bytes: bytes.max(self.base.bytes).min(self.ceiling.bytes),
+        }
     }
 }
 
@@ -889,6 +1339,53 @@ mod tests {
         });
         assert!(caught.is_err());
         assert_eq!(overdue.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn answer_grants_are_monotone_and_clamped() {
+        let budget = AnswerBudget::default();
+        let held = |grants: &[String]| budget.for_capability(&Capability::scoped(grants.to_vec()));
+        assert_eq!(held(&[]), AnswerBound::DEFAULT);
+        // A grant below the base is not a way to get less.
+        assert_eq!(held(&[cap_answer(10)]).rows(), DEFAULT_MAX_ROWS);
+        assert_eq!(
+            held(&[cap_answer(200_000), cap_answer(400_000)]).rows(),
+            400_000
+        );
+        assert_eq!(held(&[cap_answer(u64::MAX)]).rows(), CEILING_MAX_ROWS);
+        assert_eq!(
+            held(&[cap_answer_bytes(u64::MAX)]).bytes(),
+            CEILING_MAX_BYTES
+        );
+        // A byte grant raises bytes and nothing else.
+        assert_eq!(held(&[cap_answer_bytes(u64::MAX)]).rows(), DEFAULT_MAX_ROWS);
+        // Not a number: not a grant.
+        assert_eq!(
+            held(&[
+                "urn:cap:store:answer:all".to_string(),
+                "urn:cap:store:answer:bytes:lots".to_string()
+            ]),
+            AnswerBound::DEFAULT
+        );
+        assert_eq!(
+            budget.for_capability(&Capability::root()),
+            AnswerBound::CEILING
+        );
+        let tight = AnswerBudget::new(AnswerBound::new(500_000, 1 << 30).unwrap())
+            .with_ceiling(AnswerBound::new(1_000, 1 << 20).unwrap());
+        assert_eq!(tight.base(), AnswerBound::new(1_000, 1 << 20).unwrap());
+    }
+
+    #[test]
+    fn the_shared_constants_and_wording_are_the_contracts() {
+        // ledger #970: identical in `ikigai-sparql`; change both or neither.
+        assert_eq!(DEFAULT_MAX_ROWS, 100_000);
+        assert_eq!(DEFAULT_MAX_BYTES, 16 * 1024 * 1024);
+        assert_eq!(CEILING_MAX_ROWS, 10_000_000);
+        assert_eq!(CEILING_MAX_BYTES, 1024 * 1024 * 1024);
+        assert!(too_large(Measure::Triples, 7).to_string().contains(
+            "the answer exceeds 7 triples; add LIMIT, narrow the query, or ask the host for more"
+        ));
     }
 
     fn cost(text: &str) -> (usize, usize) {
