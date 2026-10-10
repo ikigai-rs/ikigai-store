@@ -66,6 +66,13 @@
 //! request ([`DurableStore::spaces_bound`] has the rule). Bind every space before the
 //! first read, and prefer one kernel per process where you can.
 //!
+//! ⚠ **One space per kernel — never one space shared by several** (ledger #761). Memoize the
+//! `DurableStore`, not the space: one `Arc` of the space (or of a composite holding it)
+//! handed to two kernels is one binding to this crate and two caches to the kernels, so a
+//! write through one leaves the other serving a stale cached read, with no bound and with
+//! `info` still saying `covered: true`. This crate cannot see that shape — an endpoint is
+//! not told which kernel invoked it — so the rule above is the only protection there is.
+//!
 //! # Getting a value in without it becoming syntax
 //!
 //! A query and an update are strings, so a consumer interpolating user text into one is
