@@ -125,6 +125,40 @@ fn request(case: &str, n: usize) -> (Verb, String, Vec<(&'static str, String)>) 
                 format!("SELECT * WHERE {{ FILTER(1{} > 0) }}", "+1".repeat(n)),
             )],
         ),
+        // `1*1*…`: a flat arithmetic chain, one algebra node a term, which the evaluator
+        // recurses over once per term at ~45 KiB a level in a DEBUG build (ledger #1003).
+        "mul-chain" => (
+            Verb::Source,
+            "urn:iki:store:select".to_string(),
+            vec![(
+                "query",
+                format!("SELECT * WHERE {{ FILTER(1{} > 0) }}", "*1".repeat(n)),
+            )],
+        ),
+        "update-mul-chain" => (
+            Verb::Sink,
+            "urn:iki:store:update".to_string(),
+            vec![(
+                "content",
+                format!(
+                    "INSERT {{ <urn:s> <urn:p> <urn:o> }} WHERE {{ FILTER(1{} > 0) }}",
+                    "*1".repeat(n)
+                ),
+            )],
+        ),
+        // `IN` is one algebra node however long its list, and the evaluator rewrites it into
+        // an `||` of `=`, one level a member: ~1.2 KiB of stack a byte in a DEBUG build.
+        "in-list" => (
+            Verb::Source,
+            "urn:iki:store:select".to_string(),
+            vec![(
+                "query",
+                format!(
+                    "SELECT * WHERE {{ FILTER(1 IN ({})) }}",
+                    vec!["1"; n.max(1)].join(",")
+                ),
+            )],
+        ),
         // Not SPARQL at all, and here as evidence: oxttl's Turtle parser keeps its own stack,
         // so a deeply nested document does not recurse.
         "load-bnodes" => (
@@ -399,8 +433,9 @@ fn a_query_past_the_byte_bound_is_refused_by_name() {
 /// past what a 2 MiB thread holds (~2,000 terms), runs on the stack `on_sparql_stack` sizes
 /// for it. Not run at the byte bound itself only because the evaluator is QUADRATIC in a
 /// chain's length — 40,000 terms take ~30 s, 80,000 more than two minutes — which is a CPU
-/// cost this crate does not bound (see the README). A debug build spends ~20-50x the stack
-/// per level, which `src/limits.rs` states as the limit of the guarantee.
+/// cost this crate bounds in time, not here (see the README). It is a release-build test for
+/// its running time only: a debug build sizes its thread for its own frames
+/// (`limits::sparql_stack_size`, ledger #1003), but evaluates far slower.
 ///
 ///     cargo test --release --test sparql_nesting -- --ignored --nocapture
 #[test]
@@ -408,4 +443,38 @@ fn a_query_past_the_byte_bound_is_refused_by_name() {
 fn a_chain_twenty_times_what_a_worker_stack_holds_runs() {
     let outcome = probe("or1-chain", 40_000);
     assert!(outcome.starts_with("ok "), "{outcome}");
+}
+
+// ------------------------------------------------------------------ debug and release agree
+
+#[test]
+fn an_arithmetic_chain_at_the_algebra_bound_runs_in_every_build() {
+    // Ledger #1003: inside MAX_ALGEBRA_NODES (1024), so nothing refuses it, and a DEBUG build
+    // aborted at ~405 terms on the 16 MiB + 512 B a byte the release sizing gives. It runs, in
+    // both. In `FILTER(1 op 1 … > 0)` the `Filter` and `>` are two nodes and each term one
+    // more; a query adds a `Project`, an update's WHERE does not.
+    for (case, at_bound) in [
+        ("plus-chain", 1024 - 3),
+        ("mul-chain", 1024 - 3),
+        ("update-mul-chain", 1024 - 2),
+    ] {
+        let outcome = probe(case, at_bound);
+        assert!(outcome.starts_with("ok"), "{case}: {outcome}");
+        let over = probe(case, at_bound + 1);
+        assert!(over.contains("MAX_ALGEBRA_NODES"), "{case}: {over}");
+    }
+}
+
+/// The costliest shapes per byte that the algebra bound cannot refuse before they recurse,
+/// at the byte bound itself: the parse of a `1*1*…` chain (refused by the algebra bound only
+/// after it), and an `IN` list (one node however long, evaluated one level a member). In a
+/// debug build this reserves a ~2 GiB thread and touches about half of it, so it is also the
+/// check that a thread that size can be started on the platform CI runs (~4 s, debug).
+#[test]
+fn the_costliest_shapes_per_byte_at_the_byte_bound_abort_nothing() {
+    let room = (1 << 20) - 64;
+    let outcome = probe("mul-chain", room / 2);
+    assert!(outcome.contains("MAX_ALGEBRA_NODES"), "{outcome}");
+    let outcome = probe("in-list", room / 2);
+    assert!(outcome.starts_with("ok"), "{outcome}");
 }

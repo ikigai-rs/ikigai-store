@@ -23,8 +23,8 @@
 //! | `!` prefix (parse error at the end, so `run` measures the parse) | 1383 | 5228 | 1383 | 5228 |
 //! | `+1` chain | 1149 | 4091 | 46 | 3282 |
 //! | `\|\|` chain | 18739 | 32912 | 299 | 2085 |
-//! | `\|\|1` chain, 3 bytes a term | | 32912 | | 2085 |
-//! | `*1` chain | | 4091 | | 3282 |
+//! | `\|\|1` chain, 3 bytes a term | | 32912 | 299 | 2085 |
+//! | `*1` chain | 1149 | 4091 | 46 | 3282 |
 //! | `/:a` path | | 4366 | | 1877 (then > 20 s) |
 //! | `/` path | 764 | 4366 | 100 | 1877 (then > 20 s) |
 //! | `UNION` chain | 4807 | 16398 | 165 | 1132 |
@@ -32,9 +32,19 @@
 //! | triple patterns | | | | 1878 (then > 20 s) |
 //! | `FILTER` list | | | | 2086 |
 //! | `BIND` list | | | | 1250 |
-//! | `IN (…)` list | | | | 8759 |
-//! | `VALUES`, `INSERT DATA` | | | | ≥ 40000, flat |
+//! | `IN (…)` list | ≥ 400000 | | 826 | 8759 |
+//! | `1 IN (1,1,…)`, 2 bytes a member | | | 825 | 8758 |
+//! | `COALESCE(1,1,…)`, `CONCAT(…)` | | | ≥ 600000, flat | |
+//! | `VALUES` | | | ≥ 600000, flat | ≥ 40000, flat |
+//! | `INSERT DATA` | | | | ≥ 40000, flat |
 //! | unary `-`, `+`, path `^` | ≥ 20000, no recursion | | | |
+//!
+//! Re-measured in a DEBUG build 2026-10-09 for ledger #1003 (`run, debug` for the chains and
+//! lists; `IN` and the arithmetic chains also in release). Per byte, the costliest debug
+//! shapes are `1 IN (1,1,…)` evaluated (~1,245 bytes of stack a byte: `IN` is one algebra node
+//! however long, rewritten into one `||` level a member) and an arithmetic chain parsed
+//! (~900); per algebra node, an arithmetic chain evaluated (~45 KiB). `src/limits.rs`'s
+//! `DEBUG_STACK_PER_BYTE` and `DEBUG_STACK_PER_NODE` are sized from these.
 
 use oxigraph::model::{GraphNameRef, NamedNodeRef, QuadRef};
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
@@ -178,6 +188,40 @@ fn shape(name: &str, n: usize) -> (bool, String) {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+        ),
+        // The shortest IN member: `IN` costs one algebra node however long its list, but
+        // the evaluator rewrites it into an `||` of `=`, one level a member (ledger #1003).
+        "in1" => (
+            false,
+            format!(
+                "SELECT * WHERE {{ FILTER(1 IN ({})) }}",
+                vec!["1"; n.max(1)].join(",")
+            ),
+        ),
+        "in-var" => (
+            false,
+            format!(
+                "SELECT * WHERE {{ ?s ?p ?o FILTER(?o IN ({})) }}",
+                vec!["?o"; n.max(1)].join(",")
+            ),
+        ),
+        "coalesce" => (
+            false,
+            format!(
+                "SELECT * WHERE {{ FILTER(COALESCE({}) > 0) }}",
+                vec!["1"; n.max(1)].join(",")
+            ),
+        ),
+        "concat" => (
+            false,
+            format!(
+                "SELECT * WHERE {{ FILTER(CONCAT({}) != \"\") }}",
+                vec!["\"a\""; n.max(1)].join(",")
+            ),
+        ),
+        "values1" => (
+            false,
+            format!("SELECT * WHERE {{ VALUES ?x {{ {} }} }}", r("1 ", n)),
         ),
         "eqor" => (
             false,
