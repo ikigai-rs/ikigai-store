@@ -117,7 +117,7 @@ use oxigraph::model::{
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 
-use crate::budget::Deadline;
+use crate::budget::{too_large, AnswerBound, AnswerBudget, CappedWriter, Deadline, Measure};
 use crate::scope::GraphSet;
 use crate::store::DurableStore;
 
@@ -268,6 +268,7 @@ pub const GRAPH_UPDATE_THREAD: &str = "urn:iki:store:graph-update";
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_ANY_URI: &str = "http://www.w3.org/2001/XMLSchema#anyURI";
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+const XSD_POSITIVE_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#positiveInteger";
 
 /// Result serializations, SELECT/ASK first — index 0 is the default and the value a
 /// conformance walk synthesizes.
@@ -488,7 +489,16 @@ impl Endpoint for QueryEndpoint {
                 let this = self.clone();
                 let text = query.to_string();
                 let confined = target.clone();
-                let requested = optional_inline_str(inv, "budget")?;
+                let requested = crate::budget::inline_bound(inv, "budget")?;
+                // ★ …and within this caller's answer SIZE (ledger #970): rows (triples for a
+                // graph) and serialized bytes, counted while serializing and refused past the
+                // bound, never truncated. A grant raises it; `max_rows=`/`max_bytes=` only
+                // lower it, and either one present but not inline is refused, never ignored.
+                let answer = crate::budget::effective_answer(
+                    crate::budget::inline_bound(inv, "max_rows")?,
+                    crate::budget::inline_bound(inv, "max_bytes")?,
+                    self.store.answer_budget().for_capability(inv.capability),
+                )?;
                 let (media, bytes) = self.store.evaluate(
                     query,
                     false,
@@ -578,9 +588,9 @@ impl Endpoint for QueryEndpoint {
                         }
 
                         if this.graph_shaped {
-                            serialize_graph(results, as_type, deadline)
+                            serialize_graph(results, as_type, deadline, answer)
                         } else {
-                            serialize_solutions(results, as_type, deadline)
+                            serialize_solutions(results, as_type, deadline, answer)
                         }
                     },
                 )?;
@@ -697,7 +707,12 @@ impl Endpoint for QueryEndpoint {
                     .default_value(outputs[0])
                     .optional(),
             )
-            .input(budget_arg());
+            .input(budget_arg())
+            .input(answer_rows_arg(
+                self.store.answer_budget(),
+                self.graph_shaped,
+            ))
+            .input(answer_bytes_arg(self.store.answer_budget()));
         outputs.iter().fold(desc, |desc, media| desc.output(*media))
     }
 }
@@ -1153,7 +1168,7 @@ impl Endpoint for UpdateEndpoint {
                 // nothing. See `src/budget.rs`.
                 let store = Arc::clone(&self.store);
                 let text = update.to_string();
-                let requested = optional_inline_str(inv, "budget")?;
+                let requested = crate::budget::inline_bound(inv, "budget")?;
                 let (before, after) = self.store.evaluate(
                     update,
                     true,
@@ -1295,7 +1310,7 @@ impl Endpoint for GraphUpdateEndpoint {
                 let store = Arc::clone(&self.store);
                 let text = update.to_string();
                 let scope = target.clone();
-                let requested = optional_inline_str(inv, "budget")?;
+                let requested = crate::budget::inline_bound(inv, "budget")?;
                 let applied = self.store.evaluate(
                     update,
                     true,
@@ -1567,6 +1582,39 @@ fn budget_arg() -> ArgSpec {
         .optional()
 }
 
+/// The `max_rows` input every query door declares (ledger #970), worded and typed as
+/// `ikigai-sparql`'s, except that the bound it lowers is the capability's, not a space's.
+fn answer_rows_arg(budget: AnswerBudget, graph_shaped: bool) -> ArgSpec {
+    ArgSpec::new("max_rows")
+        .summary(format!(
+            "optional: the most {} the answer may hold (an ASK is exempt). A larger answer is \
+             refused, never truncated. It can only LOWER the bound this caller's capability \
+             gets ({} {} unless it holds a `urn:cap:store:answer:<rows>` grant; at most {}), \
+             never raise it",
+            if graph_shaped { "triples" } else { "rows" },
+            budget.base().rows(),
+            if graph_shaped { "triples" } else { "rows" },
+            budget.ceiling().rows(),
+        ))
+        .class(XSD_POSITIVE_INTEGER)
+        .optional()
+}
+
+/// The `max_bytes` input every query door declares (ledger #970); see [`answer_rows_arg`].
+fn answer_bytes_arg(budget: AnswerBudget) -> ArgSpec {
+    ArgSpec::new("max_bytes")
+        .summary(format!(
+            "optional: the most serialized bytes the answer may hold (an ASK is exempt). A \
+             larger answer is refused, never truncated. It can only LOWER the bound this \
+             caller's capability gets ({} bytes unless it holds a \
+             `urn:cap:store:answer:bytes:<bytes>` grant; at most {}), never raise it",
+            budget.base().bytes(),
+            budget.ceiling().bytes(),
+        ))
+        .class(XSD_POSITIVE_INTEGER)
+        .optional()
+}
+
 fn plain(text: String) -> Representation {
     Representation::new(
         ReprType::new("text/plain").with_param("charset", "utf-8"),
@@ -1613,27 +1661,44 @@ fn no_bindings(inv: &Invocation<'_>, iri: &str) -> Result<()> {
 /// A bound must refuse, not substitute: `as=text/turtle` on a SELECT returning JSON
 /// would make the declared `outputs` list true by accident, and a typo would come back
 /// as a plausible answer in the wrong syntax with nothing said.
+///
+/// ★ **And bounds the answer's size while it is serialized** (ledger #970), as
+/// `ikigai-sparql`'s `serialize_results` does: the row past `bound.rows()` is refused before
+/// it is serialized, and every write goes through a [`CappedWriter`] that refuses the one
+/// past `bound.bytes()`. Either way the answer is [`too_large`] and nothing of it is
+/// returned. ASK is exempt: its answer is one boolean.
 fn serialize_solutions(
     results: QueryResults,
     as_type: Option<&str>,
     deadline: &Deadline,
+    bound: AnswerBound,
 ) -> Result<(String, Vec<u8>)> {
     let io = |e: std::io::Error| Error::Endpoint(format!("serialize: {e}"));
     let format = results_format(as_type)?;
     let bytes = match results {
         QueryResults::Solutions(solutions) => {
             let variables = solutions.variables().to_vec();
-            let mut serializer = QueryResultsSerializer::from_format(format)
-                .serialize_solutions_to_writer(Vec::new(), variables)
-                .map_err(io)?;
-            for solution in solutions {
-                // oxigraph evaluates lazily, so the rows ARE the evaluation: a caller that
-                // gave up is not served another one.
-                deadline.check()?;
-                let solution = solution.map_err(|e| Error::Endpoint(format!("query: {e}")))?;
-                serializer.serialize(&solution).map_err(io)?;
-            }
-            serializer.finish().map_err(io)?
+            let mut out = CappedWriter::new(bound.bytes());
+            let written = (|| {
+                let mut serializer = QueryResultsSerializer::from_format(format)
+                    .serialize_solutions_to_writer(&mut out, variables)
+                    .map_err(io)?;
+                let mut rows: u64 = 0;
+                for solution in solutions {
+                    // oxigraph evaluates lazily, so the rows ARE the evaluation: a caller
+                    // that gave up is not served another one.
+                    deadline.check()?;
+                    rows += 1;
+                    if rows > bound.rows() {
+                        return Err(too_large(Measure::Rows, bound.rows()));
+                    }
+                    let solution = solution.map_err(|e| Error::Endpoint(format!("query: {e}")))?;
+                    serializer.serialize(&solution).map_err(io)?;
+                }
+                serializer.finish().map_err(io)?;
+                Ok(())
+            })();
+            capped(written, out, bound)?
         }
         QueryResults::Boolean(value) => QueryResultsSerializer::from_format(format)
             .serialize_boolean_to_writer(Vec::new(), value)
@@ -1665,10 +1730,13 @@ fn serialize_solutions(
 }
 
 /// Serialize a CONSTRUCT/DESCRIBE result, refusing an unusable `as` the same way.
+///
+/// Bounded like [`serialize_solutions`], counting triples (ledger #970).
 fn serialize_graph(
     results: QueryResults,
     as_type: Option<&str>,
     deadline: &Deadline,
+    bound: AnswerBound,
 ) -> Result<(String, Vec<u8>)> {
     let io = |e: std::io::Error| Error::Endpoint(format!("serialize: {e}"));
     let format = graph_format(as_type)?;
@@ -1677,18 +1745,38 @@ fn serialize_graph(
             "internal: a result set reached the graph serializer".to_string(),
         ));
     };
-    let mut serializer = RdfSerializer::from_format(format).for_writer(Vec::new());
-    for triple in triples {
-        deadline.check()?;
-        let triple = triple.map_err(|e| Error::Endpoint(format!("query: {e}")))?;
-        serializer
-            .serialize_quad(&triple.in_graph(GraphName::DefaultGraph))
-            .map_err(io)?;
-    }
+    let mut out = CappedWriter::new(bound.bytes());
+    let written = (|| {
+        let mut serializer = RdfSerializer::from_format(format).for_writer(&mut out);
+        let mut rows: u64 = 0;
+        for triple in triples {
+            deadline.check()?;
+            rows += 1;
+            if rows > bound.rows() {
+                return Err(too_large(Measure::Triples, bound.rows()));
+            }
+            let triple = triple.map_err(|e| Error::Endpoint(format!("query: {e}")))?;
+            serializer
+                .serialize_quad(&triple.in_graph(GraphName::DefaultGraph))
+                .map_err(io)?;
+        }
+        serializer.finish().map_err(io)?;
+        Ok(())
+    })();
     Ok((
         bare_media(format.media_type()).to_string(),
-        serializer.finish().map_err(io)?,
+        capped(written, out, bound)?,
     ))
+}
+
+/// The answer a serialization into `out` produced: its bytes, or the byte bound's refusal when
+/// `out` refused a write, whatever error the serializer made of that refusal. As
+/// `ikigai-sparql`'s.
+fn capped(written: Result<()>, out: CappedWriter, bound: AnswerBound) -> Result<Vec<u8>> {
+    if out.over() {
+        return Err(too_large(Measure::Bytes, bound.bytes()));
+    }
+    written.map(|()| out.into_bytes())
 }
 
 /// A media type without its parameters.

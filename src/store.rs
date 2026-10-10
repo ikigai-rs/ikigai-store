@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use ikigai_core::{Capability, Error, Result};
 use oxigraph::model::{GraphNameRef, NamedOrBlankNode};
 
-use crate::budget::{Deadline, TimeBudget};
+use crate::budget::{AnswerBudget, Deadline, TimeBudget};
 
 /// The canonical store type, re-exported so a host names ONE `Store`.
 ///
@@ -230,6 +230,8 @@ pub struct DurableStore {
     refused: bool,
     /// How long a SPARQL evaluation may run — see [`with_time_budget`](Self::with_time_budget).
     budget: TimeBudget,
+    /// How large a SPARQL answer may be — see [`with_answer_budget`](Self::with_answer_budget).
+    answer: AnswerBudget,
     /// How many evaluations are still running after their callers gave up, shared by every
     /// clone — see [`overdue_evaluations`](Self::overdue_evaluations).
     overdue: Arc<AtomicUsize>,
@@ -276,6 +278,7 @@ impl DurableStore {
             binding: None,
             refused: false,
             budget: TimeBudget::default(),
+            answer: AnswerBudget::default(),
             overdue: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -330,6 +333,7 @@ impl DurableStore {
             binding: None,
             refused: false,
             budget: TimeBudget::default(),
+            answer: AnswerBudget::default(),
             overdue: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -651,6 +655,32 @@ impl DurableStore {
     /// The time budget this store's evaluations run under.
     pub fn time_budget(&self) -> TimeBudget {
         self.budget
+    }
+
+    /// Set how large this store's SPARQL answers may be (builder). Every clone made AFTER
+    /// this carries it, so call it before [`space`](crate::space). The default is
+    /// [`AnswerBudget::default`]: 100,000 rows and 16 MiB for every caller; 10,000,000 rows
+    /// and 1 GiB for root and as the most a `urn:cap:store:answer:*` grant can lift a caller
+    /// to. [`crate::budget`] (section 4) has the contract (ledger #970).
+    ///
+    /// ```
+    /// use ikigai_store::budget::{AnswerBound, AnswerBudget};
+    /// use ikigai_store::DurableStore;
+    ///
+    /// // An anonymous door gets 1,000 rows and 1 MiB; the host's own doors hold a grant or root.
+    /// let store = DurableStore::in_memory()?
+    ///     .with_answer_budget(AnswerBudget::new(AnswerBound::new(1_000, 1 << 20)?));
+    /// assert_eq!(store.answer_budget().base().rows(), 1_000);
+    /// # Ok::<(), ikigai_core::Error>(())
+    /// ```
+    pub fn with_answer_budget(mut self, answer: AnswerBudget) -> Self {
+        self.answer = answer;
+        self
+    }
+
+    /// How large this store's SPARQL answers may be.
+    pub fn answer_budget(&self) -> AnswerBudget {
+        self.answer
     }
 
     /// How many SPARQL evaluations over this dataset are still running after their callers
