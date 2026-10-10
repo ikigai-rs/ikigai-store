@@ -107,7 +107,8 @@
 //! <http://…>` in a caller's query would be an outbound request no `urn:cap:net:*` gates. Every
 //! evaluator here installs a refusing handler instead, which works with or without the feature,
 //! and every door refuses a query or update containing `SERVICE` before evaluating it, as an
-//! `InvalidArgument` (ledger #1083; the `service` module has the details).
+//! `InvalidArgument` (ledger #1083). [`service`] has the details, and exports the refusing
+//! evaluator and the door checks for any crate that builds its own SPARQL evaluator.
 //!
 //! # …and evaluated within a time budget
 //!
@@ -273,7 +274,7 @@ pub mod depth;
 pub mod endpoints;
 pub mod limits;
 pub(crate) mod scope;
-pub(crate) mod service;
+pub mod service;
 pub mod sparql;
 pub mod store;
 

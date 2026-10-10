@@ -121,7 +121,7 @@ pub(crate) struct Applied {
 /// caller's time budget.
 ///
 /// The update is evaluated under `deadline`'s cancellation token (ledger #964). An update
-/// with a `LOAD` in it is refused here, before evaluation (ledger #992, [`refuse_load`]), and
+/// with a `LOAD` in it is refused here, before evaluation (ledger #992, [`crate::service::refuse_load`]), and
 /// so is one with a `SERVICE` in a `WHERE` (ledger #1083, [`crate::service`]).
 ///
 /// `unreadable` names the graphs the caller may write and may NOT read: graph-management
@@ -140,44 +140,15 @@ pub(crate) fn parse(
             name: "content".to_string(),
             detail: format!("not a SPARQL update: {e}"),
         })?;
-    refuse_load(&parsed)?;
+    crate::service::refuse_load(&parsed, "content")?;
     silence_graph_management(&mut parsed, unreadable);
     crate::budget::check_update(&parsed, "content")?;
     // ★ No `SERVICE` in a `WHERE`, refused by name, on an evaluator that refuses one itself in
     // every build (ledger #1083, `src/service.rs`).
-    crate::service::refuse_in_update(&parsed, "content")?;
+    crate::service::refuse_service_in_update(&parsed, "content")?;
     Ok(crate::service::evaluator()
         .with_cancellation_token(deadline.token())
         .for_update(parsed))
-}
-
-/// Refuse an update with a `LOAD <url>` in it, before anything is evaluated (ledger #992).
-///
-/// `LOAD` fetches a document and parses it INSIDE oxigraph, with nothing between the fetch and
-/// the parse where `urn:iki:store:load`'s depth scan ([`crate::depth`]) could stand: in a
-/// build with RDF 1.2 on, a fetched document nesting ~50,000 triple terms aborted the host on
-/// the `ikigai-store-sparql` thread (reproduced with `oxigraph/http-client` on). And the fetch
-/// is oxigraph's own, so in a host whose graph enables `oxigraph/http-client` (`ikigai-cli`
-/// does, through rudof) it is an outbound request no `urn:cap:net:*` gates (ledger #145).
-/// Without that feature `LOAD` already failed, at evaluation; it now fails at the door, by
-/// name, in every build. To bring a remote graph in, source it through the kernel (where the
-/// net capability applies) and sink it into `urn:iki:store:load`.
-fn refuse_load(update: &spargebra::Update) -> Result<()> {
-    let loads = update
-        .operations
-        .iter()
-        .any(|op| matches!(op, spargebra::GraphUpdateOperation::Load { .. }));
-    if loads {
-        return Err(Error::InvalidArgument {
-            name: "content".to_string(),
-            detail: "`LOAD` is not available through this store: it would fetch and parse a \
-                     document inside the SPARQL engine, unscanned for depth and ungated by any \
-                     network capability. Nothing was evaluated. Source the document through the \
-                     kernel and sink it into `urn:iki:store:load`"
-                .to_string(),
-        });
-    }
-    Ok(())
 }
 
 /// Which graphs the caller may write but may not read, for [`parse`] (ledger #761).
