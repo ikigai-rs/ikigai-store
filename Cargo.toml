@@ -179,7 +179,13 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # it to CEILING_MAX_ROWS 10,000,000 / CEILING_MAX_BYTES 1 GiB (root gets the ceiling); `max_rows=`/`max_bytes=` only
 # lower it; by-reference bounds refused. A patch: the API is additive.
 # ⚠ gonk's backup (361,607 rows, 121.6 MB) is refused without both answer grants; ship them in the same rollout.
-version = "0.2.9"
+# ★ 0.2.10 is THE DEBUG-STACK RELEASE (ledger #1003): through 0.2.9 the SPARQL thread was sized for a RELEASE build in
+# every build, and an unoptimized one spends up to ~70x the stack a level, so a debug host aborted on a `1*1*…` chain of
+# ~405 terms (inside MAX_ALGEBRA_NODES), on a long chain while PARSING it (before the algebra bound is checked), and on a
+# long `IN` list (one algebra node however long). `limits::sparql_stack_size` is now the one formula; with
+# debug_assertions it adds DEBUG_STACK_PER_NODE 64 KiB for each of MAX_ALGEBRA_NODES and takes DEBUG_STACK_PER_BYTE
+# 2 KiB a byte. Release sizing is unchanged. A patch: the API is additive (one function, two constants).
+version = "0.2.10"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
