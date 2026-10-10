@@ -8,7 +8,7 @@ concurrency:
 jobs:
   ci:
     uses: ikigai-rs/.github/.github/workflows/rust.yml@main
-    # `features: "*"` is `--all-features`, and it carries TWO jobs' worth of meaning.
+    # `features: "*"` is `--all-features`, and it carries THREE jobs' worth of meaning.
     #
     # 1. It keeps `persistent` on, which is NOT optional and must never be dropped. The
     #    durable backend lives behind `#[cfg(feature = "persistent")]`, and a cfg path
@@ -34,11 +34,15 @@ jobs:
     # (`ikigai-cli`), and that lives in the ecosystem's clock, not here — see
     # `ikigai-store-PENDING.md`.
     #
-    # ⚠ And not every upstream feature belongs under `*`: `oxigraph/http-client` must
-    # NOT be declared here. `scope.rs`'s SERVICE probe is designed to FAIL when it is on
-    # (federation with no `urn:cap:net:*` in sight), so adding it would turn a security
-    # tripwire into a red build. Compile-must-survive and must-not-be-on are different
-    # gates.
+    # 3. ★ It reaches `http-client`, a gate like `rdf-12`: it turns on `oxigraph/http-client`,
+    #    which `ikigai-cli` gets from rudof by unification, so `tests/service_egress.rs` runs
+    #    against a local stub in the build where `SERVICE` WOULD reach the network, and proves
+    #    it does not (ledger #1083). The default-features `test` job runs the same file
+    #    without it. ⚠ Until 0.2.10 this feature was deliberately undeclared, because the
+    #    SERVICE probes in `scope.rs` depended on there being no HTTP client; they now test the
+    #    evaluator this crate builds, which refuses in every build. Compile-must-survive and
+    #    must-not-be-on are still different gates — the point is that egress no longer
+    #    depends on the second one.
     #
     # `wasm-lib: true` keeps the in-memory face honest: it runs with DEFAULT features, so
     # it lints exactly the half of this crate that has no RocksDB in it.

@@ -197,6 +197,12 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # no API change, and the behavior change is that those three succeed uniformly for a write-only caller. The same arc
 # found the one-space-shared-by-several-kernels hazard NOT closable from here (an endpoint cannot see its kernel); it is
 # documented and pinned by a test, and the fix is the host's: a space per kernel over one memoized `DurableStore`.
+# ★ 0.2.10 ALSO closes SPARQL `SERVICE` egress (ledger #1083, p1 security), folded in before it published: in any host
+# whose graph enables `oxigraph/http-client` (rudof does, so `ikigai-cli` did), `SERVICE <http://…>` was an outbound
+# request at all ten doors with no `urn:cap:net:*`. Every evaluator now carries a refusing service handler (works in every
+# build) and every door refuses `SERVICE` before evaluation as InvalidArgument on `query`/`content`. Still a patch: no API
+# change; the behavior change is that `SERVICE` is refused, which already failed in any build without `http-client`, and a
+# `SERVICE SILENT` that used to answer empty is refused too. One new direct dependency, `oxiri` (already in the graph).
 version = "0.2.10"
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -233,6 +239,23 @@ persistent = ["oxigraph/rocksdb"]
 # sound direction is the other one: this feature ON implies the variant exists, which is
 # why the test that constructs a quoted triple may be cfg'd on it and the arm may not.
 rdf-12 = ["oxigraph/rdf-12"]
+# ⚠ A GATE too, and like `rdf-12` NEVER a `cfg` on a code path. `oxigraph/http-client` is what
+# `ikigai-cli` and `ikigai-web-demo` get by unification (rudof_rdf enables
+# `http-client-rustls-native` on every native target, through `ikigai-shacl`), and with it on,
+# every `SparqlEvaluator` installs a default HTTP service handler: `SERVICE <http://…>` in a
+# caller's query becomes an outbound request with no `urn:cap:net:*` near it (ledger #1083,
+# #145). This crate installs a refusing handler of its own on every evaluator it builds
+# (`src/service.rs`), which works with or without the feature; this line is how CI's
+# `features: "*"` builds the crate the way those hosts do and proves it.
+# ★ Only the CONTROL is cfg'd on it (raw oxigraph really does reach a local stub in this
+# build, so the refusal tests are not vacuous) — the sound direction, as for `rdf-12`. The
+# refusal itself must not be, because a host reaching the feature through rudof never enables
+# this one. Plain `http-client`, not a TLS variant: the handler switch is the base feature,
+# the stub is plain HTTP on 127.0.0.1, and a TLS backend would only add a `ring` build.
+# ⚠ Until 0.2.10 this feature was deliberately UNDECLARED, because `scope.rs`'s SERVICE probes
+# relied on there being no HTTP client. They now test the evaluator this crate builds instead,
+# which refuses in every build.
+http-client = ["oxigraph/http-client"]
 
 [dependencies]
 async-trait = "0.1"
@@ -269,6 +292,13 @@ oxigraph = { version = "0.5.1", default-features = false }
 # oxigraph 0.5.x moving to spargebra 0.5 — two spargebras, and `for_query` would not accept
 # ours. `sep-0006` because oxigraph enables it and the algebra walk names `Lateral`.
 spargebra = { version = "0.4.7", features = ["sep-0006"] }
+# Named only because `DefaultServiceHandler::handle` names `oxiri::Iri<String>` in its signature,
+# and neither oxigraph nor spargebra re-exports it: `src/service.rs` implements that trait to
+# refuse every `SERVICE` (ledger #1083). The type must be the SAME crate instance spareval uses,
+# so this follows spareval: 0.2.11 is what every oxigraph 0.5.x's spareval (0.2.1 through 0.2.7)
+# requires, and a caret unifies with it. ⚠ `"0.2.11"` is `<0.3.0`: an oxigraph that moves to
+# oxiri 0.3 makes this a type mismatch at compile time, never a silent fork.
+oxiri = "0.2.11"
 # The layered `store.toml`. `deny_unknown_fields` on the layer type is what makes a
 # misspelled key loud instead of ignored. Both crates are pure Rust and wasm-clean.
 serde = { version = "1", features = ["derive"] }

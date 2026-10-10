@@ -299,7 +299,7 @@ that defeat a syntactic check:
 | a sub-select, `FILTER EXISTS`/`NOT EXISTS`, a property path over another graph | confined the same way |
 | `DESCRIBE <s>` with no pattern | reads `G` |
 | `FROM` / `FROM NAMED` in the query text | **refused** — see below |
-| `SERVICE <http://…>` | refused: no HTTP client is built in — but see the feature warning below |
+| `SERVICE <http://…>` | **refused**, in every build — see `SERVICE` below |
 
 Four decisions worth stating:
 
@@ -628,6 +628,7 @@ must *not* be built here.
 | *(default)* | in-memory only, wasm-clean | — |
 | `persistent` | `DurableStore::open`, the RocksDB backend | `oxrocksdb-sys` (~494 s of CPU on a cache miss) and `libclang` in the toolchain |
 | `rdf-12` | nothing you would use — it turns on `oxigraph/rdf-12` so CI compiles this crate the way a consumer's graph does | a few seconds of `oxrdfio`/`spareval` |
+| `http-client` | nothing you would use — it turns on `oxigraph/http-client` so CI tests the `SERVICE` refusal the way `ikigai-cli`'s graph builds it | `oxhttp` and `url`, a few seconds |
 
 The same trade `ikigai-cli` makes for `quic` and `web`: in-memory is the default so the
 wasm face and cheap tests survive, and the heavy backend is opted into.
@@ -757,6 +758,36 @@ outbound request no `urn:cap:net:*` gates (ledger #145). Without the feature `LO
 failed at evaluation; it now fails at the door in every build. To bring a remote graph in,
 source it through the kernel, where the net capability applies, and sink it into
 `urn:iki:store:load`.
+
+### ★ `SERVICE` never leaves the process (ledger #1083)
+
+Any host whose graph enables `oxigraph/http-client` gets an HTTP service handler installed in
+every plain `SparqlEvaluator` — and rudof_rdf enables it on every native target, so any host
+linking `ikigai-shacl` (`ikigai-cli`, `ikigai-web-demo`'s server) has it, whether or not it ever
+asked. Through 0.2.9, `SERVICE <http://…>` in a caller's query was then an **outbound request
+at every one of the ten doors**, scoped reads and both update doors included, with no
+`urn:cap:net:*` anywhere near it (reproduced against a stub on 127.0.0.1: one request per door).
+This crate cannot turn a sibling's feature off, and oxigraph's own off switch is itself behind
+the feature.
+
+Two layers now close it, in every build, feature or not:
+
+- **Every evaluator this crate builds refuses every service itself.** `src/service.rs` installs
+  a refusing default service handler, which oxigraph accepts in every build and which, with the
+  feature on, replaces the HTTP one. No `SERVICE` — constant or variable name, `SILENT` or not —
+  reaches a network client. A unit test fails on any evaluator built another way.
+- **Every door refuses a query or update with a `SERVICE` anywhere in it**, before evaluating
+  anything, as an `InvalidArgument` on `query` (or `content`). Not a `Denied` naming
+  `urn:cap:net:*`: no grant opens this, so naming one would send a caller looking for a remedy
+  that does not exist. To bring remote data in, source it through the kernel, where the net
+  capability applies, and sink it into `urn:iki:store:load` — the same answer `LOAD` gets.
+
+`LOAD <url>` is **not** governed by the service handler (oxigraph builds `LOAD`'s client
+separately); the door refusal above is the only guard, and it holds. `FROM` / `FROM NAMED` are
+never fetched: oxigraph reads them as graph names in the store. `tests/service_egress.rs` pins
+all three against a local stub, and CI runs it twice: in the default build, and with this crate's
+`http-client` gate feature on (`features: "*"`), where a control proves raw oxigraph really does
+reach the stub — so the refusals are not vacuous.
 
 ⚠ What this does **not** bound: a triple term **built by SPARQL**. `INSERT DATA` text is bounded
 by `MAX_SPARQL_NESTING` (`<<` counts), but an update can wrap a STORED term in `TRIPLE(…)` and

@@ -100,6 +100,15 @@
 //! refused at both update doors: oxigraph would fetch and parse the document itself, with
 //! nothing between the two for a scan to stand in (ledger #992).
 //!
+//! # …and `SERVICE` never leaves the process
+//!
+//! A host whose graph enables `oxigraph/http-client` (any host linking `ikigai-shacl`: rudof
+//! turns it on) gives every plain `SparqlEvaluator` an HTTP service handler, so `SERVICE
+//! <http://…>` in a caller's query would be an outbound request no `urn:cap:net:*` gates. Every
+//! evaluator here installs a refusing handler instead, which works with or without the feature,
+//! and every door refuses a query or update containing `SERVICE` before evaluating it, as an
+//! `InvalidArgument` (ledger #1083; the `service` module has the details).
+//!
 //! # …and evaluated within a time budget
 //!
 //! Inside those bounds oxigraph is still superlinear (a 3 KB property path plans for 19 s, a
@@ -264,6 +273,7 @@ pub mod depth;
 pub mod endpoints;
 pub mod limits;
 pub(crate) mod scope;
+pub(crate) mod service;
 pub mod sparql;
 pub mod store;
 
