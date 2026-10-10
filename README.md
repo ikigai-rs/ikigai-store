@@ -963,7 +963,7 @@ after 25.8–28.8 s under its job scopes as they are, answered in 23.4–23.7 s 
 row has been serialized yet — which is why the backup above is refused only after its
 sort, 25 s in. That memory is bounded by time, not by this.
 
-## ★ Every update on a store runs on one thread (ledger #1127)
+## ★ Every update on a store runs on one thread (0.2.12, ledger #1127)
 
 Through 0.2.11 each update ran on a thread spawned for it, and on the RocksDB backing that
 made every read after a run of writes slower, until the memtable flushed. RocksDB draws the
@@ -977,7 +977,7 @@ Every term a query decodes is a lookup in that memtable, so the cost landed on r
 | 750 writes, debug, 0.2.11 | 1.2x to 8.4x (the store alone); 3.3x to 8.4x (through `ikigai-ledger`'s append) |
 | 5,000 writes, debug, 0.2.11 | 3.9x to 37x |
 | 750 writes, release, 0.2.11 | 2.8x to 13.9x |
-| 750 to 3,000 writes, debug and release, now | 0.94x to 1.10x |
+| 750 to 3,000 writes, debug and release, 0.2.12 | 0.94x to 1.10x |
 
 How bad it got depended on which seed a run reused, which is why gonk's CI saw it once and
 a rerun passed. Writes through one graph got faster too, because the scoped door reads the

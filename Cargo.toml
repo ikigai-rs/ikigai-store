@@ -210,7 +210,15 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # map_err'd it away. `service::refuse_service_with` / `refuse_service_in_update_with` take the caller's remedy after the
 # shared `SERVICE_REFUSAL`; `has_service` / `update_has_service` return the walk as a bool. The old functions and their
 # text are unchanged. A patch: the API is additive (four functions, one constant).
-version = "0.2.11"
+# ★ 0.2.12 is THE WRITER-THREAD RELEASE (ledger #1127): on RocksDB, a read right after a run of writes took 2.3x to
+# 37x what it took on a fresh copy, until the memtable flushed (gonk's 503 after 750 appends). RocksDB seeds the
+# generator that picks memtable skiplist heights from the thread id, each update committed on a thread spawned for it,
+# and such a thread usually reuses the last one's id, so every commit drew the same heights. Every update on a store
+# now runs on that store's one long-lived writer thread (`budget::Writer`, crate-private). A patch: no API change;
+# writes were already serialized by the write lock, so the only behavior change is which thread they run on.
+# Also ledger #1122: a stale ignored nesting test now asserts the refusal, and `limits::on_sparql_stack` documents
+# that work handed to another thread leaves its stack.
+version = "0.2.12"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
