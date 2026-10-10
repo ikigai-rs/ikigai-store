@@ -173,7 +173,13 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # update commits only while its caller waits; overdue evaluations are counted and capped (Unavailable). A patch: the
 # API is additive (`budget` module, `TimeBudget`, `with_time_budget`, `overdue_evaluations`, a direct spargebra dep).
 # ⚠ A scoped job that runs long (gonk's backup: 24.6 s) needs a budget grant in the same rollout (ledger #979).
-version = "0.2.8"
+# ★ 0.2.9 is THE ANSWER-SIZE RELEASE (ledger #970): every query door counts rows (triples) and serialized bytes
+# while serializing; past DEFAULT_MAX_ROWS 100,000 / DEFAULT_MAX_BYTES 16 MiB it refuses with InvalidArgument on
+# `query`, never truncated; ASK exempt; `urn:cap:store:answer:<rows>` and `urn:cap:store:answer:bytes:<bytes>` raise
+# it to CEILING_MAX_ROWS 10,000,000 / CEILING_MAX_BYTES 1 GiB (root gets the ceiling); `max_rows=`/`max_bytes=` only
+# lower it; by-reference bounds refused. A patch: the API is additive.
+# ⚠ gonk's backup (361,607 rows, 121.6 MB) is refused without both answer grants; ship them in the same rollout.
+version = "0.2.9"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
