@@ -667,7 +667,7 @@ Two layers now stand in front of the parser, at all ten doors:
 | --- | --- | --- |
 | `limits::MAX_SPARQL_BYTES` | 1 MiB | any query or update larger, refused before parsing |
 | `limits::MAX_SPARQL_NESTING` | 64 | brackets `(` `{` `[` `<<`, and runs of `!`, nested deeper — refused before parsing |
-| the SPARQL thread | 16 MiB + 512 bytes per byte of text | everything else that recurses, run on a stack sized for it |
+| the SPARQL thread | 16 MiB + 512 bytes per byte of text (a debug build: + 64 MiB, and 2 KiB a byte) | everything else that recurses, run on a stack sized for it |
 
 **The bounds refuse, never truncate**: the refusal is an `InvalidArgument` on `query` (or
 `content`) that names the bound. Real queries nest about 5 deep (a scan of ~700 across the
@@ -691,9 +691,15 @@ both readings and refuses on the deeper (`src/limits.rs` has the argument).
 
 ⚠ What this does **not** do, plainly:
 
-- **It is a release-build guarantee for the thread.** A debug build spends ~20–50× the stack
-  per level, so a long enough operator chain can still overflow a debug host. The nesting
-  bound holds in both.
+- **The thread is sized for the build** (ledger #1003). An unoptimized build spends up to
+  ~70× the stack per level, and through 0.2.9 a debug host aborted on a `1*1*…` chain of ~405
+  terms, well inside the algebra bound below. A build with `debug_assertions` now adds 64 KiB
+  for each of the 1,024 algebra nodes that bound admits, and takes 2 KiB a byte in place of
+  512 (an `IN` list is one node however long, and recurses once a member), so a debug and a
+  release host admit and answer the same queries. `limits::sparql_stack_size` is the one
+  formula. ⚠ It keys on `debug_assertions`, the only compile-time signal there is: a release
+  profile that turns optimization off without turning debug assertions on is the one it
+  undersizes.
 - **On wasm there are no threads**, so only the two bounds apply.
 - **It does not bound time.** The evaluator is quadratic in an operator chain: 40,000 `||1`
   terms (120 KB) take ~30 s of a core, 80,000 more than two minutes. The next section does

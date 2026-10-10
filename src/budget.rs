@@ -473,8 +473,7 @@ where
         )));
     }
     let (budget, write) = (deadline.budget, deadline.write);
-    let stack = crate::limits::STACK_BASE
-        .saturating_add(text.len().saturating_mul(crate::limits::STACK_PER_BYTE));
+    let stack = crate::limits::sparql_stack_size(text);
     let (tx, rx) = std::sync::mpsc::channel();
     let state = Arc::clone(&deadline.state);
     let token = deadline.token.clone();

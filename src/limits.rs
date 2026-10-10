@@ -26,9 +26,16 @@
 //!    A thread's stack is reserved address space, committed only as it is touched, so an
 //!    ordinary query costs the spawn and nothing else.
 //!
-//! ⚠ **The second layer is a RELEASE-build guarantee.** A debug build spends ~20–50× the
-//! stack per level (a 2 MiB thread holds 47 `+` terms when evaluating, unoptimized), so a
-//! debug host can still be overflowed by a long enough operator chain inside the byte bound.
+//! ★ **The thread is sized for the BUILD, so a debug and a release build admit and answer the
+//! same queries** (ledger #1003). An unoptimized build spends up to ~70× the stack per level (a
+//! 2 MiB thread holds 46 `+` terms when evaluating, against 3,282 in release), and through
+//! 0.2.9 the release sizing applied to both: a debug host aborted on a `1*1*…` chain of ~405
+//! terms, well inside [`crate::budget::MAX_ALGEBRA_NODES`]. [`sparql_stack_size`] adds, when
+//! `debug_assertions` are on, [`DEBUG_STACK_PER_NODE`] for every node the algebra bound
+//! admits and [`DEBUG_STACK_PER_BYTE`] in place of [`STACK_PER_BYTE`]; both are measured.
+//! Sizing rather than a depth bound, because a bound low enough for a debug build would
+//! refuse in release what release answers, and because an `IN` list — one algebra node
+//! however long — recurses once a member, so no node count could bound it.
 //! The bracket bound holds in both: a debug build at [`MAX_SPARQL_NESTING`] of the costliest
 //! bracket (`STR(` calls, ~60 KiB a level) needs ~4 MiB, well inside [`STACK_BASE`].
 //!
@@ -111,6 +118,60 @@ pub const STACK_BASE: usize = 16 << 20;
 /// re-measures all of these.
 pub const STACK_PER_BYTE: usize = 512;
 
+/// In a build with `debug_assertions` ON, the stack reserved per byte of query in place of
+/// [`STACK_PER_BYTE`]: **2 KiB** (ledger #1003).
+///
+/// Covers what an unoptimized build spends per byte BEFORE the algebra bound can refuse, or
+/// where that bound does not reach: parsing an arithmetic chain `1*1*…` costs ~900 bytes of
+/// stack a byte (the algebra bound is checked after the parse, so the thread must hold the
+/// parse of any chain the byte bound admits), and evaluating `1 IN (1,1,…)` ~1,245 — `IN` is
+/// one algebra node however long its list, and the evaluator rewrites it into one `||` level
+/// a member. A query at [`MAX_SPARQL_BYTES`] gets a ~2 GiB thread in a debug build: reserved
+/// address space, touched only as deep as the query recurses.
+pub const DEBUG_STACK_PER_BYTE: usize = 2 << 10;
+
+/// In a build with `debug_assertions` ON, the stack reserved for each node the algebra bound
+/// admits ([`crate::budget::MAX_ALGEBRA_NODES`]), on top of [`STACK_BASE`]: **64 KiB**, so
+/// 64 MiB in all (ledger #1003).
+///
+/// The evaluator recurses once per algebra node, and an unoptimized build spends up to
+/// ~45 KiB a level on it: `+` and `*` chains; then ~21 KiB for `OPTIONAL`, `BIND` and a path
+/// step, ~13 KiB for `UNION`, ~7 KiB for `||` and `&&` (measured on oxigraph 0.5.11 by
+/// `tests/sparql_stack_measure.rs`). A release build spends ~640 bytes a node at worst, so
+/// the whole bound fits in [`STACK_BASE`] there and this applies to debug builds only.
+pub const DEBUG_STACK_PER_NODE: usize = 64 << 10;
+
+/// The stack a thread that parses and evaluates `text` is given: [`STACK_BASE`] plus
+/// [`STACK_PER_BYTE`] a byte in a release build; in a build with `debug_assertions` on,
+/// [`STACK_BASE`] plus [`DEBUG_STACK_PER_NODE`] for every node of
+/// [`crate::budget::MAX_ALGEBRA_NODES`] plus [`DEBUG_STACK_PER_BYTE`] a byte.
+///
+/// `debug_assertions` is the compile-time signal that stands in for "oxigraph is
+/// unoptimized". It errs safe in both mixed profiles a host is likely to use — optimized
+/// dependencies under a dev profile, or debug assertions in release, each reserve more than
+/// needed; a release profile that turns optimization OFF without debug assertions is the
+/// one it would undersize.
+///
+/// ```
+/// use ikigai_store::limits::{sparql_stack_size, STACK_BASE, STACK_PER_BYTE};
+///
+/// let query = "SELECT * WHERE { ?s ?p ?o }";
+/// if cfg!(debug_assertions) {
+///     assert!(sparql_stack_size(query) > STACK_BASE + 64 * 1024 * 1024);
+/// } else {
+///     assert_eq!(sparql_stack_size(query), STACK_BASE + query.len() * STACK_PER_BYTE);
+/// }
+/// ```
+pub fn sparql_stack_size(text: &str) -> usize {
+    if cfg!(debug_assertions) {
+        STACK_BASE
+            .saturating_add(crate::budget::MAX_ALGEBRA_NODES.saturating_mul(DEBUG_STACK_PER_NODE))
+            .saturating_add(text.len().saturating_mul(DEBUG_STACK_PER_BYTE))
+    } else {
+        STACK_BASE.saturating_add(text.len().saturating_mul(STACK_PER_BYTE))
+    }
+}
+
 /// Refuse a SPARQL query or update that exceeds [`MAX_SPARQL_BYTES`] or nests deeper than
 /// [`MAX_SPARQL_NESTING`], naming the argument `arg` and the bound. Never truncates.
 ///
@@ -178,7 +239,7 @@ fn refuse_ambiguous(arg: &str, readings: usize) -> Error {
 }
 
 /// Run `work` — a parse and everything that evaluates what it parsed — on a thread whose
-/// stack is sized for `text` (see [`STACK_BASE`] and [`STACK_PER_BYTE`]), and wait for it.
+/// stack is sized for `text` ([`sparql_stack_size`]), and wait for it.
 ///
 /// A panic on that thread is resumed on this one, so the caller sees what it would have
 /// seen inline. A thread that cannot be spawned (the address space or the platform refused
@@ -192,7 +253,7 @@ where
 {
     #[cfg(not(target_family = "wasm"))]
     {
-        let stack = STACK_BASE.saturating_add(text.len().saturating_mul(STACK_PER_BYTE));
+        let stack = sparql_stack_size(text);
         std::thread::scope(|scope| {
             let handle = std::thread::Builder::new()
                 .name("ikigai-store-sparql".to_string())
