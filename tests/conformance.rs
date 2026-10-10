@@ -1,5 +1,6 @@
 //! The module recipe as one test: `ikigai-conformance` walks the thirteen resources
-//! [`ikigai_store::space`] binds and reports every violation at once.
+//! [`ikigai_store::space`] binds and reports every violation at once, and holds that
+//! space to the naming rule for an instance-built constructor.
 //!
 //! # The fixture is a store, and the walk WRITES to it
 //!
@@ -56,10 +57,18 @@
 //!   fail its module's conformance for holding its user's data. The checks are load-
 //!   bearing for a module that AUTHORS a graph; here they confirm the face parses and is
 //!   labelled correctly, and no more.
+//! - **`SPACE-NAME` (0.6.0) holds [`ikigai_store::space`] to claiming NO name**, because it
+//!   is instance-built: its doors serve whichever [`DurableStore`] it was handed, so two
+//!   calls are two different datasets behind identical-looking doors, and a self-claimed
+//!   `urn:iki:space:store` would let the cache and every corridor treat them as one
+//!   (ledger #987). Only the host knows which store it passed in, so the host names it.
+//!   The suite is given the SAME `Arc` the kernel runs on, never a second
+//!   `space(store.clone())`: a second live space over one dataset forfeits coverage here
+//!   ([`DurableStore::spaces_bound`]), which would change the very reads being walked.
 
 use futures::executor::block_on;
 use ikigai_conformance::{Fixture, Suite};
-use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
+use ikigai_core::{ArgRef, Capability, EndpointSpace, Iri, Kernel, Request, Verb};
 use ikigai_store::{space, DurableStore, SharerWrites};
 use std::sync::Arc;
 
@@ -76,11 +85,12 @@ use std::sync::Arc;
 /// It goes in through `urn:iki:store:load` under root rather than through the raw
 /// handle, because a raw-handle write is exactly the invisible write this crate exists
 /// to not have.
-fn kernel(store: DurableStore) -> Kernel {
-    let kernel = Kernel::with_meta_renderer(
-        Arc::new(space(store)),
-        Arc::new(ikigai_vocab::TurtleRenderer),
-    );
+///
+/// The space comes back beside the kernel so the walk can declare that same instance
+/// host-named (see the module docs).
+fn kernel(store: DurableStore) -> (Kernel, Arc<EndpointSpace>) {
+    let space = Arc::new(space(store));
+    let kernel = Kernel::with_meta_renderer(space.clone(), Arc::new(ikigai_vocab::TurtleRenderer));
     block_on(
         kernel.issue(
             Request::new(Verb::Sink, Iri::parse("urn:iki:store:load").unwrap())
@@ -100,7 +110,23 @@ fn kernel(store: DurableStore) -> Kernel {
         ),
     )
     .expect("seeding the scoped graph");
-    kernel
+    (kernel, space)
+}
+
+/// The label SPACE-NAME findings name the space by: the constructor's call.
+const SPACE_LABEL: &str = "ikigai_store::space(store)";
+
+/// Run `suite` over a kernel built from `store`, declaring that kernel's own space
+/// host-named, and fail on any finding. Returns the rendered report so a test can pin a
+/// line of it.
+fn walk(suite: Suite, store: DurableStore) -> String {
+    let (kernel, space) = kernel(store);
+    let report = suite
+        .host_named_space(SPACE_LABEL, space)
+        .run_blocking(&kernel);
+    println!("{report}");
+    assert!(report.is_clean(), "{report}");
+    report.to_string()
 }
 
 /// One query per form, each answering in the shape its IRI promises. The DESCRIBE
@@ -200,12 +226,18 @@ const SCOPED_READS: [&str; 4] = [
 
 #[test]
 fn conforms() {
-    let report = READS
-        .iter()
-        .fold(fixtures(), |suite, id| suite.cacheable(*id))
-        .run_blocking(&kernel(DurableStore::in_memory().unwrap()));
-    println!("{report}");
-    assert!(report.is_clean(), "{report}");
+    let report = walk(
+        READS
+            .iter()
+            .fold(fixtures(), |suite, id| suite.cacheable(*id)),
+        DurableStore::in_memory().unwrap(),
+    );
+    // The declaration was checked, not merely made: a `space: none declared` line here
+    // would mean SPACE-NAME looked at nothing and the walk above proves nothing about it.
+    assert!(
+        report.contains(&format!("space: {SPACE_LABEL} host-named")),
+        "{report}"
+    );
 }
 
 /// ★ The same walk over a SHARED store, where every read is `Expiry::Always` by
@@ -218,12 +250,10 @@ fn conforms() {
 fn a_shared_store_conforms_as_a_live_one() {
     let (store, handle) = DurableStore::in_memory_shared().unwrap();
     drop(handle);
-    let report = READS
-        .iter()
-        .fold(fixtures(), |suite, id| suite.live(*id))
-        .run_blocking(&kernel(store));
-    println!("{report}");
-    assert!(report.is_clean(), "{report}");
+    walk(
+        READS.iter().fold(fixtures(), |suite, id| suite.live(*id)),
+        store,
+    );
 }
 
 /// ★ The third mode, walked the same way: a shared store whose host declared that the
@@ -247,7 +277,5 @@ fn a_declared_shared_store_conforms_as_cacheable_exactly_where_it_promised() {
             suite.live(*id)
         }
     });
-    let report = suite.run_blocking(&kernel(store));
-    println!("{report}");
-    assert!(report.is_clean(), "{report}");
+    walk(suite, store);
 }

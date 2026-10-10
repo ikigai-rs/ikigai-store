@@ -295,8 +295,16 @@ futures = "0.3"
 # parameterized half the suite cannot see.
 # ⚠ 0.3 rather than 0.2 is a CEILING move as well as a floor: `"0.2"` means `<0.3.0`, so
 # the new check would never have arrived on its own.
-ikigai-conformance = "0.3"
+# ★ 0.6.0 for SPACE-NAME (ledger #987): `space(store)` is instance-built, so the walk
+# declares it `host_named_space` and holds it to claiming no name. Same ceiling story as
+# above, twice over: `"0.3"` meant `<0.4.0`, so request-memoized firing (0.4), own-name
+# purity (0.5) and SPACE-NAME (0.6) all sat outside it while this suite stayed green.
+# `"0.6.0"` is `<0.7.0`; move it when 0.7 publishes.
+# ⚠ It pulls core 0.1.89 into every TEST build (conformance 0.6.0 requires it). That is
+# NOT a reason to raise `[dependencies] ikigai-core` above: that line states what the
+# LIBRARY needs, which is still 0.1.57 — the test graph's floor comes from here.
+ikigai-conformance = "0.6.0"
 # `TurtleRenderer` for the `Meta` face the kernel routes. ⚠ Resolution consequence worth
-# knowing: vocab 0.1.70 requires core 0.1.66, so the TEST graph is pulled to that even
-# though the library above genuinely builds on 0.1.57.
+# knowing: conformance 0.6.0 requires vocab and core 0.1.89, so the TEST graph is pulled
+# to that even though the library above genuinely builds on 0.1.57.
 ikigai-vocab = "0.1"
