@@ -294,6 +294,12 @@ const LOAD_FORMATS: [&str; 5] = [
 /// The store is moved in: this space and the endpoints in it are the only holders of the
 /// dataset unless the caller took a handle at construction (see
 /// [`DurableStore`]).
+///
+/// ⚠ **One kernel per space.** Several kernels over one dataset each get their own
+/// `space(store.clone())`, which this crate counts ([`DurableStore::spaces_bound`]). One
+/// space — or one composite containing it — handed to several kernels is invisible here,
+/// because an endpoint is not told which kernel invoked it, and a write through one kernel
+/// then leaves the others serving stale cached reads (ledger #761).
 pub fn space(store: DurableStore) -> EndpointSpace {
     // ★ Counted for as long as this space lives, so a SECOND live space over the same
     // dataset forfeits coverage for both — and one bound after a cached read refuses
@@ -1175,7 +1181,14 @@ impl Endpoint for UpdateEndpoint {
                     inv.capability,
                     requested,
                     move |deadline| {
-                        let prepared = crate::confine::parse(&text, deadline)?;
+                        // ★ A graph-management operation is an existence oracle for a
+                        // caller who may not read (ledger #761): silenced. `src/confine.rs`.
+                        let unreadable = if may_read {
+                            crate::confine::Unreadable::None
+                        } else {
+                            crate::confine::Unreadable::EveryGraph
+                        };
+                        let prepared = crate::confine::parse(&text, deadline, unreadable)?;
                         if crate::confine::reads_the_dataset(&prepared) && !may_read {
                             return Err(Error::Denied(format!(
                                 "this update has a `WHERE` clause, which reads the dataset, and \
@@ -1226,8 +1239,10 @@ impl Endpoint for UpdateEndpoint {
                 "Apply a SPARQL 1.1 UPDATE to the store. An update with a `WHERE` clause \
                  (including `DELETE WHERE`, `WITH`, `COPY`, `MOVE`, `ADD`) reads the \
                  dataset and also needs `urn:cap:store:read`, refused on the grant before \
-                 evaluation; a caller without it is not told the quad counts. `LOAD` is \
-                 refused: load a document through `urn:iki:store:load`. Cuts the \
+                 evaluation; a caller without it is not told the quad counts, and its \
+                 `DROP`, `CLEAR` and `CREATE` of a graph run as `SILENT`, so they do not say \
+                 whether the graph exists. `LOAD` is refused: load a document through \
+                 `urn:iki:store:load`. Cuts the \
                  golden thread `urn:iki:store:update`, so every cacheable read of this \
                  store recomputes.",
             )
@@ -1319,7 +1334,14 @@ impl Endpoint for GraphUpdateEndpoint {
                     requested,
                     move |deadline| {
                         let target = scope;
-                        let prepared = crate::confine::parse(&text, deadline)?;
+                        // ★ `DROP`/`CLEAR`/`CREATE GRAPH <G>` would tell a write-only caller
+                        // whether `G` exists (ledger #761): silenced. `src/confine.rs`.
+                        let unreadable = if may_read {
+                            crate::confine::Unreadable::None
+                        } else {
+                            crate::confine::Unreadable::Graph(&target)
+                        };
+                        let prepared = crate::confine::parse(&text, deadline, unreadable)?;
                         if crate::confine::reads_the_dataset(&prepared) && !may_read {
                             return Err(Error::Denied(format!(
                                 "this update has a `WHERE` clause, which reads graph <{}>, and \
@@ -1371,8 +1393,9 @@ impl Endpoint for GraphUpdateEndpoint {
                  `urn:cap:store:read:graph:<IRI>` (or `urn:cap:store:read`) and is refused \
                  on the grant, before evaluation, without it; `INSERT DATA`, `DELETE DATA`, \
                  `CLEAR`, `DROP` and `CREATE` need the write grant alone, and a caller who \
-                 cannot read the graph is not told the quad counts. `LOAD` is refused. Cuts \
-                 the golden thread `urn:iki:store:graph-update`.",
+                 cannot read the graph is not told the quad counts, nor whether the graph \
+                 exists (its `DROP`, `CLEAR` and `CREATE` run as `SILENT`). `LOAD` is \
+                 refused. Cuts the golden thread `urn:iki:store:graph-update`.",
             )
             .verb(Verb::Sink)
             .verb(Verb::Meta)

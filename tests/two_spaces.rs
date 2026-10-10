@@ -137,3 +137,51 @@ fn a_space_bound_after_a_cached_read_refuses_rather_than_go_stale_under_it() {
     write(&k3, "INSERT DATA { <urn:s> <urn:p> <urn:o> }");
     assert!(ask(&k3).contains("true"));
 }
+
+/// ⚠ **The shape this crate cannot see** (ledger #761): ONE space, `Arc`-cloned into two
+/// kernels. It is one binding to the count above and two caches to the kernels, so neither
+/// rule applies — `info` says `covered: true`, `k2` caches, and a write through `k1` leaves
+/// `k2` serving the stale answer with no bound. `ikigai-embedded` memoized its store space
+/// exactly this way.
+///
+/// ★ This test PINS THE HAZARD rather than a fix, because no fix is reachable from this
+/// crate: an endpoint is not told which kernel invoked it, and nothing here holds a kernel's
+/// cache (`DurableStore::spaces_bound` has the argument). If it starts failing, something
+/// upstream changed what an endpoint can see — read why before deleting it, because the
+/// store may now be able to close this properly.
+#[test]
+fn one_space_shared_by_two_kernels_is_the_hazard_this_crate_cannot_see() {
+    let store = DurableStore::in_memory().unwrap();
+    let shared: Arc<dyn ikigai_core::Space> = Arc::new(space(store.clone()));
+    let k1 = Kernel::new(Arc::clone(&shared));
+    let k2 = Kernel::new(Arc::clone(&shared));
+    assert_eq!(
+        store.spaces_bound(),
+        1,
+        "one space, however many kernels hold it"
+    );
+    assert!(info(&k2).contains("covered: true\n"), "{}", info(&k2));
+
+    assert!(ask(&k2).contains("false"), "k2 caches the empty answer");
+    write(&k1, "INSERT DATA { <urn:s> <urn:p> <urn:o> }");
+    assert!(ask(&k1).contains("true"), "control: k1 sees its own write");
+    assert!(
+        ask(&k2).contains("false"),
+        "k2 is no longer stale: something upstream now lets this crate see a shared space — \
+         see this test's doc comment before changing it"
+    );
+}
+
+/// ★ **The supported shape for several kernels**, and the one `ikigai-embedded` should
+/// memoize: ONE `DurableStore` (one open, so RocksDB's one-writer rule holds), a space PER
+/// kernel. Counted, so coverage is forfeit while both live and neither goes stale.
+#[test]
+fn one_store_with_a_space_per_kernel_is_never_stale() {
+    let memoized = DurableStore::in_memory().unwrap();
+    let k1 = Kernel::new(Arc::new(space(memoized.clone())));
+    let k2 = Kernel::new(Arc::new(space(memoized.clone())));
+    assert_eq!(memoized.spaces_bound(), 2);
+    assert!(ask(&k2).contains("false"));
+    write(&k1, "INSERT DATA { <urn:s> <urn:p> <urn:o> }");
+    assert!(ask(&k2).contains("true"), "k2 sees k1's write");
+}

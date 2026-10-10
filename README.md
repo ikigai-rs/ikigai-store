@@ -27,7 +27,8 @@ RocksDB refuses a second open of the same directory **from the same process**, t
 its own in-process registry — so a host with more than one kernel (several CLI modes, a
 test binary with a dozen), written the obvious way, gets `Error::Unavailable` on the
 second one. This is not hypothetical: the first host to bind this crate hit exactly
-that and had to memoize the space.
+that and memoized the SPACE, which is the wrong half to share (see the last bullet below):
+memoize the store and bind a space per kernel.
 
 `DurableStore` is `Clone` and holds an `Arc<Store>`, so the fix is to open once and hand
 each kernel a clone: they share the dataset, the write lock, and the coverage flag.
@@ -50,9 +51,15 @@ the spaces bound over it (`DurableStore::spaces_bound`):
   sentence saying why. Nothing can evict the first kernel's cached answers, so a write
   through the late space would leave them stale; refusing keeps the first kernel correct.
   So **bind every space before the first read** — which a host does at startup anyway.
-- ⚠ One `Arc<EndpointSpace>` handed to two kernels is ONE binding to this crate and two
-  caches to the kernels, so it cannot be seen and is not covered by either rule. Bind a
-  space per kernel.
+- ⚠ **One `Arc<EndpointSpace>` handed to two kernels is ONE binding to this crate and two
+  caches to the kernels**, so it cannot be seen and is not covered by either rule: a write
+  through one kernel leaves the other serving a stale cached read with no bound, while
+  `info` says `covered: true` through both (ledger #761,
+  `tests/two_spaces.rs::one_space_shared_by_two_kernels_is_the_hazard_this_crate_cannot_see`).
+  The same goes for a composite space (a `Fallback`) that contains this one. It cannot be
+  closed from here: an endpoint is not told which kernel invoked it, and nothing in this
+  crate can reach a kernel's cache. **Bind a space per kernel**, from one memoized
+  `DurableStore`.
 
 That is still a property of the kernel and the reason to prefer one kernel per process
 where you can.
@@ -225,6 +232,14 @@ which are a read of their own (`+0` after an `INSERT DATA` means the quad was al
 there). The broad door applies the same rule one level up: `urn:iki:store:update` with a
 `WHERE` needs `urn:cap:store:read` as well as `urn:cap:store:write`, and both broad write
 doors report counts only to a caller holding `urn:cap:store:read`.
+
+★ **And a caller who may not read a graph is not told whether it exists** (ledger #761).
+A non-`SILENT` `DROP GRAPH <G>` or `CLEAR GRAPH <G>` fails when `G` does not exist and
+`CREATE GRAPH <G>` fails when it does, so each was one bit of `G`'s state per call. For a
+caller without the read grant on `G` (on the broad door, without `urn:cap:store:read`),
+those three run as if the update had said `SILENT`: the answer is the same success line
+whatever `G` held, and the effect is still what was asked for (after `DROP`, `G` is gone;
+after `CREATE`, it exists). A caller who may read `G` keeps the standard error.
 
 ⚠ **The declared `requires` cannot say this, and is unchanged.** `requires` is ALL-of and
 unconditional, while this requirement depends on the update's shape; declaring the read

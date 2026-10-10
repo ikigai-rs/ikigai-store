@@ -81,7 +81,9 @@
 //!   them only for a caller that may read `G`.
 //!
 //! `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP` and `CREATE` have no `WHERE` and stay
-//! write-only. (`LOAD` has none either, and is refused outright: see [`parse`].) `COPY`, `MOVE` and `ADD` are rewritten by the parser into
+//! write-only — but for a caller who may not read `G`, `DROP`, `CLEAR` and `CREATE` of `G`
+//! run as `SILENT`, because their non-`SILENT` failure says whether `G` exists (ledger #761,
+//! `silence_graph_management`). (`LOAD` has none either, and is refused outright: see [`parse`].) `COPY`, `MOVE` and `ADD` are rewritten by the parser into
 //! `DELETE/INSERT … WHERE` over the source graph, so they read it, and need the grant.
 //!
 //! //! # What it costs
@@ -120,17 +122,25 @@ pub(crate) struct Applied {
 ///
 /// The update is evaluated under `deadline`'s cancellation token (ledger #964). An update
 /// with a `LOAD` in it is refused here, before evaluation (ledger #992, [`refuse_load`]).
-pub(crate) fn parse(update: &str, deadline: &Deadline) -> Result<PreparedSparqlUpdate> {
+///
+/// `unreadable` names the graphs the caller may write and may NOT read: graph-management
+/// operations on them run as `SILENT` (ledger #761, [`Unreadable`]).
+pub(crate) fn parse(
+    update: &str,
+    deadline: &Deadline,
+    unreadable: Unreadable<'_>,
+) -> Result<PreparedSparqlUpdate> {
     crate::limits::check_sparql(update, "content")?;
     // ★ Parsed by the parser oxigraph uses, and measured before oxigraph plans it: the
     // planner cannot be cancelled (ledger #964, `src/budget.rs`).
-    let parsed = spargebra::SparqlParser::new()
+    let mut parsed = spargebra::SparqlParser::new()
         .parse_update(update)
         .map_err(|e| Error::InvalidArgument {
             name: "content".to_string(),
             detail: format!("not a SPARQL update: {e}"),
         })?;
     refuse_load(&parsed)?;
+    silence_graph_management(&mut parsed, unreadable);
     crate::budget::check_update(&parsed, "content")?;
     Ok(SparqlEvaluator::new()
         .with_cancellation_token(deadline.token())
@@ -164,6 +174,65 @@ fn refuse_load(update: &spargebra::Update) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Which graphs the caller may write but may not read, for [`parse`] (ledger #761).
+#[derive(Clone, Copy)]
+pub(crate) enum Unreadable<'a> {
+    /// The caller may read every graph this update can name; standard SPARQL semantics.
+    None,
+    /// The scoped door: the caller may not read this graph.
+    Graph(&'a NamedNode),
+    /// The broad door: the caller may read no graph at all.
+    EveryGraph,
+}
+
+impl Unreadable<'_> {
+    fn covers(self, graph: &str) -> bool {
+        match self {
+            Unreadable::None => false,
+            Unreadable::Graph(g) => g.as_str() == graph,
+            Unreadable::EveryGraph => true,
+        }
+    }
+}
+
+/// Run `DROP`, `CLEAR` and `CREATE` of a graph the caller may not read as if the update had
+/// said `SILENT` (ledger #761).
+///
+/// ★ A non-`SILENT` `DROP GRAPH <G>` or `CLEAR GRAPH <G>` FAILS when `G` does not exist, and
+/// `CREATE GRAPH <G>` fails when it does, so through a door that runs them for a caller with
+/// the write grant alone each was one bit of `G`'s state per call — the last read channel the
+/// ledger #751 arc reproduced and left open. `SILENT` is the uniform answer because it is the
+/// only one that keeps the operation meaningful: the caller gets the same success line
+/// whatever `G` held, and the effect is still what it asked for (after `DROP`, `G` is gone;
+/// after `CREATE`, it exists). A uniform REFUSAL would have broken every legitimate one.
+///
+/// Decided on the caller's GRANT and the update's TEXT, never on the data, like the rest of
+/// the read rule. A caller who may read the graph keeps the standard error: it could have
+/// asked `graph-ask`, and the error tells it its update named nothing. `DEFAULT`, `NAMED` and
+/// `ALL` targets are untouched — they cannot fail, so they were never an oracle.
+fn silence_graph_management(update: &mut spargebra::Update, unreadable: Unreadable<'_>) {
+    use spargebra::algebra::GraphTarget;
+    use spargebra::GraphUpdateOperation::{Clear, Create, Drop};
+    for operation in &mut update.operations {
+        match operation {
+            Drop {
+                silent,
+                graph: GraphTarget::NamedNode(graph),
+            }
+            | Clear {
+                silent,
+                graph: GraphTarget::NamedNode(graph),
+            }
+            | Create { silent, graph }
+                if unreadable.covers(graph.as_str()) =>
+            {
+                *silent = true;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Whether the update has a `WHERE` — i.e. READS the dataset it runs against.

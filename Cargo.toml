@@ -191,6 +191,12 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # `content`), reading the text as the strict parser's lexer does. And SPARQL `LOAD` is refused at both update doors: the
 # fetched document is parsed inside oxigraph, unscannable. Still a patch: the API is additive (`pub mod depth`); the
 # behavior change is that those two inputs are refused — `LOAD` already failed in any build without `http-client`.
+# ★ 0.2.10 ALSO closes the graph-existence oracle (ledger #761), folded in before it published: a non-SILENT
+# `DROP`/`CLEAR GRAPH <G>` failed when G was absent and `CREATE GRAPH <G>` when it was present, one bit of G's state to
+# a caller who may write G and not read it. For such a caller (either door) the three now run as SILENT. Still a patch:
+# no API change, and the behavior change is that those three succeed uniformly for a write-only caller. The same arc
+# found the one-space-shared-by-several-kernels hazard NOT closable from here (an endpoint cannot see its kernel); it is
+# documented and pinned by a test, and the fix is the host's: a space per kernel over one memoized `DurableStore`.
 version = "0.2.10"
 edition = "2021"
 license = "MIT OR Apache-2.0"

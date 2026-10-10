@@ -443,6 +443,13 @@ impl DurableStore {
     /// it.** `Arc<EndpointSpace>` handed to two `Kernel`s is one binding here and two
     /// caches there. The only shape this crate can vouch for is one space per kernel; a
     /// host with several kernels over one dataset binds a space for each, up front.
+    /// ★ Why it cannot be closed from here (ledger #761): an endpoint is not told which
+    /// kernel invoked it (`Invocation`'s issuer is private and carries no identity), and
+    /// nothing in this crate holds a kernel, so it can neither count kernels nor cut their
+    /// caches. A cached probe resource would tell kernels apart only until the cache
+    /// evicted it or a second capability keyed a second entry, so a refusal built on it
+    /// would refuse legitimate callers. Closing it needs core to expose an invocation's
+    /// kernel identity; `tests/two_spaces.rs` pins the hazard so that change is noticed.
     pub fn spaces_bound(&self) -> usize {
         self.spaces.load(Ordering::SeqCst)
     }
