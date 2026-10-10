@@ -205,7 +205,12 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # `SERVICE SILENT` that used to answer empty is refused too. One new direct dependency, `oxiri` (already in the graph).
 # ★ And the layers are PUBLIC (`ikigai_store::service::{evaluator, Refuse, refuse_service, refuse_service_in_update,
 # refuse_load}`), so ledger/markdown/nl/script, which build their own evaluators, stop needing copies. Additive.
-version = "0.2.10"
+# ★ 0.2.11 is THE CONSUMER-REFUSAL RELEASE (ledger #1094): `service::refuse_service` names this store and its remedy
+# (sink into `urn:iki:store:load`), wrong advice in a shape, a mapping or a script, so shacl, markdown and cli's intray each
+# map_err'd it away. `service::refuse_service_with` / `refuse_service_in_update_with` take the caller's remedy after the
+# shared `SERVICE_REFUSAL`; `has_service` / `update_has_service` return the walk as a bool. The old functions and their
+# text are unchanged. A patch: the API is additive (four functions, one constant).
+version = "0.2.11"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
