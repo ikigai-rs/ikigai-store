@@ -166,7 +166,14 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # all eight query doors and both update doors. ★ A patch: the API is additive (`pub mod limits`);
 # the only behavior change is that text past the bounds is refused. Not bounded: evaluation TIME
 # (ledger #964).
-version = "0.2.7"
+# ★ 0.2.8 is THE TIME-BUDGET RELEASE (ledger #964): oxigraph checks its cancellation token only at dataset touches,
+# so the planner and in-memory joins could hold a core for minutes. Algebra bounds BEFORE planning (MAX_JOIN_OPERANDS 32,
+# MAX_ALGEBRA_NODES 1024, refused by name) and a caller-side deadline (base 5 s, ceiling 120 s; root gets the ceiling;
+# `urn:cap:store:budget:<ms>` raises a caller, `budget=` only lowers) answered with Error::Timeout, never partial; an
+# update commits only while its caller waits; overdue evaluations are counted and capped (Unavailable). A patch: the
+# API is additive (`budget` module, `TimeBudget`, `with_time_budget`, `overdue_evaluations`, a direct spargebra dep).
+# ⚠ A scoped job that runs long (gonk's backup: 24.6 s) needs a budget grant in the same rollout (ledger #979).
+version = "0.2.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
