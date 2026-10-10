@@ -789,6 +789,14 @@ build it with `evaluator()` and check at its door. ⚠ For an update it also nee
 because nothing in the evaluator stops `LOAD`. The module docs have a table of exactly what each
 item covers, and a doctest that pins it.
 
+The door checks above word the refusal for **this store** (sink into `urn:iki:store:load`),
+which is the wrong advice inside a markdown mapping, a SHACL shape or a script. A crate raising
+it at its own door uses `refuse_service_with(&query, arg, remedy)` (or
+`refuse_service_in_update_with`): the same walk and the same typed `InvalidArgument`, with a
+detail of `SERVICE_REFUSAL` (identical in every crate) followed by the caller's own remedy, or
+nothing when it passes `None`. `has_service` / `update_has_service` return the walk alone, for a
+crate that words its whole refusal itself (ledger #1094).
+
 `LOAD <url>` is **not** governed by the service handler (oxigraph builds `LOAD`'s client
 separately); the door refusal above is the only guard, and it holds. `FROM` / `FROM NAMED` are
 never fetched: oxigraph reads them as graph names in the store. `tests/service_egress.rs` pins
