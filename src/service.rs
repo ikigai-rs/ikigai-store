@@ -25,6 +25,8 @@
 //! | --- | --- | --- |
 //! | [`evaluator`] | every `SERVICE`, constant or variable name, `SILENT` or not, in a query or an update's `WHERE`: refused by the handler, never called, in every build | **`LOAD <url>`**: oxigraph builds `LOAD`'s HTTP client from the evaluator's HTTP settings, not from the service registry, so the handler never sees it |
 //! | [`refuse_service`] / [`refuse_service_in_update`] | a `SERVICE` anywhere in the parsed algebra (`EXISTS`, sub-selects, `OPTIONAL`, `LATERAL` included), refused as a typed `InvalidArgument` BEFORE evaluation | `LOAD`; and only what you hand it, so it is a door check, not a guarantee |
+//! | [`refuse_service_with`] / [`refuse_service_in_update_with`] | the same walk and the same typed refusal, worded for the CALLER's door: [`SERVICE_REFUSAL`], then the caller's remedy (or none) | as for [`refuse_service`] |
+//! | [`has_service`] / [`update_has_service`] | the walk alone, as a `bool`, for a crate that words its whole refusal itself | as for [`refuse_service`] |
 //! | [`refuse_load`] | `LOAD <url>`, `SILENT` or not, `INTO GRAPH` or not, as a typed `InvalidArgument` before evaluation | — it is the ONLY guard against `LOAD`: an evaluator built by [`evaluator`] still fetches it in a build with `oxigraph/http-client` on |
 //!
 //! So a consumer evaluating caller-supplied SPARQL wants **all three**: [`evaluator`] for the
@@ -39,8 +41,13 @@
 //!
 //! ★ Why `InvalidArgument` and not `Denied` naming `urn:cap:net:*`: no grant opens this. The
 //! store never federates, so a `Denied` would send a caller looking for a capability that
-//! changes nothing. The refusal texts name the store's own remedy (fetch through the kernel,
-//! where the net capability applies, and sink into `urn:iki:store:load`).
+//! changes nothing. The store's own refusal texts name the store's own remedy (fetch through
+//! the kernel, where the net capability applies, and sink into `urn:iki:store:load`).
+//!
+//! ★ **A consumer raising the refusal at its own door uses the `_with` forms** (ledger #1094):
+//! inside a markdown mapping, a SHACL shape or a script, `urn:iki:store:load` is the wrong
+//! advice. [`refuse_service_with`] writes [`SERVICE_REFUSAL`], identical in every crate that
+//! uses it, then the remedy the caller passes, so nobody has to `map_err` the store's text away.
 //!
 //! ⚠ The checks take `spargebra`'s `Query` / `Update`, like [`crate::budget::check_query`]:
 //! parse with `spargebra::SparqlParser`, check, then hand the parsed value to
@@ -137,14 +144,12 @@ impl DefaultServiceHandler for Refuse {
 
 /// Refuse a parsed query with a `SERVICE` anywhere in it, as `InvalidArgument` naming `arg`.
 /// A door check, before evaluation; [`evaluator`] is the guarantee behind it.
+///
+/// ⚠ The refusal names THIS STORE and its remedy (sink into `urn:iki:store:load`). A crate
+/// raising it at its own door wants [`refuse_service_with`], which takes the remedy from the
+/// caller, or [`has_service`], to word the whole refusal itself.
 pub fn refuse_service(query: &Query, arg: &str) -> Result<()> {
-    let pattern = match query {
-        Query::Select { pattern, .. }
-        | Query::Ask { pattern, .. }
-        | Query::Describe { pattern, .. }
-        | Query::Construct { pattern, .. } => pattern,
-    };
-    if has_service(pattern) {
+    if has_service(query) {
         return Err(refusal(arg));
     }
     Ok(())
@@ -152,16 +157,122 @@ pub fn refuse_service(query: &Query, arg: &str) -> Result<()> {
 
 /// [`refuse_service`] for an update: the `WHERE` of every `DELETE`/`INSERT` operation. No
 /// other update operation has a pattern. ⚠ It passes `LOAD`, which is not a `SERVICE`: check
-/// that with [`refuse_load`].
+/// that with [`refuse_load`]. Like [`refuse_service`], it names the store's own remedy; the
+/// consumer form is [`refuse_service_in_update_with`].
 pub fn refuse_service_in_update(update: &Update, arg: &str) -> Result<()> {
-    let services = update.operations.iter().any(|operation| match operation {
-        GraphUpdateOperation::DeleteInsert { pattern, .. } => has_service(pattern),
-        _ => false,
-    });
-    if services {
+    if update_has_service(update) {
         return Err(refusal(arg));
     }
     Ok(())
+}
+
+/// The text every consumer's `SERVICE` refusal opens with, whatever remedy follows it (ledger
+/// #1094). [`refuse_service_with`] and [`refuse_service_in_update_with`] write exactly this,
+/// then the caller's remedy, so a log line or a test can match on it across the ecosystem.
+///
+/// ★ `` `SERVICE` is not available `` is the prefix it shares with the store's own refusal
+/// ([`refuse_service`], which says "through this store"): match on that to catch both. The
+/// evaluator's [`Refused`] names the service (`` `SERVICE <iri>` is not available ``) and is
+/// an untyped evaluation error, not a door refusal.
+pub const SERVICE_REFUSAL: &str = "`SERVICE` is not available here: a federated call would be \
+     an outbound request from inside a SPARQL string, gated by no network capability, and no \
+     grant opens it. Nothing was evaluated.";
+
+/// Whether a parsed query has a `SERVICE` anywhere in it: in `EXISTS`, sub-selects,
+/// `OPTIONAL`, `LATERAL`, with a constant or a variable name, `SILENT` or not. The predicate
+/// behind [`refuse_service`], for a crate that words its own refusal.
+///
+/// ```
+/// use ikigai_store::service::has_service;
+///
+/// let parse = |text: &str| spargebra::SparqlParser::new().parse_query(text).unwrap();
+/// assert!(has_service(&parse(
+///     "ASK { ?s ?p ?o FILTER EXISTS { SERVICE SILENT <http://127.0.0.1:9/x> { ?s ?p ?o } } }"
+/// )));
+/// // An IRI in a GRAPH clause, or the word in a literal, is not a service.
+/// assert!(!has_service(&parse(
+///     "SELECT * WHERE { GRAPH <http://127.0.0.1:9/x> { ?s ?p \"SERVICE <x> { }\" } }"
+/// )));
+/// ```
+pub fn has_service(query: &Query) -> bool {
+    match query {
+        Query::Select { pattern, .. }
+        | Query::Ask { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Construct { pattern, .. } => pattern_has_service(pattern),
+    }
+}
+
+/// [`has_service`] for an update: the `WHERE` of every `DELETE`/`INSERT` operation. ⚠ `false`
+/// for `LOAD`, which is not a `SERVICE`: see [`refuse_load`].
+pub fn update_has_service(update: &Update) -> bool {
+    update.operations.iter().any(|operation| match operation {
+        GraphUpdateOperation::DeleteInsert { pattern, .. } => pattern_has_service(pattern),
+        _ => false,
+    })
+}
+
+/// [`refuse_service`] for a crate raising the refusal at its OWN door: the same walk, an
+/// `InvalidArgument` naming `arg`, and a detail of [`SERVICE_REFUSAL`] followed by `remedy`
+/// (the caller's own advice, as a sentence), or by nothing when `remedy` is `None`. The store's
+/// `urn:iki:store:load` is never named, since inside a mapping, a shape or a script it is the
+/// wrong advice.
+///
+/// ```
+/// use ikigai_core::Error;
+/// use ikigai_store::service::{refuse_service_with, SERVICE_REFUSAL};
+///
+/// let parse = |text: &str| spargebra::SparqlParser::new().parse_query(text).unwrap();
+/// let query = parse("SELECT * WHERE { SERVICE <http://127.0.0.1:9/x> { ?s ?p ?o } }");
+///
+/// let remedy = "Fetch the data through the kernel and pass it as `data`.";
+/// let Err(Error::InvalidArgument { name, detail }) =
+///     refuse_service_with(&query, "shapes", Some(remedy))
+/// else {
+///     panic!("a SERVICE passed")
+/// };
+/// assert_eq!(name, "shapes");
+/// assert_eq!(detail, format!("{SERVICE_REFUSAL} {remedy}"));
+/// assert!(!detail.contains("urn:iki:store:load"));
+///
+/// // No remedy: the shared text alone.
+/// let Err(Error::InvalidArgument { detail, .. }) = refuse_service_with(&query, "query", None)
+/// else {
+///     panic!("a SERVICE passed")
+/// };
+/// assert_eq!(detail, SERVICE_REFUSAL);
+///
+/// // A query without one passes.
+/// assert!(refuse_service_with(&parse("ASK { ?s ?p ?o }"), "query", Some(remedy)).is_ok());
+/// ```
+pub fn refuse_service_with(query: &Query, arg: &str, remedy: Option<&str>) -> Result<()> {
+    if has_service(query) {
+        return Err(consumer_refusal(arg, remedy));
+    }
+    Ok(())
+}
+
+/// [`refuse_service_with`] for an update, over the walk [`update_has_service`] does. ⚠ It
+/// passes `LOAD`: check that with [`refuse_load`].
+pub fn refuse_service_in_update_with(
+    update: &Update,
+    arg: &str,
+    remedy: Option<&str>,
+) -> Result<()> {
+    if update_has_service(update) {
+        return Err(consumer_refusal(arg, remedy));
+    }
+    Ok(())
+}
+
+fn consumer_refusal(arg: &str, remedy: Option<&str>) -> Error {
+    Error::InvalidArgument {
+        name: arg.to_string(),
+        detail: match remedy {
+            Some(remedy) => format!("{SERVICE_REFUSAL} {remedy}"),
+            None => SERVICE_REFUSAL.to_string(),
+        },
+    }
 }
 
 /// Refuse an update with a `LOAD <url>` in it, as `InvalidArgument` naming `arg`, before
@@ -215,31 +326,35 @@ fn refusal(arg: &str) -> Error {
 /// crate's manifest enables itself. A new variant upstream is then a compile error here, not a
 /// pattern this walk silently skips. Recursive, and bounded: it runs after
 /// `budget::check_query`, on the sized SPARQL thread.
-fn has_service(pattern: &GraphPattern) -> bool {
+fn pattern_has_service(pattern: &GraphPattern) -> bool {
     match pattern {
         GraphPattern::Service { .. } => true,
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => false,
         GraphPattern::Join { left, right }
         | GraphPattern::Lateral { left, right }
         | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => has_service(left) || has_service(right),
+        | GraphPattern::Minus { left, right } => {
+            pattern_has_service(left) || pattern_has_service(right)
+        }
         GraphPattern::LeftJoin {
             left,
             right,
             expression,
         } => {
-            has_service(left)
-                || has_service(right)
+            pattern_has_service(left)
+                || pattern_has_service(right)
                 || expression.as_ref().is_some_and(expression_has_service)
         }
-        GraphPattern::Filter { expr, inner } => expression_has_service(expr) || has_service(inner),
+        GraphPattern::Filter { expr, inner } => {
+            expression_has_service(expr) || pattern_has_service(inner)
+        }
         GraphPattern::Extend {
             inner, expression, ..
-        } => expression_has_service(expression) || has_service(inner),
+        } => expression_has_service(expression) || pattern_has_service(inner),
         GraphPattern::OrderBy { inner, expression } => {
             expression.iter().any(|order| match order {
                 OrderExpression::Asc(e) | OrderExpression::Desc(e) => expression_has_service(e),
-            }) || has_service(inner)
+            }) || pattern_has_service(inner)
         }
         GraphPattern::Group {
             inner, aggregates, ..
@@ -247,13 +362,13 @@ fn has_service(pattern: &GraphPattern) -> bool {
             aggregates.iter().any(|(_, aggregate)| match aggregate {
                 AggregateExpression::FunctionCall { expr, .. } => expression_has_service(expr),
                 AggregateExpression::CountSolutions { .. } => false,
-            }) || has_service(inner)
+            }) || pattern_has_service(inner)
         }
         GraphPattern::Graph { inner, .. }
         | GraphPattern::Project { inner, .. }
         | GraphPattern::Distinct { inner }
         | GraphPattern::Reduced { inner }
-        | GraphPattern::Slice { inner, .. } => has_service(inner),
+        | GraphPattern::Slice { inner, .. } => pattern_has_service(inner),
     }
 }
 
@@ -263,7 +378,7 @@ fn expression_has_service(expression: &Expression) -> bool {
         | Expression::Literal(_)
         | Expression::Variable(_)
         | Expression::Bound(_) => false,
-        Expression::Exists(pattern) => has_service(pattern),
+        Expression::Exists(pattern) => pattern_has_service(pattern),
         Expression::In(e, members) => {
             expression_has_service(e) || members.iter().any(expression_has_service)
         }
@@ -330,6 +445,14 @@ mod tests {
                 matches!(&err, Error::InvalidArgument { name, .. } if name == "query"),
                 "{text}: {err}"
             );
+            // The consumer forms walk exactly the same positions.
+            assert!(has_service(&query(&text)), "{text}");
+            let err = refuse_service_with(&query(&text), "shapes", Some("Do X.")).expect_err(&text);
+            assert!(
+                matches!(&err, Error::InvalidArgument { name, detail }
+                    if name == "shapes" && detail == &format!("{SERVICE_REFUSAL} Do X.")),
+                "{text}: {err}"
+            );
         }
     }
 
@@ -344,6 +467,9 @@ mod tests {
             "DESCRIBE <http://127.0.0.1:9/x>",
         ] {
             refuse_service(&query(text), "query").unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert!(!has_service(&query(text)), "{text}");
+            refuse_service_with(&query(text), "query", None)
+                .unwrap_or_else(|e| panic!("{text}: {e}"));
         }
     }
 
@@ -364,6 +490,45 @@ mod tests {
             "content",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn the_consumer_update_form_reads_the_same_where_and_passes_load() {
+        let parse = |t: &str| spargebra::SparqlParser::new().parse_update(t).unwrap();
+        let with_service = parse(
+            "DELETE { ?s ?p ?o } WHERE { ?s ?p ?o FILTER EXISTS { \
+             SERVICE ?e { ?s ?p ?o } } }",
+        );
+        assert!(update_has_service(&with_service));
+        let err = refuse_service_in_update_with(&with_service, "script", None).unwrap_err();
+        assert!(matches!(&err, Error::InvalidArgument { name, detail }
+            if name == "script" && detail == SERVICE_REFUSAL));
+        // LOAD is not a service, in this form too: `refuse_load` is still the only guard.
+        let load = parse("LOAD <http://127.0.0.1:9/doc.ttl>");
+        assert!(!update_has_service(&load));
+        refuse_service_in_update_with(&load, "script", None).unwrap();
+    }
+
+    /// ★ Ledger #1094's two halves, side by side: the store's own refusal is unchanged and
+    /// still names the store's remedy, which is why a consumer needs the other form; the
+    /// consumer form never names it, and both open with the same matchable prefix.
+    #[test]
+    fn the_store_refusal_is_unchanged_and_the_consumer_one_drops_its_remedy() {
+        let q = query("SELECT * WHERE { SERVICE <http://127.0.0.1:9/x> { ?s ?p ?o } }");
+        let detail = |e: Error| match e {
+            Error::InvalidArgument { detail, .. } => detail,
+            other => panic!("not InvalidArgument: {other}"),
+        };
+        let store = detail(refuse_service(&q, "query").unwrap_err());
+        assert!(store.starts_with("`SERVICE` is not available through this store: "));
+        assert!(store.ends_with("sink it into `urn:iki:store:load`"));
+        let consumer =
+            detail(refuse_service_with(&q, "query", Some("Pass it as `data`.")).unwrap_err());
+        assert!(!consumer.contains("store"), "{consumer}");
+        let shared = "`SERVICE` is not available";
+        for text in [store.as_str(), consumer.as_str(), SERVICE_REFUSAL] {
+            assert!(text.starts_with(shared), "{text}");
+        }
     }
 
     /// The guarantee layer on its own: an evaluator built by [`evaluator`] answers a `SERVICE`
