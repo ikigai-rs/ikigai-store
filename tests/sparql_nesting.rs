@@ -253,14 +253,21 @@ fn probe(case: &str, n: usize) -> String {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Name the thread that overflowed, from Rust's own report of it. It is usually NOT the
+    // probe's 2 MiB thread: everything that parses or evaluates SPARQL runs on the
+    // `ikigai-store-sparql` thread `limits::sparql_stack_size` sizes, so an overflow there
+    // means the sizing is short, not that the caller's stack was.
+    let overflow = stderr.lines().find(|l| l.contains("overflowed its stack"));
+    let thread = overflow
+        .and_then(|l| l.split('\'').nth(1))
+        .map_or("no thread reported an overflow".to_string(), |name| {
+            format!("thread `{name}` overflowed its stack")
+        });
     assert!(
         out.status.success(),
-        "the `{case}` probe at {n} did not survive a 2 MiB thread: {} — {}",
+        "the `{case}` probe at {n} aborted the child ({}): {thread} — {}",
         out.status,
-        stderr
-            .lines()
-            .find(|l| l.contains("overflow"))
-            .unwrap_or(&stderr)
+        overflow.unwrap_or(&stderr)
     );
     let at = stdout
         .find("\nOUTCOME ")
@@ -470,6 +477,14 @@ fn an_arithmetic_chain_at_the_algebra_bound_runs_in_every_build() {
 /// after it), and an `IN` list (one node however long, evaluated one level a member). In a
 /// debug build this reserves a ~2 GiB thread and touches about half of it, so it is also the
 /// check that a thread that size can be started on the platform CI runs (~4 s, debug).
+///
+/// ⚠ It is slow enough to cross the 5 s DEFAULT_BUDGET on a loaded runner, and it pins the
+/// STACK, not time (ledger #1026: `ikigai-sparql`'s twin was refused by time on CI). It does
+/// not here because every probe is issued as ROOT, and root gets the store's ceiling,
+/// DEFAULT_CEILING (120 s). Measured on a laptop at background QoS (`taskpolicy -b`), debug:
+/// 10.5 s for the whole test as root; the same probes under a plain read grant (the 5 s
+/// base) were refused with a Timeout. Keep `issue` on root, or give these probes a
+/// `urn:cap:store:budget:<ms>` grant.
 #[test]
 fn the_costliest_shapes_per_byte_at_the_byte_bound_abort_nothing() {
     let room = (1 << 20) - 64;
