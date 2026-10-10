@@ -714,6 +714,45 @@ both readings and refuses on the deeper (`src/limits.rs` has the argument).
 ten doors (it fails, with the child killed by `SIGABRT`, against 0.2.6);
 `tests/sparql_stack_measure.rs` re-measures every number above when oxigraph moves.
 
+## ★ A loaded document is bounded in triple-term depth (ledger #992)
+
+In a build with RDF 1.2 on — `oxigraph/rdf-12`, which `ikigai-cli` gets by feature unification
+through rudof, never by asking this crate — a triple term may be the object of a triple term,
+and the RDF library copies, renames and drops a nested one **recursively**, once per level,
+inside the parser. Through 0.2.9, `urn:iki:store:load` parsed a caller's document inline on the
+caller's thread, under the store's write lock, so about 1,000 levels of `<<( … )>>` (some 22 KB
+of Turtle) aborted a debug host on a 2 MiB thread — in Turtle, TriG, N-Triples, N-Quads and
+RDF/XML (`rdf:parseType="Triple"`) alike.
+
+Now `depth::check_rdf_nesting` scans the document before the parser sees it, and a document
+nesting triple terms deeper than **`depth::MAX_RDF_NESTING` (64)** is refused as an
+`InvalidArgument` on `content`, with nothing loaded. The scan keeps no stack and reads the text
+**the way the parser's lexer does, in the mode this crate parses in** (strict; oxttl's Turtle
+mode for Turtle and TriG, its N-Triples mode for N-Triples and N-Quads, quick-xml's markup rules
+for RDF/XML), so a `<<` inside a literal, an IRI or a comment is text, and nothing the parser
+reads as code is skipped. That lesson is `ikigai-shacl`'s (PR 17): a scan that read the grammar
+instead of the lexer could be bypassed. The Turtle scan is a copy of that crate's, and ledger
+#976 is where the two fold into one.
+
+**SPARQL `LOAD <url>` is refused** at both update doors, as an `InvalidArgument` on `content`,
+before evaluation. oxigraph fetches and parses the document itself, with nothing between the two
+where a scan could stand: with `oxigraph/http-client` on (it is, in `ikigai-cli`'s graph), a
+fetched document 50,000 levels deep aborted a debug host on the SPARQL thread. That fetch is also an
+outbound request no `urn:cap:net:*` gates (ledger #145). Without the feature `LOAD` already
+failed at evaluation; it now fails at the door in every build. To bring a remote graph in,
+source it through the kernel, where the net capability applies, and sink it into
+`urn:iki:store:load`.
+
+⚠ What this does **not** bound: a triple term **built by SPARQL**. `INSERT DATA` text is bounded
+by `MAX_SPARQL_NESTING` (`<<` counts), but an update can wrap a STORED term in `TRIPLE(…)` and
+store the result — up to ~60 levels deeper per update — and oxigraph encodes, decodes, hashes and
+drops a stored triple term recursively too. In a debug build, 17 such updates built a term 1,020
+deep that aborted a 2 MiB thread reading the store directly through a shared handle, and 300
+aborted the host on the sized SPARQL thread. Reported, not fixed, in this release.
+
+`tests/triple_term_nesting.rs` reproduces the load abort in a child process in every syntax (it
+fails, with the child killed by `SIGABRT`, against 0.2.9 with `--features rdf-12`).
+
 ## ★ Every evaluation has a time budget (ledger #964)
 
 Inside the byte and nesting bounds, oxigraph is still superlinear in shapes no lexical bound

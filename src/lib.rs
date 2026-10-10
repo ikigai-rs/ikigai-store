@@ -84,6 +84,15 @@
 //! thread whose stack is sized for it. [`limits`] has the measurements and the one subtle
 //! part — a `<` can be an IRI or a less-than, and the scan follows both (ledger #915).
 //!
+//! # …and so is a loaded document's triple-term depth
+//!
+//! In a build with RDF 1.2 on, oxrdf copies a nested triple term recursively inside the
+//! parser, so `urn:iki:store:load` scans a document for `<<( … )>>` nesting (or
+//! `rdf:parseType="Triple"` elements) before parsing it and refuses one past
+//! [`depth::MAX_RDF_NESTING`], reading it as the parser's lexer does. SPARQL `LOAD <url>` is
+//! refused at both update doors: oxigraph would fetch and parse the document itself, with
+//! nothing between the two for a scan to stand in (ledger #992).
+//!
 //! # …and evaluated within a time budget
 //!
 //! Inside those bounds oxigraph is still superlinear (a 3 KB property path plans for 19 s, a
@@ -244,6 +253,7 @@
 pub mod budget;
 pub mod config;
 pub(crate) mod confine;
+pub mod depth;
 pub mod endpoints;
 pub mod limits;
 pub(crate) mod scope;

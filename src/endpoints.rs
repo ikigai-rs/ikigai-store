@@ -1182,7 +1182,7 @@ impl Endpoint for UpdateEndpoint {
                              reading it through `urn:iki:store:update` needs `{CAP_READ}` as well \
                              as `{CAP_WRITE}`; this capability does not hold it. Nothing was \
                              evaluated. The write grant alone covers updates that read nothing: \
-                             `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP`, `CREATE`, `LOAD`"
+                             `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP`, `CREATE`"
                             )));
                         }
                         let _writes = store.write_lock();
@@ -1226,7 +1226,8 @@ impl Endpoint for UpdateEndpoint {
                 "Apply a SPARQL 1.1 UPDATE to the store. An update with a `WHERE` clause \
                  (including `DELETE WHERE`, `WITH`, `COPY`, `MOVE`, `ADD`) reads the \
                  dataset and also needs `urn:cap:store:read`, refused on the grant before \
-                 evaluation; a caller without it is not told the quad counts. Cuts the \
+                 evaluation; a caller without it is not told the quad counts. `LOAD` is \
+                 refused: load a document through `urn:iki:store:load`. Cuts the \
                  golden thread `urn:iki:store:update`, so every cacheable read of this \
                  store recomputes.",
             )
@@ -1370,8 +1371,8 @@ impl Endpoint for GraphUpdateEndpoint {
                  `urn:cap:store:read:graph:<IRI>` (or `urn:cap:store:read`) and is refused \
                  on the grant, before evaluation, without it; `INSERT DATA`, `DELETE DATA`, \
                  `CLEAR`, `DROP` and `CREATE` need the write grant alone, and a caller who \
-                 cannot read the graph is not told the quad counts. Cuts the golden thread \
-                 `urn:iki:store:graph-update`.",
+                 cannot read the graph is not told the quad counts. `LOAD` is refused. Cuts \
+                 the golden thread `urn:iki:store:graph-update`.",
             )
             .verb(Verb::Sink)
             .verb(Verb::Meta)
@@ -1428,6 +1429,11 @@ impl Endpoint for LoadEndpoint {
                             LOAD_FORMATS.join(", ")
                         ),
                     })?;
+                // ★ Bounded in triple-term depth before the parser sees a byte (ledger #992):
+                // with RDF 1.2 on, ~1000 levels of `<<( … )>>` aborted the host from here, on
+                // the caller's thread and under the write lock. Scanned outside the lock, in
+                // the lexing mode of the parser below (strict, by format). See `src/depth.rs`.
+                crate::depth::check_rdf_nesting(bytes, format, "content")?;
                 let _writes = self.store.write_lock();
                 let mut parser = RdfParser::from_format(format);
                 // ⚠ A `graph` that is present but unreadable is refused: read as absent, it
@@ -1470,7 +1476,9 @@ impl Endpoint for LoadEndpoint {
             .summary(
                 "Parse an RDF document and add its statements to the store. The kernel \
                  door that replaces the old `load_turtle` side entrance: this one is \
-                 capability-gated and cuts the golden thread `urn:iki:store:load`.",
+                 capability-gated and cuts the golden thread `urn:iki:store:load`. A \
+                 document nesting RDF 1.2 triple terms deeper than 64 is refused before \
+                 it is parsed.",
             )
             .verb(Verb::Sink)
             .verb(Verb::Meta)
