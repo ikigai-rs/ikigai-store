@@ -103,7 +103,7 @@ use ikigai_core::{Error, Result};
 use oxigraph::model::{GraphName, NamedNode, Quad};
 
 use crate::budget::Deadline;
-use oxigraph::sparql::{PreparedSparqlUpdate, SparqlEvaluator};
+use oxigraph::sparql::PreparedSparqlUpdate;
 use oxigraph::store::Store;
 
 /// What a scoped update did to the real store.
@@ -121,7 +121,8 @@ pub(crate) struct Applied {
 /// caller's time budget.
 ///
 /// The update is evaluated under `deadline`'s cancellation token (ledger #964). An update
-/// with a `LOAD` in it is refused here, before evaluation (ledger #992, [`refuse_load`]).
+/// with a `LOAD` in it is refused here, before evaluation (ledger #992, [`refuse_load`]), and
+/// so is one with a `SERVICE` in a `WHERE` (ledger #1083, [`crate::service`]).
 ///
 /// `unreadable` names the graphs the caller may write and may NOT read: graph-management
 /// operations on them run as `SILENT` (ledger #761, [`Unreadable`]).
@@ -142,7 +143,10 @@ pub(crate) fn parse(
     refuse_load(&parsed)?;
     silence_graph_management(&mut parsed, unreadable);
     crate::budget::check_update(&parsed, "content")?;
-    Ok(SparqlEvaluator::new()
+    // ★ No `SERVICE` in a `WHERE`, refused by name, on an evaluator that refuses one itself in
+    // every build (ledger #1083, `src/service.rs`).
+    crate::service::refuse_in_update(&parsed, "content")?;
+    Ok(crate::service::evaluator()
         .with_cancellation_token(deadline.token())
         .for_update(parsed))
 }

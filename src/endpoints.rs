@@ -115,7 +115,7 @@ use oxigraph::model::{
     GraphName, GraphNameRef, NamedNode, NamedNodeRef, NamedOrBlankNode, Term, Variable,
 };
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
-use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+use oxigraph::sparql::QueryResults;
 
 use crate::budget::{too_large, AnswerBound, AnswerBudget, CappedWriter, Deadline, Measure};
 use crate::scope::GraphSet;
@@ -524,7 +524,12 @@ impl Endpoint for QueryEndpoint {
                                     detail: format!("not a SPARQL query: {e}"),
                                 })?;
                         crate::budget::check_query(&parsed, "query")?;
-                        let mut prepared = SparqlEvaluator::new()
+                        // ★ No `SERVICE`, refused by name before evaluation, and an evaluator
+                        // that refuses one itself in every build (ledger #1083,
+                        // `src/service.rs`): in a host with `oxigraph/http-client` on, a plain
+                        // evaluator turns `SERVICE <http://…>` into an ungated request.
+                        crate::service::refuse_in_query(&parsed, "query")?;
+                        let mut prepared = crate::service::evaluator()
                             .with_cancellation_token(deadline.token())
                             .for_query(parsed);
                         if let Some(target) = &confined {

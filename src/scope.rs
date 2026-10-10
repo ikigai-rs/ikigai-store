@@ -64,7 +64,7 @@
 //! | a sub-select, `FILTER EXISTS`, `MINUS`, a property path | confined | all of them resolve patterns through the same dataset |
 //! | `DESCRIBE <s>` with no pattern | reads `G` | ⚠ DESCRIBE collects from the **default graph** only — see below |
 //! | `FROM` / `FROM NAMED` in the text | **refused** by the endpoint | see [`names_its_own_dataset`] |
-//! | `SERVICE <http://…>` | refused by oxigraph — no HTTP client is built in | ⚠ a *build* property, not a code one; see `README.md` |
+//! | `SERVICE <http://…>` | **refused** by the endpoint, and by the evaluator itself | in every build, HTTP client or not: see `crate::service` (ledger #1083) |
 //!
 //! # ⚠ DESCRIBE reads the default graph and nothing else — upstream, in both doors
 //!
@@ -524,15 +524,17 @@ mod tests {
         );
     }
 
-    /// ⚠ `SERVICE` — federation is off in this build, and that is a property of the
-    /// BUILD rather than of this code (see `README.md` and the PENDING note): a crate
-    /// anywhere in the host's graph enabling `oxigraph/http-client` installs a default
-    /// HTTP service handler and this refusal becomes an outbound request, with no
-    /// `urn:cap:net:*` anywhere near it. This test is what would notice.
+    /// `SERVICE` under a scope: refused by the evaluator this crate builds, in EVERY build.
+    /// ⚠ Through 0.2.9 this test used a plain evaluator and passed only because no HTTP
+    /// client was built in — a property of the BUILD, which a host with `oxigraph/http-client`
+    /// on (any host linking `ikigai-shacl`) did not have, and there a scoped read reached the
+    /// network (ledger #1083). The guarantee now lives in `crate::service::evaluator`, and the
+    /// doors refuse `SERVICE` by name before this layer is ever reached
+    /// (`tests/service_egress.rs`, which also runs with the feature on).
     #[test]
-    fn a_service_clause_is_refused_because_no_http_client_is_built_in() {
+    fn a_service_clause_is_refused_by_the_evaluator_this_crate_builds() {
         let store = store();
-        let mut prepared = SparqlEvaluator::new()
+        let mut prepared = crate::service::evaluator()
             .parse_query("SELECT ?s WHERE { SERVICE <http://example.invalid/sparql> { ?s ?p ?o } }")
             .unwrap();
         confine(&mut prepared, &[NamedNode::new(G).unwrap()]);
@@ -544,8 +546,9 @@ mod tests {
         };
         assert!(
             failed,
-            "a SERVICE clause was answered — this build has an HTTP client, and a scoped \
-             read can now reach the network"
+            "a SERVICE clause was answered under a scope: the evaluator this crate builds \
+             no longer refuses it, and in a host with an HTTP client a scoped read reaches \
+             the network"
         );
     }
 
@@ -840,7 +843,7 @@ mod tests {
     #[test]
     fn a_service_clause_is_refused_over_a_set_too() {
         let store = three_tenants();
-        let mut prepared = SparqlEvaluator::new()
+        let mut prepared = crate::service::evaluator()
             .parse_query("SELECT ?s WHERE { SERVICE <http://example.invalid/sparql> { ?s ?p ?o } }")
             .unwrap();
         confine(&mut prepared, &pair());
