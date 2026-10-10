@@ -80,8 +80,8 @@
 //!   own (an `INSERT DATA` of a quad already there adds 0), so the success line carries
 //!   them only for a caller that may read `G`.
 //!
-//! `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP`, `CREATE` and `LOAD` have no `WHERE` and
-//! stay write-only. `COPY`, `MOVE` and `ADD` are rewritten by the parser into
+//! `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP` and `CREATE` have no `WHERE` and stay
+//! write-only. (`LOAD` has none either, and is refused outright: see [`parse`].) `COPY`, `MOVE` and `ADD` are rewritten by the parser into
 //! `DELETE/INSERT … WHERE` over the source graph, so they read it, and need the grant.
 //!
 //! //! # What it costs
@@ -118,7 +118,8 @@ pub(crate) struct Applied {
 /// evaluation that follows on a stack sized for them (both are recursive) and within the
 /// caller's time budget.
 ///
-/// The update is evaluated under `deadline`'s cancellation token (ledger #964).
+/// The update is evaluated under `deadline`'s cancellation token (ledger #964). An update
+/// with a `LOAD` in it is refused here, before evaluation (ledger #992, [`refuse_load`]).
 pub(crate) fn parse(update: &str, deadline: &Deadline) -> Result<PreparedSparqlUpdate> {
     crate::limits::check_sparql(update, "content")?;
     // ★ Parsed by the parser oxigraph uses, and measured before oxigraph plans it: the
@@ -129,10 +130,40 @@ pub(crate) fn parse(update: &str, deadline: &Deadline) -> Result<PreparedSparqlU
             name: "content".to_string(),
             detail: format!("not a SPARQL update: {e}"),
         })?;
+    refuse_load(&parsed)?;
     crate::budget::check_update(&parsed, "content")?;
     Ok(SparqlEvaluator::new()
         .with_cancellation_token(deadline.token())
         .for_update(parsed))
+}
+
+/// Refuse an update with a `LOAD <url>` in it, before anything is evaluated (ledger #992).
+///
+/// `LOAD` fetches a document and parses it INSIDE oxigraph, with nothing between the fetch and
+/// the parse where `urn:iki:store:load`'s depth scan ([`crate::depth`]) could stand: in a
+/// build with RDF 1.2 on, a fetched document nesting ~50,000 triple terms aborted the host on
+/// the `ikigai-store-sparql` thread (reproduced with `oxigraph/http-client` on). And the fetch
+/// is oxigraph's own, so in a host whose graph enables `oxigraph/http-client` (`ikigai-cli`
+/// does, through rudof) it is an outbound request no `urn:cap:net:*` gates (ledger #145).
+/// Without that feature `LOAD` already failed, at evaluation; it now fails at the door, by
+/// name, in every build. To bring a remote graph in, source it through the kernel (where the
+/// net capability applies) and sink it into `urn:iki:store:load`.
+fn refuse_load(update: &spargebra::Update) -> Result<()> {
+    let loads = update
+        .operations
+        .iter()
+        .any(|op| matches!(op, spargebra::GraphUpdateOperation::Load { .. }));
+    if loads {
+        return Err(Error::InvalidArgument {
+            name: "content".to_string(),
+            detail: "`LOAD` is not available through this store: it would fetch and parse a \
+                     document inside the SPARQL engine, unscanned for depth and ungated by any \
+                     network capability. Nothing was evaluated. Source the document through the \
+                     kernel and sink it into `urn:iki:store:load`"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Whether the update has a `WHERE` — i.e. READS the dataset it runs against.
@@ -143,7 +174,7 @@ pub(crate) fn parse(update: &str, deadline: &Deadline) -> Result<PreparedSparqlU
 /// clause, the default one), and none for any other operation: so "has at least one" is
 /// exactly "some operation in this request evaluates a graph pattern". That covers
 /// `DELETE WHERE`, `WITH … WHERE` and the `COPY`/`MOVE`/`ADD` rewrites, and excludes
-/// `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP`, `CREATE` and `LOAD`.
+/// `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP`, `CREATE` and `LOAD` (which [`parse`] refuses).
 /// `the_read_grant_rule_classifies_every_operation` pins the table, so an upstream change
 /// to that mapping fails a test rather than quietly reopening the oracle.
 pub(crate) fn reads_the_dataset(prepared: &PreparedSparqlUpdate) -> bool {

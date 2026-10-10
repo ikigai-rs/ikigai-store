@@ -185,6 +185,12 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # long `IN` list (one algebra node however long). `limits::sparql_stack_size` is now the one formula; with
 # debug_assertions it adds DEBUG_STACK_PER_NODE 64 KiB for each of MAX_ALGEBRA_NODES and takes DEBUG_STACK_PER_BYTE
 # 2 KiB a byte. Release sizing is unchanged. A patch: the API is additive (one function, two constants).
+# ★ 0.2.10 ALSO carries the triple-term depth bound (ledger #992), folded in before it published: with RDF 1.2 on (cli
+# gets it by unification), ~1000 levels of `<<( … )>>` given to `urn:iki:store:load` aborted the host inside the parser, in
+# all five syntaxes. `depth::check_rdf_nesting` refuses past MAX_RDF_NESTING 64 before parsing (InvalidArgument on
+# `content`), reading the text as the strict parser's lexer does. And SPARQL `LOAD` is refused at both update doors: the
+# fetched document is parsed inside oxigraph, unscannable. Still a patch: the API is additive (`pub mod depth`); the
+# behavior change is that those two inputs are refused — `LOAD` already failed in any build without `http-client`.
 version = "0.2.10"
 edition = "2021"
 license = "MIT OR Apache-2.0"
