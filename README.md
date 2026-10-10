@@ -782,6 +782,13 @@ Two layers now close it, in every build, feature or not:
   that does not exist. To bring remote data in, source it through the kernel, where the net
   capability applies, and sink it into `urn:iki:store:load` — the same answer `LOAD` gets.
 
+**Other crates can use the same layers.** `ikigai_store::service` exports them: `evaluator()`
+(the refusing evaluator), `refuse_service` / `refuse_service_in_update` (the door checks) and
+`refuse_load`. A crate that evaluates caller SPARQL with its own `SparqlEvaluator` should
+build it with `evaluator()` and check at its door. ⚠ For an update it also needs `refuse_load`,
+because nothing in the evaluator stops `LOAD`. The module docs have a table of exactly what each
+item covers, and a doctest that pins it.
+
 `LOAD <url>` is **not** governed by the service handler (oxigraph builds `LOAD`'s client
 separately); the door refusal above is the only guard, and it holds. `FROM` / `FROM NAMED` are
 never fetched: oxigraph reads them as graph names in the store. `tests/service_egress.rs` pins

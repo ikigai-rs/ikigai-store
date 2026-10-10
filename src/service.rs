@@ -1,43 +1,83 @@
-//! `SERVICE` never leaves the process, in any build (ledger #1083, #145).
+//! SPARQL that never leaves the process, in any build: the refusing evaluator and the door
+//! checks (ledger #1083, #145, #992).
+//!
+//! ★ **Public so other crates stop needing copies.** Any crate that builds its own oxigraph
+//! `SparqlEvaluator` (ikigai-ledger, ikigai-markdown, ikigai-nl and ikigai-script all do) has
+//! the hole this module closes for the store, and closes it the same way by building through
+//! [`evaluator`] and checking at its door with [`refuse_service`],
+//! [`refuse_service_in_update`] and [`refuse_load`].
 //!
 //! # The hole
 //!
 //! oxigraph's `SparqlEvaluator` installs a default HTTP service handler whenever
-//! `oxigraph/http-client` is on, and this crate cannot turn that feature off: Cargo unifies
-//! features across the whole graph, and rudof_rdf enables `http-client-rustls-native` on every
-//! native target, so any host linking `ikigai-shacl` (`ikigai-cli`, `ikigai-web-demo`) has it.
-//! There, `SERVICE <http://…>` in a caller's query was an outbound request at every one of
-//! the ten doors, scoped reads and both update doors included, with no `urn:cap:net:*` anywhere
-//! near it: a read grant on one graph was a network client. `without_default_http_service_handler`
-//! is itself `#[cfg(feature = "http-client")]`, and a crate cannot `cfg` on a dependency's
-//! feature being enabled by someone else, so it cannot be called.
+//! `oxigraph/http-client` is on, and no crate can turn that feature off for itself: Cargo
+//! unifies features across the whole graph, and rudof_rdf enables `http-client-rustls-native`
+//! on every native target, so any host linking `ikigai-shacl` (`ikigai-cli`, `ikigai-web-demo`)
+//! has it. There, `SERVICE <http://…>` in a caller's query is an outbound request with no
+//! `urn:cap:net:*` anywhere near it. oxigraph's own off switch,
+//! `without_default_http_service_handler`, is itself `#[cfg(feature = "http-client")]`, and a
+//! crate cannot `cfg` on a dependency's feature being enabled by someone else, so it cannot be
+//! called. Until 0.2.10 every one of this store's ten doors had the hole.
 //!
-//! # The fix, in two layers
+//! # What each item covers, exactly
 //!
-//! 1. **[`evaluator`]** builds every `SparqlEvaluator` this crate evaluates with, and installs
-//!    [`Refuse`] as the default service handler. `with_default_service_handler` exists in every
-//!    build, and in a build with the feature it also clears the flag that would install the
-//!    HTTP handler (oxigraph 0.5.11, `sparql/mod.rs`). So no `SERVICE`, under any name,
-//!    constant or variable, `SILENT` or not, reaches a network client. This layer is the
-//!    guarantee.
-//! 2. **[`refuse_in_query`] / [`refuse_in_update`]** walk the parsed algebra at the door and
-//!    refuse any `SERVICE`, before anything is evaluated, as an `InvalidArgument` on the
-//!    argument that carried it. This layer is the ANSWER: without it a `SERVICE SILENT` would
-//!    succeed with nothing bound (the handler's refusal is swallowed by `SILENT`, by the spec),
-//!    and a plain `SERVICE` would fail mid-evaluation as an untyped endpoint error.
+//! | item | covers | does NOT cover |
+//! | --- | --- | --- |
+//! | [`evaluator`] | every `SERVICE`, constant or variable name, `SILENT` or not, in a query or an update's `WHERE`: refused by the handler, never called, in every build | **`LOAD <url>`**: oxigraph builds `LOAD`'s HTTP client from the evaluator's HTTP settings, not from the service registry, so the handler never sees it |
+//! | [`refuse_service`] / [`refuse_service_in_update`] | a `SERVICE` anywhere in the parsed algebra (`EXISTS`, sub-selects, `OPTIONAL`, `LATERAL` included), refused as a typed `InvalidArgument` BEFORE evaluation | `LOAD`; and only what you hand it, so it is a door check, not a guarantee |
+//! | [`refuse_load`] | `LOAD <url>`, `SILENT` or not, `INTO GRAPH` or not, as a typed `InvalidArgument` before evaluation | — it is the ONLY guard against `LOAD`: an evaluator built by [`evaluator`] still fetches it in a build with `oxigraph/http-client` on |
+//!
+//! So a consumer evaluating caller-supplied SPARQL wants **all three**: [`evaluator`] for the
+//! guarantee, [`refuse_service`] (or the update form) for a typed answer, and for an update,
+//! [`refuse_load`], because nothing else stops `LOAD`. `FROM` / `FROM NAMED` / `GRAPH <iri>`
+//! need nothing: oxigraph reads them as names of graphs in the store and never fetches them.
+//!
+//! The door checks are separate from the evaluator because a `SERVICE SILENT` swallows the
+//! handler's refusal (by the spec) and answers with nothing bound, and a plain `SERVICE` fails
+//! mid-evaluation as an untyped error. Only a check before evaluation can answer both as
+//! "this input is refused".
 //!
 //! ★ Why `InvalidArgument` and not `Denied` naming `urn:cap:net:*`: no grant opens this. The
 //! store never federates, so a `Denied` would send a caller looking for a capability that
-//! changes nothing. It is the same refusal `LOAD <url>` gets (ledger #992), for the same
-//! reason, with the same remedy: fetch remote data through the kernel, where the net
-//! capability applies, and sink it into `urn:iki:store:load`.
+//! changes nothing. The refusal texts name the store's own remedy (fetch through the kernel,
+//! where the net capability applies, and sink into `urn:iki:store:load`).
 //!
-//! ⚠ What this layer does NOT govern: `LOAD <url>`. oxigraph builds `LOAD`'s HTTP client
-//! from the evaluator's HTTP settings, not from the service registry, so a refusing service
-//! handler leaves it untouched. The door refusal in [`crate::confine`] is the only thing
-//! between `LOAD` and the network, and `tests/service_egress.rs` pins that it holds in a
-//! build with the feature on. `FROM` / `FROM NAMED` are not fetches at all: oxigraph reads
-//! them as names of graphs in the store (the same test pins that too).
+//! ⚠ The checks take `spargebra`'s `Query` / `Update`, like [`crate::budget::check_query`]:
+//! parse with `spargebra::SparqlParser`, check, then hand the parsed value to
+//! `evaluator().for_query(…)` / `.for_update(…)`. Your `spargebra` must be the one oxigraph
+//! uses (0.4.x for oxigraph 0.5), which cargo unifies on its own when you name it with a caret.
+//!
+//! ```
+//! use ikigai_core::Error;
+//! use ikigai_store::service::{evaluator, refuse_load, refuse_service, refuse_service_in_update};
+//! use oxigraph::sparql::QueryResults;
+//! use oxigraph::store::Store;
+//!
+//! let parser = || spargebra::SparqlParser::new();
+//! let text = "SELECT ?s WHERE { SERVICE <http://127.0.0.1:9/sparql> { ?s ?p ?o } }";
+//!
+//! // The door check: a typed refusal, naming the argument, before anything runs.
+//! let query = parser().parse_query(text)?;
+//! let refused = refuse_service(&query, "query").unwrap_err();
+//! assert!(matches!(&refused, Error::InvalidArgument { name, detail }
+//!     if name == "query" && detail.contains("`SERVICE` is not available")));
+//!
+//! // The guarantee: even unchecked, the evaluator refuses the call itself, in every build.
+//! let store = Store::new()?;
+//! let failure = match evaluator().for_query(query).on_store(&store).execute() {
+//!     Err(e) => e.to_string(),
+//!     Ok(QueryResults::Solutions(mut rows)) => rows.next().unwrap().unwrap_err().to_string(),
+//!     Ok(_) => unreachable!(),
+//! };
+//! assert!(failure.contains("`SERVICE <http://127.0.0.1:9/sparql>` is not available"));
+//!
+//! // ⚠ LOAD is NOT a service: the service checks pass it, and only `refuse_load` stops it.
+//! let load = parser().parse_update("LOAD <http://127.0.0.1:9/doc.ttl>")?;
+//! assert!(refuse_service_in_update(&load, "content").is_ok());
+//! assert!(matches!(refuse_load(&load, "content"),
+//!     Err(Error::InvalidArgument { name, .. }) if name == "content"));
+//! # Ok::<_, Box<dyn std::error::Error>>(())
+//! ```
 
 use ikigai_core::{Error, Result};
 use oxigraph::model::NamedNode;
@@ -46,22 +86,28 @@ use oxiri::Iri;
 use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
 use spargebra::{GraphUpdateOperation, Query, Update};
 
-/// The evaluator every query and update in this crate runs on: oxigraph's, with [`Refuse`]
-/// as its default service handler, so no `SERVICE` reaches a network client in any build.
+/// A `SparqlEvaluator` with [`Refuse`] as its default service handler, so no `SERVICE` reaches
+/// a network client, in any build. Chain the rest as usual (`with_cancellation_token`,
+/// `for_query`, `parse_update`, …).
 ///
-/// ★ Build every `SparqlEvaluator` through this. A unit test below scans `src/` and fails on
-/// any other plain constructor outside a test module, because one in a host with
-/// `oxigraph/http-client` on is an outbound request with no capability on it.
-pub(crate) fn evaluator() -> SparqlEvaluator {
+/// `with_default_service_handler` exists in every build, and with `oxigraph/http-client` on it
+/// also clears the flag that would install oxigraph's HTTP handler (oxigraph 0.5.11,
+/// `sparql/mod.rs`); that is what makes this work where `without_default_http_service_handler`
+/// cannot be called. ⚠ It does NOT stop `LOAD <url>`: see [`refuse_load`].
+///
+/// ★ This crate builds every `SparqlEvaluator` through this; a unit test scans `src/` and fails
+/// on any other plain constructor outside a test module.
+pub fn evaluator() -> SparqlEvaluator {
     SparqlEvaluator::new().with_default_service_handler(Refuse)
 }
 
-/// A default service handler that refuses every service, by name.
-pub(crate) struct Refuse;
+/// A default service handler that refuses every service, by name, without calling it. Install
+/// it on an evaluator you build some other way with `with_default_service_handler(Refuse)`.
+pub struct Refuse;
 
 /// What [`Refuse`] answers: the service it would not call.
 #[derive(Debug)]
-pub(crate) struct Refused(NamedNode);
+pub struct Refused(pub NamedNode);
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -89,8 +135,9 @@ impl DefaultServiceHandler for Refuse {
     }
 }
 
-/// Refuse a parsed query with a `SERVICE` anywhere in it, naming the argument `arg`.
-pub(crate) fn refuse_in_query(query: &Query, arg: &str) -> Result<()> {
+/// Refuse a parsed query with a `SERVICE` anywhere in it, as `InvalidArgument` naming `arg`.
+/// A door check, before evaluation; [`evaluator`] is the guarantee behind it.
+pub fn refuse_service(query: &Query, arg: &str) -> Result<()> {
     let pattern = match query {
         Query::Select { pattern, .. }
         | Query::Ask { pattern, .. }
@@ -103,15 +150,47 @@ pub(crate) fn refuse_in_query(query: &Query, arg: &str) -> Result<()> {
     Ok(())
 }
 
-/// [`refuse_in_query`] for an update: the `WHERE` of every `DELETE`/`INSERT` operation.
-/// (`LOAD` is refused separately, by [`crate::confine`]; no other operation has a pattern.)
-pub(crate) fn refuse_in_update(update: &Update, arg: &str) -> Result<()> {
+/// [`refuse_service`] for an update: the `WHERE` of every `DELETE`/`INSERT` operation. No
+/// other update operation has a pattern. ⚠ It passes `LOAD`, which is not a `SERVICE`: check
+/// that with [`refuse_load`].
+pub fn refuse_service_in_update(update: &Update, arg: &str) -> Result<()> {
     let services = update.operations.iter().any(|operation| match operation {
         GraphUpdateOperation::DeleteInsert { pattern, .. } => has_service(pattern),
         _ => false,
     });
     if services {
         return Err(refusal(arg));
+    }
+    Ok(())
+}
+
+/// Refuse an update with a `LOAD <url>` in it, as `InvalidArgument` naming `arg`, before
+/// anything is evaluated (ledger #992).
+///
+/// ★ The ONLY guard against `LOAD`: the fetch is oxigraph's own, built from the evaluator's
+/// HTTP settings rather than its service registry, so [`Refuse`] never sees it. In a host whose
+/// graph enables `oxigraph/http-client` (`ikigai-cli` does, through rudof) an unchecked `LOAD`
+/// is an outbound request no `urn:cap:net:*` gates (ledger #145), and the fetched document is
+/// parsed inside oxigraph with nothing between fetch and parse for a depth scan
+/// ([`crate::depth`]) to stand in: a document nesting ~50,000 triple terms aborted the host on
+/// the `ikigai-store-sparql` thread. Without the feature `LOAD` fails at evaluation anyway; this
+/// makes it fail at the door, by name, in every build. To bring a remote graph in, source it
+/// through the kernel (where the net capability applies) and sink it into
+/// `urn:iki:store:load`.
+pub fn refuse_load(update: &Update, arg: &str) -> Result<()> {
+    let loads = update
+        .operations
+        .iter()
+        .any(|op| matches!(op, GraphUpdateOperation::Load { .. }));
+    if loads {
+        return Err(Error::InvalidArgument {
+            name: arg.to_string(),
+            detail: "`LOAD` is not available through this store: it would fetch and parse a \
+                     document inside the SPARQL engine, unscanned for depth and ungated by any \
+                     network capability. Nothing was evaluated. Source the document through the \
+                     kernel and sink it into `urn:iki:store:load`"
+                .to_string(),
+        });
     }
     Ok(())
 }
@@ -246,7 +325,7 @@ mod tests {
             format!("CONSTRUCT {{ ?s ?p ?o }} WHERE {{ {s} }}"),
             format!("DESCRIBE ?s WHERE {{ {s} }}"),
         ] {
-            let err = refuse_in_query(&query(&text), "query").expect_err(&text);
+            let err = refuse_service(&query(&text), "query").expect_err(&text);
             assert!(
                 matches!(&err, Error::InvalidArgument { name, .. } if name == "query"),
                 "{text}: {err}"
@@ -264,14 +343,14 @@ mod tests {
             "SELECT * WHERE { ?s ?p ?o FILTER EXISTS { ?s ?p ?o } }",
             "DESCRIBE <http://127.0.0.1:9/x>",
         ] {
-            refuse_in_query(&query(text), "query").unwrap_or_else(|e| panic!("{text}: {e}"));
+            refuse_service(&query(text), "query").unwrap_or_else(|e| panic!("{text}: {e}"));
         }
     }
 
     #[test]
     fn the_walk_reads_an_update_s_where() {
         let parse = |t: &str| spargebra::SparqlParser::new().parse_update(t).unwrap();
-        let err = refuse_in_update(
+        let err = refuse_service_in_update(
             &parse(
                 "INSERT DATA { <urn:a> <urn:b> <urn:c> } ; \
                  DELETE { ?s ?p ?o } WHERE { SERVICE <http://127.0.0.1:9/x> { ?s ?p ?o } }",
@@ -280,7 +359,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(&err, Error::InvalidArgument { name, .. } if name == "content"));
-        refuse_in_update(
+        refuse_service_in_update(
             &parse("DELETE { ?s ?p ?o } WHERE { ?s ?p ?o } ; CLEAR GRAPH <urn:g>"),
             "content",
         )
