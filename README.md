@@ -963,6 +963,38 @@ after 25.8–28.8 s under its job scopes as they are, answered in 23.4–23.7 s 
 row has been serialized yet — which is why the backup above is refused only after its
 sort, 25 s in. That memory is bounded by time, not by this.
 
+## ★ Every update on a store runs on one thread (ledger #1127)
+
+Through 0.2.11 each update ran on a thread spawned for it, and on the RocksDB backing that
+made every read after a run of writes slower, until the memtable flushed. RocksDB draws the
+height of each memtable skiplist node from a thread-local generator seeded from the thread's
+id, and a thread spawned after the previous one exited usually gets the same id back, so
+every commit drew the same few heights and the skiplists stopped growing upper levels.
+Every term a query decodes is a lookup in that memtable, so the cost landed on reads:
+
+| | read after the writes, against a fresh copy of the same data |
+| --- | --- |
+| 750 writes, debug, 0.2.11 | 1.2x to 8.4x (the store alone); 3.3x to 8.4x (through `ikigai-ledger`'s append) |
+| 5,000 writes, debug, 0.2.11 | 3.9x to 37x |
+| 750 writes, release, 0.2.11 | 2.8x to 13.9x |
+| 750 to 3,000 writes, debug and release, now | 0.94x to 1.10x |
+
+How bad it got depended on which seed a run reused, which is why gonk's CI saw it once and
+a rerun passed. Writes through one graph got faster too, because the scoped door reads the
+graph it copies: 750 of them took 70 s in a debug build and 33 s in release, and now take
+20 s and 3.5 s.
+
+Every update on a store now runs on that store's one long-lived writer thread, which keeps
+its generator advancing. Writes were already serialized by the store's write lock, so this
+serializes nothing new; reads still run on threads of their own. The thread's stack grows to
+fit the largest update it has run and never shrinks.
+
+⚠ **It covers the writes this crate performs.** A host that writes through the raw handle
+(`open_shared`), or commits inside `limits::on_sparql_stack` (which spawns a thread per
+call), from a fresh thread per write meets the same degeneration. Write from a thread that
+lives. `tests/post_bulk_read.rs` measures it and holds a read after 4,000 writes to 3x a
+fresh copy; `budget`'s `every_write_on_a_store_runs_on_one_thread` pins the mechanism.
+
 ## Configuration
 
 `~/.config/ikigai/store.toml` (or `$XDG_CONFIG_HOME/ikigai/store.toml`), layered the way

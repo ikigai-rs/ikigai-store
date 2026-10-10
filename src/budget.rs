@@ -33,10 +33,12 @@
 //!
 //! # 2. A deadline, and the caller is answered at it
 //!
-//! - **The caller waits at most the budget.** The evaluation runs on its own thread (sized as
-//!   [`crate::limits::on_sparql_stack`] sizes one); past the budget the caller gets a typed
-//!   [`Error::Timeout`] naming it — never a partial answer: a bound refuses, it does not
-//!   truncate.
+//! - **The caller waits at most the budget.** The evaluation runs on another thread (sized as
+//!   [`crate::limits::on_sparql_stack`] sizes one): a query on one spawned for it, an update on
+//!   the store's one long-lived writer thread, because a write committed on a freshly spawned
+//!   thread degrades RocksDB's memtable (ledger #1127, `Writer`). Past the budget the caller
+//!   gets a typed [`Error::Timeout`] naming it — never a partial answer: a bound refuses, it
+//!   does not truncate. An update's budget includes any time it waited behind another.
 //! - **The evaluation is told to stop** through oxigraph's [`CancellationToken`], and this
 //!   crate's serializers check the same token on every row, so a query whose cost is in its
 //!   rows stops between two of them.
@@ -406,7 +408,9 @@ fn timeout(budget: Duration, write: bool) -> Error {
     ))
 }
 
-/// Run one evaluation of `text` within `budget`, on a thread sized for it.
+/// Run one evaluation of `text` within `budget`, on a thread sized for it: a read on a
+/// thread of its own, an update on `writer`'s thread when one is given (ledger #1127 — see
+/// [`Writer`]).
 ///
 /// `overdue` is the store's count of evaluations still running after their callers gave up;
 /// at `max_overdue` this refuses before starting anything. See the module docs.
@@ -416,6 +420,7 @@ pub(crate) fn run<T, F>(
     budget: Duration,
     overdue: &Arc<AtomicUsize>,
     max_overdue: usize,
+    writer: Option<&Writer>,
     work: F,
 ) -> Result<T>
 where
@@ -428,7 +433,108 @@ where
         budget,
         write,
     };
-    on_its_own_thread(text, overdue, max_overdue, deadline, work)
+    on_its_own_thread(text, overdue, max_overdue, writer, deadline, work)
+}
+
+/// The one long-lived thread a store's UPDATES run on (ledger #1127).
+///
+/// ★ **Why a write may not run on a thread spawned for it.** RocksDB draws the height of
+/// every memtable skiplist node from a THREAD-LOCAL generator seeded from a hash of the
+/// thread's id (`Random::GetTLSInstance`). A thread spawned after the previous one exited
+/// usually gets the same id back — the C library reuses its memory — so a store that commits
+/// each write on a fresh thread draws the same few heights for every transaction, and the
+/// memtable's skiplists stop growing upper levels. Every lookup then walks a long top level:
+/// measured on gonk's 750-append fill (debug, oxigraph 0.5.11), a read right after the writes
+/// took 2.3x to 20x what it took on a fresh copy of the same data, depending on which seed the
+/// run reused, until the memtable flushed. Committing every write on ONE thread lets its
+/// generator advance across transactions, and the same replay measured 1.0x
+/// (`tests/post_bulk_read.rs` has the measurement and the bound).
+///
+/// - **Writes were already one at a time** — every write door takes the store's write lock
+///   — so running them on one thread serializes nothing that ran in parallel before; a write
+///   waits in this queue where it used to wait on that lock.
+/// - **Reads stay on threads of their own.** A read inserts nothing into a memtable, and
+///   reads do run in parallel.
+/// - **The stack grows, never shrinks.** The thread is started with a stack that fits the
+///   first update ([`crate::limits::sparql_stack_size`], rounded up to a power of two); an
+///   update that needs more replaces it with a larger one, and the old thread finishes what
+///   was queued on it and exits. A stack is reserved address space and only touched as deep
+///   as an update recurses, but what was touched stays resident for the thread's life.
+/// - **A write whose caller gave up while it waited is not run**, and leaves the overdue
+///   count when it is skipped.
+/// - **One per store**, shared by every clone of it, and gone with the last clone: dropping
+///   the store drops the queue's sender and the thread exits once it is empty. It never holds
+///   the dataset itself, so a store can be reopened at the same path as soon as it is dropped.
+/// - On wasm there are no threads, and an update runs inline like everything else.
+///
+/// ⚠ It covers the writes THIS crate performs. A host that writes through the raw handle
+/// (`open_shared`) or commits inside [`crate::limits::on_sparql_stack`], which spawns a
+/// thread per call, on a fresh thread per write meets the same degeneration, and the fix is
+/// the same: write from a thread that lives.
+#[derive(Default)]
+pub(crate) struct Writer {
+    #[cfg(not(target_family = "wasm"))]
+    thread: Mutex<Option<WriterThread>>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct WriterThread {
+    jobs: std::sync::mpsc::Sender<Job>,
+    stack: usize,
+}
+
+#[cfg(not(target_family = "wasm"))]
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(not(target_family = "wasm"))]
+impl Writer {
+    /// Queue `job` on the writer thread, first starting one — or a larger one, when the
+    /// current stack is smaller than `stack` — if need be.
+    fn submit(&self, stack: usize, job: Job) -> Result<()> {
+        let mut slot = self.thread.lock().unwrap_or_else(|e| e.into_inner());
+        let job = match slot.as_ref() {
+            Some(current) if current.stack >= stack => match current.jobs.send(job) {
+                Ok(()) => return Ok(()),
+                // The thread is gone, which nothing here does on purpose (a job catches its own
+                // panic): start another rather than lose the write.
+                Err(std::sync::mpsc::SendError(job)) => job,
+            },
+            _ => job,
+        };
+        let size = stack
+            .checked_next_power_of_two()
+            .unwrap_or(stack)
+            .min(crate::limits::sparql_stack_size_for_len(
+                crate::limits::MAX_SPARQL_BYTES,
+            ))
+            .max(stack);
+        let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("ikigai-store-writer".to_string())
+            .stack_size(size)
+            .spawn(move || {
+                for job in queue {
+                    job();
+                }
+            })
+            .map_err(|e| {
+                Error::Unavailable(format!(
+                    "could not start a {} MiB thread to run this store's SPARQL updates on: {e}",
+                    size >> 20
+                ))
+            })?;
+        jobs.send(job)
+            .map_err(|_| Error::Endpoint("internal: a new SPARQL writer thread ended".into()))?;
+        *slot = Some(WriterThread { jobs, stack: size });
+        Ok(())
+    }
+
+    /// The writer thread's stack, or `None` before the first write. For tests.
+    #[cfg(test)]
+    fn stack(&self) -> Option<usize> {
+        let slot = self.thread.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref().map(|current| current.stack)
+    }
 }
 
 /// On wasm there are no threads: the work runs inline, and so is unbounded in time. The
@@ -438,13 +544,14 @@ fn on_its_own_thread<T, F>(
     text: &str,
     overdue: &Arc<AtomicUsize>,
     max_overdue: usize,
+    writer: Option<&Writer>,
     deadline: Deadline,
     work: F,
 ) -> Result<T>
 where
     F: FnOnce(&Deadline) -> Result<T>,
 {
-    let _ = (text, overdue, max_overdue);
+    let _ = (text, overdue, max_overdue, writer);
     work(&deadline)
 }
 
@@ -453,6 +560,7 @@ fn on_its_own_thread<T, F>(
     text: &str,
     overdue: &Arc<AtomicUsize>,
     max_overdue: usize,
+    writer: Option<&Writer>,
     deadline: Deadline,
     work: F,
 ) -> Result<T>
@@ -478,30 +586,43 @@ where
     let state = Arc::clone(&deadline.state);
     let token = deadline.token.clone();
     let worker_overdue = Arc::clone(overdue);
-    std::thread::Builder::new()
-        .name("ikigai-store-sparql".to_string())
-        .stack_size(stack)
-        .spawn(move || {
-            let outcome =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&deadline)));
-            {
-                let mut state = lock(&deadline.state);
-                match *state {
-                    State::Abandoned => {
-                        worker_overdue.fetch_sub(1, Ordering::SeqCst);
-                    }
-                    _ => *state = State::Settled,
+    let body = move || {
+        // A write can wait in the writer's queue past its caller's budget: then the caller has
+        // already been answered and counted it overdue, and running it would only be work
+        // whose commit `settle` refuses.
+        if *lock(&deadline.state) == State::Abandoned {
+            worker_overdue.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&deadline)));
+        {
+            let mut state = lock(&deadline.state);
+            match *state {
+                State::Abandoned => {
+                    worker_overdue.fetch_sub(1, Ordering::SeqCst);
                 }
+                _ => *state = State::Settled,
             }
-            // The caller may be gone (it gave up); that is the case `Abandoned` counted.
-            let _ = tx.send(outcome);
-        })
-        .map_err(|e| {
-            Error::Unavailable(format!(
-                "could not start a {} MiB thread to evaluate this SPARQL text on: {e}",
-                stack >> 20
-            ))
-        })?;
+        }
+        // The caller may be gone (it gave up); that is the case `Abandoned` counted.
+        let _ = tx.send(outcome);
+    };
+    match writer {
+        // ★ Never on a fresh thread: see `Writer` (ledger #1127).
+        Some(writer) => writer.submit(stack, Box::new(body))?,
+        None => {
+            std::thread::Builder::new()
+                .name("ikigai-store-sparql".to_string())
+                .stack_size(stack)
+                .spawn(body)
+                .map_err(|e| {
+                    Error::Unavailable(format!(
+                        "could not start a {} MiB thread to evaluate this SPARQL text on: {e}",
+                        stack >> 20
+                    ))
+                })?;
+        }
+    }
     let lost = || Error::Endpoint("internal: a SPARQL worker ended without answering".into());
     let outcome = match rx.recv_timeout(budget) {
         Ok(outcome) => outcome,
@@ -1220,7 +1341,16 @@ mod tests {
     #[test]
     fn an_answer_inside_the_budget_is_returned() {
         let overdue = counter();
-        let got = run("q", false, Duration::from_secs(5), &overdue, 1, |_| Ok(7)).unwrap();
+        let got = run(
+            "q",
+            false,
+            Duration::from_secs(5),
+            &overdue,
+            1,
+            None,
+            |_| Ok(7),
+        )
+        .unwrap();
         assert_eq!(got, 7);
         assert_eq!(overdue.load(Ordering::SeqCst), 0);
     }
@@ -1235,6 +1365,7 @@ mod tests {
             Duration::from_millis(100),
             &overdue,
             4,
+            None,
             |deadline| {
                 // Cooperative work: stops when told.
                 while deadline.check().is_ok() {
@@ -1271,6 +1402,7 @@ mod tests {
             Duration::from_millis(50),
             &overdue,
             1,
+            None,
             move |_| {
                 let _ = held.recv();
                 Ok(())
@@ -1279,7 +1411,16 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Timeout(_)));
         assert_eq!(overdue.load(Ordering::SeqCst), 1);
-        let refused = run("q", false, Duration::from_secs(5), &overdue, 1, |_| Ok(())).unwrap_err();
+        let refused = run(
+            "q",
+            false,
+            Duration::from_secs(5),
+            &overdue,
+            1,
+            None,
+            |_| Ok(()),
+        )
+        .unwrap_err();
         assert!(
             matches!(&refused, Error::Unavailable(m) if m.contains("still running")),
             "{refused}"
@@ -1290,7 +1431,16 @@ mod tests {
             assert!(wait.elapsed() < Duration::from_secs(5));
             std::thread::sleep(Duration::from_millis(5));
         }
-        run("q", false, Duration::from_secs(5), &overdue, 1, |_| Ok(())).unwrap();
+        run(
+            "q",
+            false,
+            Duration::from_secs(5),
+            &overdue,
+            1,
+            None,
+            |_| Ok(()),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1305,6 +1455,7 @@ mod tests {
             Duration::from_millis(50),
             &overdue,
             4,
+            None,
             move |deadline| {
                 // Slow work that does not look at the token, then a commit.
                 std::thread::sleep(Duration::from_millis(300));
@@ -1333,10 +1484,157 @@ mod tests {
                 Duration::from_secs(5),
                 &overdue,
                 1,
+                None,
                 |_| -> Result<()> { panic!("boom") },
             );
         });
         assert!(caught.is_err());
+        assert_eq!(overdue.load(Ordering::SeqCst), 0);
+    }
+
+    /// ★ The deterministic half of ledger #1127 (`tests/post_bulk_read.rs` measures the
+    /// symptom, whose size depends on luck): every update on one store runs on the SAME
+    /// thread, never one spawned for it, so RocksDB's thread-local skiplist generator keeps
+    /// advancing across commits. A read still gets a thread of its own.
+    #[test]
+    fn every_write_on_a_store_runs_on_one_thread() {
+        let overdue = counter();
+        let writer = Writer::default();
+        let on = |write: bool| {
+            run(
+                "q",
+                write,
+                Duration::from_secs(5),
+                &overdue,
+                1,
+                write.then_some(&writer),
+                |_| Ok(std::thread::current().id()),
+            )
+            .unwrap()
+        };
+        let first = on(true);
+        assert_ne!(first, std::thread::current().id());
+        for _ in 0..5 {
+            assert_eq!(on(true), first, "an update ran on a thread of its own");
+        }
+        assert_ne!(on(false), first, "a read waited for the writer");
+    }
+
+    #[test]
+    fn an_update_needing_more_stack_moves_the_writer_to_a_larger_thread() {
+        let overdue = counter();
+        let writer = Writer::default();
+        let write = |text: &str| {
+            run(
+                text,
+                true,
+                Duration::from_secs(5),
+                &overdue,
+                1,
+                Some(&writer),
+                |_| Ok(std::thread::current().id()),
+            )
+            .unwrap()
+        };
+        let small = write("q");
+        let first_stack = writer.stack().unwrap();
+        assert!(first_stack >= crate::limits::sparql_stack_size("q"));
+        assert!(first_stack.is_power_of_two());
+        // Short enough that its rounded-up stack still fits the first thread: same thread.
+        assert_eq!(write("qq"), small);
+        let long = "q".repeat(64 << 10);
+        let large = write(&long);
+        assert_ne!(large, small);
+        assert!(writer.stack().unwrap() >= crate::limits::sparql_stack_size(&long));
+        // And the larger thread serves the smaller updates from then on.
+        assert_eq!(write("q"), large);
+    }
+
+    #[test]
+    fn a_queued_write_whose_caller_gave_up_is_not_run() {
+        let overdue = counter();
+        let writer = Arc::new(Writer::default());
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let blocker = {
+            let (overdue, writer) = (Arc::clone(&overdue), Arc::clone(&writer));
+            std::thread::spawn(move || {
+                run(
+                    "q",
+                    true,
+                    Duration::from_secs(30),
+                    &overdue,
+                    4,
+                    Some(&writer),
+                    move |_| {
+                        hold.recv().unwrap();
+                        Ok(())
+                    },
+                )
+            })
+        };
+        // Wait until the blocker holds the writer thread.
+        let started = Instant::now();
+        while writer.stack().is_none() {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ran = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&ran);
+        let err = run(
+            "q",
+            true,
+            Duration::from_millis(50),
+            &overdue,
+            4,
+            Some(&writer),
+            move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Timeout(m) if m.contains("Nothing was written")),
+            "{err}"
+        );
+        assert_eq!(overdue.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        blocker.join().unwrap().unwrap();
+        let wait = Instant::now();
+        while overdue.load(Ordering::SeqCst) != 0 {
+            assert!(wait.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "an abandoned write was run");
+    }
+
+    #[test]
+    fn a_panic_in_a_write_reaches_its_caller_and_the_writer_lives_on() {
+        let overdue = counter();
+        let writer = Writer::default();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = run(
+                "q",
+                true,
+                Duration::from_secs(5),
+                &overdue,
+                1,
+                Some(&writer),
+                |_| -> Result<()> { panic!("boom") },
+            );
+        }));
+        assert!(caught.is_err());
+        let got = run(
+            "q",
+            true,
+            Duration::from_secs(5),
+            &overdue,
+            1,
+            Some(&writer),
+            |_| Ok(7),
+        )
+        .unwrap();
+        assert_eq!(got, 7);
         assert_eq!(overdue.load(Ordering::SeqCst), 0);
     }
 

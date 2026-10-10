@@ -163,12 +163,17 @@ pub const DEBUG_STACK_PER_NODE: usize = 64 << 10;
 /// }
 /// ```
 pub fn sparql_stack_size(text: &str) -> usize {
+    sparql_stack_size_for_len(text.len())
+}
+
+/// [`sparql_stack_size`] for a text of `len` bytes.
+pub(crate) fn sparql_stack_size_for_len(len: usize) -> usize {
     if cfg!(debug_assertions) {
         STACK_BASE
             .saturating_add(crate::budget::MAX_ALGEBRA_NODES.saturating_mul(DEBUG_STACK_PER_NODE))
-            .saturating_add(text.len().saturating_mul(DEBUG_STACK_PER_BYTE))
+            .saturating_add(len.saturating_mul(DEBUG_STACK_PER_BYTE))
     } else {
-        STACK_BASE.saturating_add(text.len().saturating_mul(STACK_PER_BYTE))
+        STACK_BASE.saturating_add(len.saturating_mul(STACK_PER_BYTE))
     }
 }
 
@@ -246,6 +251,36 @@ fn refuse_ambiguous(arg: &str, readings: usize) -> Error {
 /// a stack this size) is a transient [`Error::Unavailable`], never a fallback to running
 /// inline — inline is the overflow this exists to prevent. On wasm there are no threads,
 /// and `work` runs inline.
+///
+/// ⚠ **Only what runs ON this thread gets its stack** (ledger #1122). Work that `work` hands
+/// to another thread — a rayon pool, a spawned thread or task, an async executor, a channel to
+/// a worker — recurses on THAT thread's stack, usually 2 MiB, and the sizing here does
+/// nothing for it. `ikigai-shacl` was misled exactly so (ledger #1119): rudof's validator
+/// moves work onto rayon's global pool whenever a shape level has two or more shapes, so the
+/// sized thread protected nothing and a 3,000-term chain aborted the process. Keep every
+/// parse and every evaluation of the text inside `work` itself, or run the pool on threads
+/// sized with [`sparql_stack_size`].
+///
+/// ```
+/// use ikigai_store::limits::on_sparql_stack;
+///
+/// let (here, spawned) = on_sparql_stack("SELECT * WHERE { ?s ?p ?o }", || {
+///     let here = std::thread::current().name().map(str::to_string);
+///     let spawned = std::thread::spawn(|| std::thread::current().name().map(str::to_string))
+///         .join()
+///         .unwrap();
+///     Ok((here, spawned))
+/// })
+/// .unwrap();
+/// assert_eq!(here.as_deref(), Some("ikigai-store-sparql")); // the sized thread
+/// assert_eq!(spawned, None); // not the sized thread: a default stack
+/// ```
+///
+/// ⚠ And it spawns a NEW thread per call, so it is the wrong place to COMMIT a write to a
+/// RocksDB-backed store over and over: RocksDB seeds a thread-local generator from the
+/// thread's id, a new thread usually reuses the last one's id, and repeated commits from
+/// such threads degrade the memtable for every later read (ledger #1127; this crate's own
+/// updates run on one long-lived writer thread for that reason — see the README).
 pub fn on_sparql_stack<T, F>(text: &str, work: F) -> Result<T>
 where
     T: Send,

@@ -436,20 +436,22 @@ fn a_query_past_the_byte_bound_is_refused_by_name() {
     assert!(err.contains("`query`") && err.contains("1048576"), "{err}");
 }
 
-/// RELEASE BUILDS ONLY, and slow (~30 s): a chain the bracket bound does not cover, far
-/// past what a 2 MiB thread holds (~2,000 terms), runs on the stack `on_sparql_stack` sizes
-/// for it. Not run at the byte bound itself only because the evaluator is QUADRATIC in a
-/// chain's length — 40,000 terms take ~30 s, 80,000 more than two minutes — which is a CPU
-/// cost this crate bounds in time, not here (see the README). It is a release-build test for
-/// its running time only: a debug build sizes its thread for its own frames
-/// (`limits::sparql_stack_size`, ledger #1003), but evaluates far slower.
+/// A chain the bracket bound does not cover, twenty times what a 2 MiB thread holds (~2,000
+/// terms), is PARSED on the stack `on_sparql_stack` sizes for it and then refused by name by
+/// the algebra bound — the refusal is the evidence the parse did not abort the host.
 ///
-///     cargo test --release --test sparql_nesting -- --ignored --nocapture
+/// Until ledger #964 (0.2.8) this was an ignored, release-only test that the 40,000-term chain
+/// RAN (~30 s: the evaluator is quadratic in a chain). `MAX_ALGEBRA_NODES` (1024) now refuses
+/// it before planning, so the ignored test failed under `--include-ignored` and asserted a
+/// behavior that no longer exists (ledger #1122). Refused in milliseconds, it runs in every
+/// build.
 #[test]
-#[ignore]
-fn a_chain_twenty_times_what_a_worker_stack_holds_runs() {
+fn a_chain_twenty_times_what_a_worker_stack_holds_is_parsed_then_refused_by_the_algebra_bound() {
     let outcome = probe("or1-chain", 40_000);
-    assert!(outcome.starts_with("ok "), "{outcome}");
+    assert!(
+        outcome.starts_with("err ") && outcome.contains("MAX_ALGEBRA_NODES"),
+        "{outcome}"
+    );
 }
 
 // ------------------------------------------------------------------ debug and release agree

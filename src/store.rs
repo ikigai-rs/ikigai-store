@@ -235,6 +235,10 @@ pub struct DurableStore {
     /// How many evaluations are still running after their callers gave up, shared by every
     /// clone — see [`overdue_evaluations`](Self::overdue_evaluations).
     overdue: Arc<AtomicUsize>,
+    /// The one thread every update on this store runs on, shared by every clone (ledger
+    /// #1127): a write committed on a freshly spawned thread degrades RocksDB's memtable. See
+    /// `budget::Writer`.
+    writer: Arc<crate::budget::Writer>,
 }
 
 /// One bound space's place in [`DurableStore::spaces`]. Decrements on drop, so the count
@@ -280,6 +284,7 @@ impl DurableStore {
             budget: TimeBudget::default(),
             answer: AnswerBudget::default(),
             overdue: Arc::new(AtomicUsize::new(0)),
+            writer: Arc::default(),
         })
     }
 
@@ -335,6 +340,7 @@ impl DurableStore {
             budget: TimeBudget::default(),
             answer: AnswerBudget::default(),
             overdue: Arc::new(AtomicUsize::new(0)),
+            writer: Arc::default(),
         })
     }
 
@@ -724,6 +730,7 @@ impl DurableStore {
             budget,
             &self.overdue,
             self.budget.max_overdue(),
+            write.then_some(&*self.writer),
             work,
         )
     }
