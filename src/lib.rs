@@ -84,6 +84,16 @@
 //! thread whose stack is sized for it. [`limits`] has the measurements and the one subtle
 //! part — a `<` can be an IRI or a less-than, and the scan follows both (ledger #915).
 //!
+//! # …and evaluated within a time budget
+//!
+//! Inside those bounds oxigraph is still superlinear (a 3 KB property path plans for 19 s, a
+//! 118-byte cross product runs for minutes). So the parsed algebra is bounded before oxigraph
+//! plans it, and every evaluation runs within a budget the host sets per door through the
+//! capability (a request's `budget=` can only lower it): the caller is answered with a typed
+//! `Error::Timeout` at the budget, the evaluation is cancelled, and an update that runs out
+//! of time writes nothing. [`budget`] has the numbers, the default and its evidence, and —
+//! as plainly — what oxigraph still cannot be stopped partway through (ledger #964).
+//!
 //! # A tenancy boundary: scopes narrower than the whole dataset
 //!
 //! [`CAP_WRITE`] is all-or-nothing, so a module layered over this store makes its callers
@@ -221,6 +231,7 @@
 //!
 //! [`ikigai-sparql`]: https://crates.io/crates/ikigai-sparql
 
+pub mod budget;
 pub mod config;
 pub(crate) mod confine;
 pub mod endpoints;
@@ -229,6 +240,7 @@ pub(crate) mod scope;
 pub mod sparql;
 pub mod store;
 
+pub use budget::TimeBudget;
 pub use config::StoreConfig;
 pub use endpoints::{
     cap_read_graph, cap_write_graph, space, CAP_READ, CAP_READ_ANY, CAP_READ_GRAPH, CAP_WRITE,

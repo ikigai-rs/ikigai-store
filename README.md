@@ -696,8 +696,8 @@ both readings and refuses on the deeper (`src/limits.rs` has the argument).
   bound holds in both.
 - **On wasm there are no threads**, so only the two bounds apply.
 - **It does not bound time.** The evaluator is quadratic in an operator chain: 40,000 `||1`
-  terms (120 KB) take ~30 s of a core, 80,000 more than two minutes. A host exposed to
-  untrusted queries needs its own budget.
+  terms (120 KB) take ~30 s of a core, 80,000 more than two minutes. The next section does
+  (ledger #964).
 - **The bounds are constants, not configuration.** They protect the process, not a policy,
   so a per-host knob would only be a way to turn the protection off; a host that needs a
   tighter limit can refuse earlier at its own door with `ikigai_store::limits::check_sparql`,
@@ -707,6 +707,104 @@ both readings and refuses on the deeper (`src/limits.rs` has the argument).
 `tests/sparql_nesting.rs` reproduces the abort in a child process on a 2 MiB thread at all
 ten doors (it fails, with the child killed by `SIGABRT`, against 0.2.6);
 `tests/sparql_stack_measure.rs` re-measures every number above when oxigraph moves.
+
+## ★ Every evaluation has a time budget (ledger #964)
+
+Inside the byte and nesting bounds, oxigraph is still superlinear in shapes no lexical bound
+can refuse. Measured on 0.2.7 (release build, `tests/sparql_time_measure.rs`):
+
+| query | size | time |
+| --- | --- | --- |
+| `FILTER(1‖1‖…)`, 40,000 terms | 120 KB | 30 s |
+| a property path `:p/:p/…`, 1,000 steps | 3 KB | 19 s |
+| a property path, 2,000 steps | 6 KB | over 60 s (killed) |
+| 500 triple patterns sharing a subject | 9 KB | over 30 s (killed) |
+| a cross product of 6 unconstrained patterns, over 120 quads | 118 bytes | over 30 s (killed) |
+
+So every door that evaluates caller SPARQL (the eight query IRIs and both update IRIs) now
+has three layers, aligned with `ikigai-sparql`'s (ledger #964; the hub means to fold the
+two into one shared module):
+
+1. **The algebra is bounded before oxigraph plans it.** oxigraph checks its cancellation
+   token only where it touches the dataset, and its planner touches none — the 3 KB path
+   above spends its 19 s planning and saw the token 18 s after it fired. So the parsed query
+   is measured first, and refused with an `InvalidArgument` naming the bound past
+   `budget::MAX_JOIN_OPERANDS` (**32** operands in one join; a sequence path counts one a
+   step) or `budget::MAX_ALGEBRA_NODES` (**1024** operators in the whole query or update;
+   `VALUES` rows, constant `IN` members and `INSERT DATA` quads cost nothing). The largest
+   join the ecosystem runs has 11 patterns; the worst plan inside both bounds is ~125 ms.
+2. **A deadline, and the caller is answered at it**, with a typed `Error::Timeout` naming
+   the budget — never later, never a partial answer. The evaluation is cancelled, and this
+   crate's serializers check the token between rows. **An update that runs out of time
+   writes nothing**, then or later: its transaction commits only while the caller is still
+   waiting, under the lock the caller takes to give up.
+3. **What still cannot be stopped is counted and capped.** Inside the bounds, an aggregate
+   or join over rows already in memory (`COUNT(*)` over a cross product) still ignores the
+   token. Such an evaluation is counted as overdue (`DurableStore::overdue_evaluations`),
+   and while `TimeBudget::max_overdue` are overdue (default: a quarter of the machine's
+   cores, at least one) every new evaluation is refused with a transient
+   `Error::Unavailable`, so one store's callers cannot pin more cores than that.
+
+`tests/sparql_time_budget.rs` pins all of it, including waiting for an abandoned update's
+worker to end and checking the store is unchanged, at both update doors.
+
+### The default, and why
+
+**5 s for every caller** (as `ikigai-sparql`), **120 s for root** and as the most any caller
+can be lifted to. The evidence, measured over a copy of gonk's live dataset (361,607 quads,
+the largest store in the ecosystem; release build, on RocksDB as gonk runs it): the ledger's
+bulk reads (a 43 KB `VALUES` of all 902 items) take 44–232 ms, and reading the whole
+348,232-quad browse graph 1.4 s. So the base is 3.5 times the heaviest caller-facing read.
+
+⚠ **Whole-dataset owner work is not inside it.** gonk's BACKUP query — every quad,
+`ORDER BY ?g ?s ?p ?o`, 121 MB of JSON — takes **24.6 s** on that RocksDB copy (0.44 s in
+memory), and gonk runs it under a scoped job capability, which gets the base. A host running
+such a job must grant it a budget (below) or run it as root.
+
+### How a host sets it — per door, through the capability; a caller can only tighten
+
+```rust
+use ikigai_store::{budget::{cap_budget, TimeBudget}, DurableStore};
+use std::time::Duration;
+
+let store = DurableStore::open(&config.path)?
+    .with_time_budget(
+        TimeBudget::new(Duration::from_millis(1000))     // what EVERY caller gets
+            .with_ceiling(Duration::from_secs(120)),     // root, and the most a grant lifts to
+    );
+// The anonymous door's capability holds no budget grant: 1 s.
+// The signed-in door's holds `cap_budget(5_000)` = `urn:cap:store:budget:5000`: 5 s.
+// The backup job's holds `cap_budget(120_000)`; the owner's socket holds root: 120 s.
+```
+
+- A capability holding `urn:cap:store:budget:<milliseconds>` gets the largest such grant,
+  never below the base and never above the ceiling; root gets the ceiling.
+- **Any request may carry `budget=<milliseconds>`, which can only LOWER that** (the same
+  argument, rule and wording as `ikigai-sparql`'s). A door may stamp it — overwriting the
+  caller's — instead of, or as well as, setting the base.
+
+The capability is the channel because it is the one thing a host already stamps per door
+that a caller cannot forge, and it follows a request down its sub-requests — a handler that
+queries the store on its caller's behalf runs on its caller's budget. (`ikigai-sparql` puts
+its ceiling on the space instead; a store cannot, because two spaces over one store forfeit
+caching, so a per-space ceiling could not tell two doors on one kernel apart.) ★ **A caller
+cannot raise its own budget**: attenuating a capability only removes grants, removing a
+budget grant only lowers the budget towards the base, and `budget=` takes the smaller. A
+budget grant is never REQUIRED, so it appears in no endpoint's declared `requires`.
+
+### ⚠ What it does not do
+
+- **An aggregate or join over rows already in memory cannot be stopped partway** (layer 3).
+  The caller is answered at the budget and the cores are capped, but the core is not
+  released until oxigraph's loop ends. The real fix is upstream: `spareval` checking its
+  token in those loops.
+- **An overdue update keeps the write lock** until its worker ends, so other writes wait (and
+  time out) behind it. It still commits nothing.
+- **`urn:iki:store:load` is not budgeted**: it parses RDF, not SPARQL, and is linear.
+- **Memory is not budgeted.** A query that answers within its budget can still build a large
+  result (gonk's backup is 121 MB of JSON).
+- **On wasm there are no threads**, so an evaluation runs inline: only the algebra bounds
+  apply.
 
 ## Configuration
 

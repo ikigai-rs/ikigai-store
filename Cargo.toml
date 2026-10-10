@@ -229,6 +229,15 @@ ikigai-core = "0.1.57"
 # resolution where that query leaks, so a later regression upstream is caught as well.
 # ⚠ `"0.5.1"` is still a CEILING at `<0.6.0`.
 oxigraph = { version = "0.5.1", default-features = false }
+# The parser oxigraph itself uses, named directly so a query's ALGEBRA can be measured against
+# the time budget's bounds before oxigraph plans it (ledger #964): planning cannot be
+# cancelled. Its type must be the one oxigraph converts from (`for_query`/`for_update`), and
+# oxigraph 0.5.11 pins `=0.4.7`, so this floor is that version and resolution unifies them —
+# the same line `ikigai-sparql` carries. ⚠ A CARET, not `=0.4.7`: a later oxigraph 0.5.x
+# pinning `=0.4.8` still unifies with it. What WOULD break a stranger's fresh build is an
+# oxigraph 0.5.x moving to spargebra 0.5 — two spargebras, and `for_query` would not accept
+# ours. `sep-0006` because oxigraph enables it and the algebra walk names `Lateral`.
+spargebra = { version = "0.4.7", features = ["sep-0006"] }
 # The layered `store.toml`. `deny_unknown_fields` on the layer type is what makes a
 # misspelled key loud instead of ignored. Both crates are pure Rust and wasm-clean.
 serde = { version = "1", features = ["derive"] }

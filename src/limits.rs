@@ -39,7 +39,9 @@
 //! length: 40,000 `||1` terms (120 KB) take ~30 s of a core in a release build and 80,000
 //! more than two minutes, and long property paths, long BGPs and deeply nested collections
 //! are slow well before they are deep. This module is about the stack — an abort takes
-//! down every request at once — and leaves a query budget to the host.
+//! down every request at once. Time is [`crate::budget`]'s (ledger #964): this crate's doors
+//! run every evaluation within one, on a thread sized exactly as [`on_sparql_stack`] sizes
+//! it.
 //!
 //! # The scan is exact about what it skips, and that took an automaton
 //!

@@ -13,8 +13,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ikigai_core::{Error, Result};
+use ikigai_core::{Capability, Error, Result};
 use oxigraph::model::{GraphNameRef, NamedOrBlankNode};
+
+use crate::budget::{Deadline, TimeBudget};
 
 /// The canonical store type, re-exported so a host names ONE `Store`.
 ///
@@ -226,6 +228,11 @@ pub struct DurableStore {
     /// Set only on the copy a space owns, when that space was bound too late to be safe:
     /// every request through it is refused. See [`spaces_bound`](Self::spaces_bound).
     refused: bool,
+    /// How long a SPARQL evaluation may run — see [`with_time_budget`](Self::with_time_budget).
+    budget: TimeBudget,
+    /// How many evaluations are still running after their callers gave up, shared by every
+    /// clone — see [`overdue_evaluations`](Self::overdue_evaluations).
+    overdue: Arc<AtomicUsize>,
 }
 
 /// One bound space's place in [`DurableStore::spaces`]. Decrements on drop, so the count
@@ -268,6 +275,8 @@ impl DurableStore {
             cached: Arc::new(AtomicBool::new(false)),
             binding: None,
             refused: false,
+            budget: TimeBudget::default(),
+            overdue: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -320,6 +329,8 @@ impl DurableStore {
             cached: Arc::new(AtomicBool::new(false)),
             binding: None,
             refused: false,
+            budget: TimeBudget::default(),
+            overdue: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -614,6 +625,70 @@ impl DurableStore {
             graphs.insert(name.to_string(), GraphDigest { quads, checksum });
         }
         Ok(GraphFingerprint { graphs })
+    }
+
+    /// Set how long this store's SPARQL evaluations may run (builder). Every clone made
+    /// AFTER this carries it, so call it before [`space`](crate::space) — which a host does
+    /// at startup anyway. The default is [`TimeBudget::default`]: 5 s for every caller,
+    /// 120 s for root and as the most a `urn:cap:store:budget:<ms>` grant can lift a caller
+    /// to. [`crate::budget`] has the whole story, including what it cannot stop.
+    ///
+    /// ```
+    /// use ikigai_store::{budget::TimeBudget, DurableStore};
+    /// use std::time::Duration;
+    ///
+    /// // An anonymous door gets half a second; the host's own doors hold a grant or root.
+    /// let store = DurableStore::in_memory()?
+    ///     .with_time_budget(TimeBudget::new(Duration::from_millis(500)));
+    /// assert_eq!(store.time_budget().base(), Duration::from_millis(500));
+    /// # Ok::<(), ikigai_core::Error>(())
+    /// ```
+    pub fn with_time_budget(mut self, budget: TimeBudget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// The time budget this store's evaluations run under.
+    pub fn time_budget(&self) -> TimeBudget {
+        self.budget
+    }
+
+    /// How many SPARQL evaluations over this dataset are still running after their callers
+    /// were answered with a timeout, right now.
+    ///
+    /// Usually 0, and back to 0 within milliseconds of a timeout: oxigraph stops when it
+    /// next reads a quad. A number that STAYS up is a query shape oxigraph cannot stop
+    /// partway (see [`crate::budget`]), holding a core each; at
+    /// [`TimeBudget::max_overdue`] the store refuses new evaluations until one ends.
+    pub fn overdue_evaluations(&self) -> usize {
+        self.overdue.load(Ordering::SeqCst)
+    }
+
+    /// Run one evaluation of `text` (an update when `write`) for a caller holding
+    /// `capability`, within the budget that capability gets — or the request's own `budget=`
+    /// milliseconds (`requested`) when that is smaller. See [`crate::budget::run`].
+    pub(crate) fn evaluate<T, F>(
+        &self,
+        text: &str,
+        write: bool,
+        capability: &Capability,
+        requested: Option<&str>,
+        work: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Deadline) -> Result<T> + Send + 'static,
+    {
+        let budget =
+            crate::budget::effective_budget(requested, self.budget.for_capability(capability))?;
+        crate::budget::run(
+            text,
+            write,
+            budget,
+            &self.overdue,
+            self.budget.max_overdue(),
+            work,
+        )
     }
 
     /// The dataset, for this crate's endpoints. Deliberately **not** `pub`: see the

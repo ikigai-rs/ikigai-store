@@ -14,7 +14,10 @@
 //! `Update` keeps its `spargebra` AST private and exposes only the `USING` clauses, and
 //! taking a direct `spargebra` dependency would mean pinning `=0.4.7` beside oxigraph's
 //! own exact pin, so a stranger's fresh `cargo add ikigai-store` would stop compiling the
-//! day oxigraph bumps it. Not enough: `DELETE WHERE { GRAPH ?g { ?s ?p ?o } }` names its
+//! day oxigraph bumps it. (Since ledger #964 this crate does depend on `spargebra`, at a
+//! caret that unifies with oxigraph's pin, to bound a query's algebra before planning — see
+//! the note in `Cargo.toml`. The argument below, that a syntactic check would not be enough,
+//! stands either way.) Not enough: `DELETE WHERE { GRAPH ?g { ?s ?p ?o } }` names its
 //! graph with a *variable*, and `INSERT DATA { <s> <p> <o> }` names none at all and
 //! writes the default graph.
 //!
@@ -96,6 +99,8 @@ use std::collections::HashSet;
 
 use ikigai_core::{Error, Result};
 use oxigraph::model::{GraphName, NamedNode, Quad};
+
+use crate::budget::Deadline;
 use oxigraph::sparql::{PreparedSparqlUpdate, SparqlEvaluator};
 use oxigraph::store::Store;
 
@@ -109,16 +114,25 @@ pub(crate) struct Applied {
 ///
 /// ★ The one place an update reaches the parser, so the one place it is bounded first
 /// (ledger #915): [`crate::limits::check_sparql`] refuses text past the byte or nesting
-/// bound. Call it on [`crate::limits::on_sparql_stack`]: the parse and the evaluation that
-/// follows are recursive.
-pub(crate) fn parse(update: &str) -> Result<PreparedSparqlUpdate> {
+/// bound. Call it inside [`crate::DurableStore::evaluate`], which runs the parse and the
+/// evaluation that follows on a stack sized for them (both are recursive) and within the
+/// caller's time budget.
+///
+/// The update is evaluated under `deadline`'s cancellation token (ledger #964).
+pub(crate) fn parse(update: &str, deadline: &Deadline) -> Result<PreparedSparqlUpdate> {
     crate::limits::check_sparql(update, "content")?;
-    SparqlEvaluator::new()
+    // ★ Parsed by the parser oxigraph uses, and measured before oxigraph plans it: the
+    // planner cannot be cancelled (ledger #964, `src/budget.rs`).
+    let parsed = spargebra::SparqlParser::new()
         .parse_update(update)
         .map_err(|e| Error::InvalidArgument {
             name: "content".to_string(),
             detail: format!("not a SPARQL update: {e}"),
-        })
+        })?;
+    crate::budget::check_update(&parsed, "content")?;
+    Ok(SparqlEvaluator::new()
+        .with_cancellation_token(deadline.token())
+        .for_update(parsed))
 }
 
 /// Whether the update has a `WHERE` — i.e. READS the dataset it runs against.
@@ -141,10 +155,15 @@ pub(crate) fn reads_the_dataset(prepared: &PreparedSparqlUpdate) -> bool {
 /// The caller must already hold the per-graph capability — the write grant always, and the
 /// read grant when [`reads_the_dataset`] — and the store's write lock: this function is
 /// the mechanism, not the gate.
+///
+/// ★ The real store is written only at `deadline`'s commit point (ledger #964): the scratch
+/// copy is private, so an update that runs out of time before step 4 has written nothing
+/// anywhere, and one that runs out at step 4 is not committed.
 pub(crate) fn scoped_update(
     store: &Store,
     graph: &NamedNode,
     update: PreparedSparqlUpdate,
+    deadline: &Deadline,
 ) -> Result<Applied> {
     let scope = GraphName::from(graph.clone());
     let scratch = Store::new().map_err(storage)?;
@@ -161,6 +180,7 @@ pub(crate) fn scoped_update(
             .map_err(storage)?;
     }
     for quad in store.quads_for_pattern(None, None, None, Some(graph.as_ref().into())) {
+        deadline.check()?;
         scratch.insert(&quad.map_err(storage)?).map_err(storage)?;
     }
     let before: HashSet<Quad> = scratch
@@ -209,7 +229,7 @@ pub(crate) fn scoped_update(
     } else if !registered && now_registered {
         txn.insert_named_graph(graph.as_ref());
     }
-    txn.commit().map_err(storage)?;
+    deadline.settle(|| txn.commit().map_err(storage))?;
 
     Ok(Applied {
         added: added.len(),
