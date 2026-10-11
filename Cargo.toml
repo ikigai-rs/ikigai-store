@@ -224,7 +224,14 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # patterns' constants (`confine::footprint`, crate-private): about 1 ms at all three. The boundary is unchanged (the
 # private store still holds nothing outside the graph, and the effects check is the same code). A patch: no API change,
 # and every answer the same, pinned by a differential test against the whole-graph copy.
-version = "0.2.13"
+# ★ 0.2.14 is THE SHARED-WRITER RELEASE (ledger #1207): a host holding a shared store's raw handle had no public way
+# onto the store's writer thread (`budget::Writer` was crate-private), so each such host built its own to dodge the
+# RocksDB seed trap (browse did). `DurableStore::shared_writer()` now hands it a `SharedWriter` (None on an owned
+# store): `write(|txn| ...)` runs ONE transaction on the store's own writer thread, under its write lock, committed
+# only on Ok, so a record is atomic. A write asked from inside a write is refused instead of waiting on itself.
+# `Transaction` and `StorageError` are re-exported beside `Store`. A patch: purely additive, nothing changed shape,
+# and a minor bump would ceiling out every consumer pinned at 0.2.x.
+version = "0.2.14"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
