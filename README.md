@@ -1047,7 +1047,7 @@ call), from a fresh thread per write meets the same degeneration. Write from a t
 lives. `tests/post_bulk_read.rs` measures it and holds a read after 4,000 writes to 3x a
 fresh copy; `budget`'s `every_write_on_a_store_runs_on_one_thread` pins the mechanism.
 
-### A host's own writes, on the same thread: `SharedWriter` (ledger #1207)
+### A host's own writes, on the same thread: `SharedWriter` (0.2.14, ledger #1207)
 
 A host holding a shared store's raw handle does not need a writer thread of its own. Ask the
 store for its writer and commit each record as ONE transaction on the store's writer thread,
