@@ -284,4 +284,7 @@ pub use endpoints::{
     cap_read_graph, cap_write_graph, space, CAP_READ, CAP_READ_ANY, CAP_READ_GRAPH, CAP_WRITE,
     CAP_WRITE_GRAPH, GRAPH_UPDATE_THREAD, LOAD_THREAD, UPDATE_THREAD,
 };
-pub use store::{Backing, DurableStore, GraphFingerprint, SharerWrites, Store};
+pub use store::{
+    Backing, DurableStore, GraphFingerprint, SharedWriter, SharerWrites, StorageError, Store,
+    Transaction,
+};

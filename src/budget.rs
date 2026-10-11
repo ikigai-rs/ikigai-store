@@ -478,10 +478,15 @@ where
 ///   the dataset itself, so a store can be reopened at the same path as soon as it is dropped.
 /// - On wasm there are no threads, and an update runs inline like everything else.
 ///
-/// ⚠ It covers the writes THIS crate performs. A host that writes through the raw handle
-/// (`open_shared`) or commits inside [`crate::limits::on_sparql_stack`], which spawns a
-/// thread per call, on a fresh thread per write meets the same degeneration, and the fix is
-/// the same: write from a thread that lives.
+/// - **A job may not queue another on the thread it runs on.** It would wait for a job queued
+///   behind itself (a host's write forever, an update until its budget ran out), so
+///   [`submit`](Writer::submit) refuses at once instead.
+///
+/// ⚠ It covers the writes THIS crate performs, and the host's own writes when it makes them
+/// through [`SharedWriter`](crate::SharedWriter) (ledger #1207), which runs them here. A host
+/// that writes through the raw handle (`open_shared`) or commits inside
+/// [`crate::limits::on_sparql_stack`], which spawns a thread per call, on a fresh thread per
+/// write meets the same degeneration, and the fix is the same: write from a thread that lives.
 #[derive(Default)]
 pub(crate) struct Writer {
     #[cfg(not(target_family = "wasm"))]
@@ -492,6 +497,8 @@ pub(crate) struct Writer {
 struct WriterThread {
     jobs: std::sync::mpsc::Sender<Job>,
     stack: usize,
+    /// The thread's id: a job running on it that queues another here is refused.
+    id: std::thread::ThreadId,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -504,6 +511,19 @@ impl Writer {
     fn submit(&self, stack: usize, job: Job) -> Result<()> {
         let mut slot = self.thread.lock().unwrap_or_else(|e| e.into_inner());
         let job = match slot.as_ref() {
+            // From a job already running on this thread, the new one would wait behind the
+            // job that waits for it. (When the stack does not fit, the job goes to a NEW
+            // thread below, and nothing waits on itself.)
+            Some(current)
+                if current.stack >= stack && current.id == std::thread::current().id() =>
+            {
+                return Err(Error::Endpoint(
+                    "a write on this store was asked for from inside another write on its \
+                     writer thread, and would wait for itself: finish the first write, then make \
+                     the second"
+                        .into(),
+                ));
+            }
             Some(current) if current.stack >= stack => match current.jobs.send(job) {
                 Ok(()) => return Ok(()),
                 // The thread is gone, which nothing here does on purpose (a job catches its own
@@ -520,8 +540,8 @@ impl Writer {
             ))
             .max(stack);
         let (jobs, queue) = std::sync::mpsc::channel::<Job>();
-        std::thread::Builder::new()
-            .name("ikigai-store-writer".to_string())
+        let started = std::thread::Builder::new()
+            .name(WRITER_THREAD_NAME.to_string())
             .stack_size(size)
             .spawn(move || {
                 for job in queue {
@@ -530,14 +550,45 @@ impl Writer {
             })
             .map_err(|e| {
                 Error::Unavailable(format!(
-                    "could not start a {} MiB thread to run this store's SPARQL updates on: {e}",
+                    "could not start a {} MiB thread to run this store's writes on: {e}",
                     size >> 20
                 ))
             })?;
+        let id = started.thread().id();
         jobs.send(job)
-            .map_err(|_| Error::Endpoint("internal: a new SPARQL writer thread ended".into()))?;
-        *slot = Some(WriterThread { jobs, stack: size });
+            .map_err(|_| Error::Endpoint("internal: a new store writer thread ended".into()))?;
+        *slot = Some(WriterThread {
+            jobs,
+            stack: size,
+            id,
+        });
         Ok(())
+    }
+
+    /// Run `work` on the writer thread and wait for its answer, with no deadline: the door
+    /// for a host's own writes ([`SharedWriter`](crate::SharedWriter), ledger #1207). A panic
+    /// in `work` is caught there, so the thread lives on, and resumed here.
+    pub(crate) fn call<T: Send + 'static>(
+        &self,
+        stack: usize,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T> {
+        let (answer, answered) = std::sync::mpsc::sync_channel(1);
+        self.submit(
+            stack,
+            Box::new(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+                // The caller waits for this; it can only be gone if it panicked itself.
+                let _ = answer.send(outcome);
+            }),
+        )?;
+        match answered.recv() {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => Err(Error::Endpoint(
+                "internal: the store's writer thread ended without answering".into(),
+            )),
+        }
     }
 
     /// The writer thread's stack, or `None` before the first write. For tests.
@@ -545,6 +596,19 @@ impl Writer {
     fn stack(&self) -> Option<usize> {
         let slot = self.thread.lock().unwrap_or_else(|e| e.into_inner());
         slot.as_ref().map(|current| current.stack)
+    }
+}
+
+/// The name of a store's writer thread, which a host can see in a profile or a panic message.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) const WRITER_THREAD_NAME: &str = "ikigai-store-writer";
+
+/// On wasm there are no threads: a host's write runs inline.
+#[cfg(target_family = "wasm")]
+impl Writer {
+    pub(crate) fn call<T>(&self, stack: usize, work: impl FnOnce() -> T) -> Result<T> {
+        let _ = stack;
+        Ok(work())
     }
 }
 

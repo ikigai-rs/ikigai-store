@@ -1047,6 +1047,32 @@ call), from a fresh thread per write meets the same degeneration. Write from a t
 lives. `tests/post_bulk_read.rs` measures it and holds a read after 4,000 writes to 3x a
 fresh copy; `budget`'s `every_write_on_a_store_runs_on_one_thread` pins the mechanism.
 
+### A host's own writes, on the same thread: `SharedWriter` (ledger #1207)
+
+A host holding a shared store's raw handle does not need a writer thread of its own. Ask the
+store for its writer and commit each record as ONE transaction on the store's writer thread,
+the thread its update doors use:
+
+```rust
+let (store, handle) = DurableStore::open_shared_declaring(&path, writes)?;
+let writer = store.shared_writer().expect("a shared store has a writer");
+writer.write(move |txn| {
+    for quad in &record {
+        txn.insert(quad);
+    }
+    Ok::<_, StorageError>(())
+})?;
+```
+
+The record commits whole or not at all (an `Err` from the closure writes nothing), it is
+ordered with the store's own writes under the same write lock, a panic in it reaches the
+caller and the writer lives on, and a write asked for from inside a write is refused rather
+than left waiting for itself. `shared_writer()` is `None` on an owned store, whose every
+write goes through a kernel door. It changes which thread a sharer's writes commit on, not
+what the kernel can see: the reads of a shared store are cached exactly as before.
+`SharedWriter::store()` is the same raw handle, so a module can take this one value for both
+its reads and its writes.
+
 ## Configuration
 
 `~/.config/ikigai/store.toml` (or `$XDG_CONFIG_HOME/ikigai/store.toml`), layered the way
