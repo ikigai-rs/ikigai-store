@@ -97,7 +97,7 @@
 //! #1132 the whole of `G` was copied on every write, so each append cost in proportion to
 //! everything appended before it: measured on the RocksDB backing, a median append took 23,
 //! 144 and 614 ms in debug at 100, 750 and 3,000 items (3, 25 and 122 ms in release), and
-//! now about 2 ms in debug and under 1 ms in release at all three
+//! now about 1 ms in debug and 0.15 ms in release at all three
 //! (`tests/scoped_append_cost.rs`).
 //!
 //! ★ **The boundary does not depend on the footprint.** Whatever is copied, the private store

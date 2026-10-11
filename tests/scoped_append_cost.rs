@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 const GRAPH: &str = "urn:x:append-cost:ledger";
 const NS: &str = "urn:x:append-cost:";
 
-/// The most the median append at 3,000 items may take, as a multiple of the median at 100.
-/// The fixed code measures about 1x; the whole-graph copy measured 9x to 26x.
+/// The most the best append at 3,000 items may take, as a multiple of the best at 100. The
+/// fixed code measures about 1x; the whole-graph copy measured 29x (in memory, debug).
 const MAX_RATIO: f64 = 3.0;
 
 fn kernel(store: DurableStore) -> Kernel {
@@ -128,13 +128,14 @@ fn append(n: usize) -> String {
     )
 }
 
-/// The median of `appends` appends to a graph preloaded with `items` items, and checks that
-/// each one did what an append does: one item more, the counter moved by one.
-fn median_append(
+/// How long each of `appends` appends to a graph preloaded with `items` items took, fastest
+/// first, checking that each one did what an append does: one item more, the counter moved by
+/// one.
+fn appends(
     open: &dyn Fn() -> (DurableStore, Arc<Store>),
     items: usize,
     appends: usize,
-) -> Duration {
+) -> Vec<Duration> {
     let (store, handle) = open();
     preload(&handle, items);
     let kernel = kernel(store);
@@ -169,7 +170,7 @@ fn median_append(
         .unwrap();
     assert_eq!(last.object, Literal::from((items + appends) as i64).into());
     took.sort();
-    took[took.len() / 2]
+    took
 }
 
 #[cfg(feature = "persistent")]
@@ -184,12 +185,14 @@ fn scratch(name: &str) -> std::path::PathBuf {
 }
 
 /// ★ THE REGRESSION (ledger #1132): an append to a 3,000-item graph costs about what it costs
-/// at 100 items. Through the whole-graph copy it cost 9x to 26x as much.
+/// at 100 items. Through the whole-graph copy it cost 29x as much. Each side is the BEST of
+/// several appends, so a noisy runner has to be slow on every one of them to fail it; the
+/// regression slows every append, so the best of them shows it as well as the median does.
 #[test]
 fn an_append_costs_the_same_at_three_thousand_items_as_at_a_hundred() {
     let open = || DurableStore::in_memory_shared().unwrap();
-    let small = median_append(&open, 100, 9);
-    let large = median_append(&open, 3_000, 9);
+    let small = appends(&open, 100, 9)[0];
+    let large = appends(&open, 3_000, 9)[0];
     let ratio = large.as_secs_f64() / small.as_secs_f64();
     assert!(
         ratio <= MAX_RATIO,
@@ -205,7 +208,7 @@ fn an_append_costs_the_same_at_three_thousand_items_as_at_a_hundred() {
 #[ignore = "a measurement: run with --ignored --nocapture"]
 fn measure_an_append_as_the_graph_grows() {
     let var = |name: &str, default: &str| std::env::var(name).unwrap_or(default.to_string());
-    let appends: usize = var("APPENDS", "15").parse().unwrap();
+    let count: usize = var("APPENDS", "15").parse().unwrap();
     let backing = var(
         "BACKING",
         if cfg!(feature = "persistent") {
@@ -216,29 +219,26 @@ fn measure_an_append_as_the_graph_grows() {
     );
     for items in var("ITEMS", "100,750,3000").split(',') {
         let items: usize = items.trim().parse().unwrap();
-        let median = match backing.as_str() {
+        let took = match backing.as_str() {
             #[cfg(feature = "persistent")]
             "disk" => {
                 let path = scratch(&format!("{items}"));
-                let open = || DurableStore::open_shared(&path).unwrap();
-                let median = median_append(&open, items, appends);
+                let took = appends(&|| DurableStore::open_shared(&path).unwrap(), items, count);
                 let _ = std::fs::remove_dir_all(&path);
-                median
+                took
             }
-            "memory" => median_append(
-                &|| DurableStore::in_memory_shared().unwrap(),
-                items,
-                appends,
-            ),
+            "memory" => appends(&|| DurableStore::in_memory_shared().unwrap(), items, count),
             other => panic!("BACKING={other}: `disk` needs --features persistent"),
         };
         println!(
-            "{} build, {backing}, {items} items: median append {median:?} over {appends}",
+            "{} build, {backing}, {items} items: median append {:?}, best {:?}, over {count}",
             if cfg!(debug_assertions) {
                 "debug"
             } else {
                 "release"
             },
+            took[took.len() / 2],
+            took[0],
         );
     }
 }

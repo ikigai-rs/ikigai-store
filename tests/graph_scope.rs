@@ -263,6 +263,133 @@ fn a_scoped_update_cannot_read_another_graph() {
     assert_eq!(quads(&kernel, G), 1);
 }
 
+/// Whether graph `graph` holds `subject` as a subject, read under root.
+fn holds_subject(kernel: &Kernel, graph: &str, subject: &str) -> bool {
+    let request = Request::new(Verb::Source, Iri::parse("urn:iki:store:ask").unwrap()).with_arg(
+        "query",
+        ArgRef::Inline(format!("ASK {{ GRAPH <{graph}> {{ <{subject}> ?p ?o }} }}").into_bytes()),
+    );
+    let repr = block_on(kernel.issue(request, &Capability::root())).expect("asking");
+    String::from_utf8_lossy(&repr.bytes).contains("true")
+}
+
+/// ★ The read half of the boundary, through every spelling of "another graph", now that the
+/// private store holds only the update's FOOTPRINT of `G` rather than all of it (ledger
+/// #1132). Each update names its predicate, so its footprint is narrow; each must read
+/// nothing outside `G`, write nothing outside `G`, or be refused — and the default graph
+/// and the other tenant's graph both hold a quad it would match if it could see them.
+#[test]
+fn a_narrow_footprint_reads_and_writes_nothing_outside_the_graph() {
+    let copied = |from: &str| {
+        format!(
+            "INSERT {{ GRAPH <{G}> {{ ?s <urn:copied> ?o }} }} {from} WHERE {{ ?s <urn:p> ?o }}"
+        )
+    };
+    for (name, update, outcome) in [
+        (
+            "GRAPH <other> in the WHERE",
+            format!(
+                "INSERT {{ GRAPH <{G}> {{ ?s <urn:copied> ?o }} }} \
+                 WHERE {{ GRAPH <{OTHER}> {{ ?s <urn:p> ?o }} }}"
+            ),
+            "applied",
+        ),
+        (
+            "USING <other>",
+            copied(&format!("USING <{OTHER}>")),
+            "applied",
+        ),
+        ("the default graph, named by nothing", copied(""), "applied"),
+        (
+            "USING NAMED <other> with a variable graph",
+            format!(
+                "INSERT {{ GRAPH <{G}> {{ ?s <urn:copied> ?o }} }} USING NAMED <{OTHER}> \
+                 WHERE {{ GRAPH ?g {{ ?s <urn:p> ?o }} }}"
+            ),
+            "applied",
+        ),
+        (
+            "a variable graph, which binds G and nothing else",
+            format!(
+                "INSERT {{ GRAPH <{G}> {{ ?s <urn:copied> ?g }} }} \
+                 WHERE {{ GRAPH ?g {{ ?s <urn:p> ?o }} }}"
+            ),
+            "applied",
+        ),
+        (
+            "WITH <other>, deleting what it can match there",
+            format!("WITH <{OTHER}> DELETE {{ ?s <urn:p> ?o }} WHERE {{ ?s <urn:p> ?o }}"),
+            "applied",
+        ),
+        (
+            "WITH <other>, inserting",
+            format!("WITH <{OTHER}> INSERT {{ <urn:example:x> <urn:p> \"no\" }} WHERE {{ }}"),
+            "refused",
+        ),
+        (
+            "a template graph bound from G's own data",
+            format!(
+                "INSERT {{ GRAPH ?o {{ <urn:example:x> <urn:p> \"no\" }} }} \
+                 WHERE {{ GRAPH <{G}> {{ ?s <urn:p> ?seed BIND(<{OTHER}> AS ?o) }} }}"
+            ),
+            "refused",
+        ),
+        (
+            "SERVICE, refused before evaluation",
+            format!(
+                "INSERT {{ GRAPH <{G}> {{ ?s <urn:copied> ?o }} }} \
+                 WHERE {{ SERVICE <http://127.0.0.1:9/sparql> {{ ?s <urn:p> ?o }} }}"
+            ),
+            "refused",
+        ),
+    ] {
+        let kernel = kernel();
+        sink(
+            &kernel,
+            BROAD,
+            &[(
+                "content",
+                "INSERT DATA { <urn:example:default:1> <urn:p> \"seed\" }",
+            )],
+            &Capability::root(),
+        )
+        .expect("seeding the default graph");
+        let answer = scoped(&kernel, &update, &one_graph());
+        match outcome {
+            "applied" => {
+                answer.unwrap_or_else(|e| panic!("{name}: expected it to apply, got {e:?}"));
+            }
+            _ => {
+                answer.expect_err(&format!("{name}: expected a refusal"));
+            }
+        }
+        // Nothing of the other tenant's graph or the default graph reached G…
+        for outsider in ["urn:example:zenith:1", "urn:example:default:1"] {
+            assert!(
+                !holds_subject(&kernel, G, outsider),
+                "{name}: {outsider} reached the scoped graph"
+            );
+        }
+        // …and nothing outside G changed.
+        assert_eq!(quads(&kernel, OTHER), 1, "{name} changed another graph");
+        assert!(
+            holds_subject(&kernel, OTHER, "urn:example:zenith:1"),
+            "{name} changed another graph"
+        );
+        assert!(
+            !holds_subject(&kernel, OTHER, "urn:example:x"),
+            "{name} wrote another graph"
+        );
+        // The variable graph is the one shape that matches something: G's own quad, with G
+        // as the bound graph name.
+        if name.starts_with("a variable graph") {
+            assert_eq!(quads(&kernel, G), 2, "{name}");
+        } else {
+            assert_eq!(quads(&kernel, G), 1, "{name} changed the scoped graph");
+        }
+    }
+}
+
 // --------------------------------------------------- the two scopes do not substitute
 
 /// Declared is enforced in both directions, across the two write doors.
