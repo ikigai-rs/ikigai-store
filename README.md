@@ -1041,24 +1041,26 @@ its generator advancing. Writes were already serialized by the store's write loc
 serializes nothing new; reads still run on threads of their own. The thread's stack grows to
 fit the largest update it has run and never shrinks.
 
-⚠ **It covers the writes this crate performs.** A host that writes through the raw handle
-(`open_shared`), or commits inside `limits::on_sparql_stack` (which spawns a thread per
-call), from a fresh thread per write meets the same degeneration. Write from a thread that
-lives. `tests/post_bulk_read.rs` measures it and holds a read after 4,000 writes to 3x a
+⚠ **It covers the writes this crate performs** (`urn:iki:store:load` too, since 0.2.15: it
+committed on the caller's thread until then, and 750 loads asked from fresh threads left reads
+4.8x to 14.8x slower; now 0.88x to 1.21x, ledger #1209), and a host's writes through a
+`SharedWriter` (below). A host that writes through the raw handle (`open_shared`), or commits
+inside `limits::on_sparql_stack` (which spawns a thread per call), from a fresh thread per
+write meets the same degeneration. Write from a thread that lives. `tests/post_bulk_read.rs` measures it and holds a read after 4,000 writes to 3x a
 fresh copy; `budget`'s `every_write_on_a_store_runs_on_one_thread` pins the mechanism.
 
 ### A host's own writes, on the same thread: `SharedWriter` (0.2.14, ledger #1207)
 
 A host holding a shared store's raw handle does not need a writer thread of its own. Ask the
 store for its writer and commit each record as ONE transaction on the store's writer thread,
-the thread its update doors use:
+the thread its update and load doors use:
 
 ```rust
 let (store, handle) = DurableStore::open_shared_declaring(&path, writes)?;
 let writer = store.shared_writer().expect("a shared store has a writer");
-writer.write(move |txn| {
+writer.write_declared(move |txn| {
     for quad in &record {
-        txn.insert(quad);
+        txn.insert(quad)?;
     }
     Ok::<_, StorageError>(())
 })?;
@@ -1067,11 +1069,50 @@ writer.write(move |txn| {
 The record commits whole or not at all (an `Err` from the closure writes nothing), it is
 ordered with the store's own writes under the same write lock, a panic in it reaches the
 caller and the writer lives on, and a write asked for from inside a write is refused rather
-than left waiting for itself. `shared_writer()` is `None` on an owned store, whose every
-write goes through a kernel door. It changes which thread a sharer's writes commit on, not
-what the kernel can see: the reads of a shared store are cached exactly as before.
-`SharedWriter::store()` is the same raw handle, so a module can take this one value for both
-its reads and its writes.
+than left waiting for itself, through this type or through the `load` door. `shared_writer()`
+is `None` on an owned store, whose every write goes through a kernel door. It changes which
+thread a sharer's writes commit on, not what the kernel can see: the reads of a shared store
+are cached exactly as before. `SharedWriter::store()` is the same raw handle, so a module can
+take this one value for both its reads and its writes.
+
+### ★ Declared = enforced (0.2.15, ledger #1209)
+
+A `SharerWrites` declaration is what lets a shared store cache scoped reads of every graph the
+sharer does not write, and a false one is silent, unbounded staleness. Through 0.2.14 a write
+through a `SharedWriter` could land in any graph. Now a writer carries its declaration and
+keeps it:
+
+- **`write_declared`** hands the closure a `DeclaredTransaction` (insert, remove, extend, and
+  reads). A write to a named graph the declaration does not name, or to a blank-node graph,
+  returns an `UndeclaredGraph` refusal (recognize it with `UndeclaredGraph::of`), and **the
+  whole transaction is rolled back**, even if the closure ignored the refusal. The default
+  graph is always writable, as `SharerWrites` has always said.
+- **`write`** hands the closure oxigraph's raw `Transaction`, which can write any graph, so it
+  is **refused before the closure runs** on a writer carrying a declaration. It stays for a
+  writer with nothing declared (`open_shared`), which refuses nothing.
+
+The raw handle a shared constructor returned can still write anything:
+`reserved_graphs_fingerprint` stays the tripwire for that.
+
+### A host with a bare `Store`: `SharedWriter::over` (0.2.15, ledger #1207)
+
+A host that opened the store itself (`Store::open`) holds no `DurableStore` to ask. It builds
+the same type over its handle, naming what it writes:
+
+```rust
+let store = Arc::new(Store::open(&path)?);
+let writer = SharedWriter::over(Arc::clone(&store), SharerWrites::only_the_default_graph());
+```
+
+| | `DurableStore::shared_writer()` | `SharedWriter::over(store, writes)` |
+| --- | --- | --- |
+| writer thread | the store's own, shared with its doors | its own, started on the first write |
+| write lock | the store's own: ordered with every door | its own: ordered with its clones only |
+| declaration | the store's (`open_shared_declaring`), or none (`open_shared`) | `writes`, always |
+
+⚠ Never call `over` on a handle a `DurableStore` gave out: it would start a second thread and
+a second lock beside the store's, and a scoped write through a door could lose an update made
+through it. And make one `over` writer per store and clone it; each `over` is a thread.
 
 ## Configuration
 

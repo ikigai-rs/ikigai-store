@@ -447,7 +447,7 @@ where
     on_its_own_thread(text, overdue, max_overdue, writer, deadline, work)
 }
 
-/// The one long-lived thread a store's UPDATES run on (ledger #1127).
+/// The one long-lived thread a store's UPDATES and LOADS run on (ledger #1127, #1209).
 ///
 /// ★ **Why a write may not run on a thread spawned for it.** RocksDB draws the height of
 /// every memtable skiplist node from a THREAD-LOCAL generator seeded from a hash of the
@@ -482,8 +482,10 @@ where
 ///   behind itself (a host's write forever, an update until its budget ran out), so
 ///   [`submit`](Writer::submit) refuses at once instead.
 ///
-/// ⚠ It covers the writes THIS crate performs, and the host's own writes when it makes them
-/// through [`SharedWriter`](crate::SharedWriter) (ledger #1207), which runs them here. A host
+/// ⚠ It covers the writes THIS crate performs (`urn:iki:store:load` since 0.2.15, ledger
+/// #1209), and the host's own writes when it makes them through
+/// [`SharedWriter`](crate::SharedWriter) (ledger #1207), which runs them here, or on a
+/// writer of its own for [`SharedWriter::over`](crate::SharedWriter::over). A host
 /// that writes through the raw handle (`open_shared`) or commits inside
 /// [`crate::limits::on_sparql_stack`], which spawns a thread per call, on a fresh thread per
 /// write meets the same degeneration, and the fix is the same: write from a thread that lives.
