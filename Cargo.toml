@@ -231,7 +231,16 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # only on Ok, so a record is atomic. A write asked from inside a write is refused instead of waiting on itself.
 # `Transaction` and `StorageError` are re-exported beside `Store`. A patch: purely additive, nothing changed shape,
 # and a minor bump would ceiling out every consumer pinned at 0.2.x.
-version = "0.2.14"
+# ★ 0.2.15 is DECLARED = ENFORCED (ledger #1207 option b, #1209): `SharedWriter::over(Arc<Store>, SharerWrites)` gives a
+# host holding a bare oxigraph `Store` (cli embedded opens browse's that way) the same type, on a writer thread and
+# write lock of its own. A writer now carries its declaration: `write_declared` hands the closure a
+# `DeclaredTransaction` that refuses a graph outside it (`UndeclaredGraph`) and rolls the whole transaction back, and
+# the raw `write` is REFUSED on a writer carrying a declaration. `urn:iki:store:load` now commits on the store's writer
+# thread (750 loads from fresh threads: reads 4.8x-14.8x slower before, 0.88x-1.21x after), and a load asked from
+# inside a `SharedWriter` closure is refused instead of deadlocking. A patch: the API is additive, and the one new
+# refusal hits a combination 0.2.14 shipped hours earlier that nothing calls; a minor bump would ceiling out every
+# consumer pinned at 0.2.x for a change that affects none of them.
+version = "0.2.15"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
