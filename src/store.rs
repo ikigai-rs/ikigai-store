@@ -26,6 +26,11 @@ use crate::budget::{AnswerBudget, Deadline, TimeBudget};
 /// coincidental — the same reason `ikigai-sparql` re-exports it.
 pub use oxigraph::store::Store;
 
+/// Oxigraph's transaction and storage error, re-exported for the same reason as [`Store`]:
+/// a [`SharedWriter::write`] closure names them, and one `oxigraph` in the build makes
+/// them the types the host already has.
+pub use oxigraph::store::{StorageError, Transaction};
+
 /// Where a [`DurableStore`]'s bytes live.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Backing {
@@ -741,6 +746,27 @@ impl DurableStore {
         &self.store
     }
 
+    /// The writer a host that holds the raw handle commits its OWN writes through: on this
+    /// store's one long-lived writer thread, one transaction per call (ledger #1207). `None`
+    /// for an owned store. Read [`SharedWriter`] for why both halves of that matter.
+    ///
+    /// ★ **`None` on an owned store is the point, not a gap.** An owned store's every write
+    /// goes through a kernel door, where the golden thread sees it; a writer handed out
+    /// here would be a write the kernel cannot see, which is exactly what the type docs say
+    /// no accessor may turn an owned store into. The handle a shared store's constructor
+    /// already gave away can write anyway, so this adds no authority: it only decides which
+    /// THREAD those writes commit on.
+    pub fn shared_writer(&self) -> Option<SharedWriter> {
+        match self.coverage {
+            Coverage::Owned => None,
+            Coverage::Shared | Coverage::SharedDeclaring(_) => Some(SharedWriter {
+                store: Arc::clone(&self.store),
+                writes: Arc::clone(&self.writes),
+                writer: Arc::clone(&self.writer),
+            }),
+        }
+    }
+
     /// Serialize this crate's writes against each other.
     ///
     /// ★ **Needed because the graph-scoped write is a read-modify-write.**
@@ -763,6 +789,153 @@ impl DurableStore {
     /// through an oxigraph transaction that either commits or does not.
     pub(crate) fn write_lock(&self) -> MutexGuard<'_, ()> {
         self.writes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// How a host holding a shared store's raw handle commits its own writes: on the store's one
+/// long-lived writer thread, a whole record per transaction (ledger #1207). Get one from
+/// [`DurableStore::shared_writer`]; clones share the thread.
+///
+/// # ★ Why the thread matters: the RocksDB seed trap (ledger #1127)
+///
+/// RocksDB draws the height of every memtable skiplist node from a THREAD-LOCAL generator
+/// seeded from a hash of the thread's id. A thread spawned after the previous one exited
+/// usually gets the same id back, so a host that commits each write on a fresh thread (a
+/// socket door that spawns one per connection, `tokio::task::spawn_blocking`, the stack
+/// [`crate::limits::on_sparql_stack`] spawns) draws the same few heights for every
+/// transaction. The skiplists stop growing upper levels, and every read walks a long top
+/// level until the memtable flushes: 2x to 20x slower reads after gonk's 750-append fill,
+/// and 6x to 68x after 750 browse annotations, against 1.0x when the same writes came from
+/// one thread. This crate's own doors have committed on one writer thread since 0.2.12;
+/// before this type, a host writing through the raw handle had to build its own (browse
+/// did). Now it commits on the SAME thread as the store's doors, so every write to the
+/// dataset advances one generator.
+///
+/// # What a call does
+///
+/// - **One transaction.** `write` opens a transaction on the writer thread, hands it to the
+///   closure, and commits it only if the closure returns `Ok`: a record of fifteen quads is
+///   one commit, and a reader sees all of it or none of it. On `Err` nothing is written.
+/// - **Ordered with the store's own writes.** It takes the store's write lock, as every
+///   write door does, and runs in the same queue as `urn:iki:store:update` and
+///   `urn:iki:store:graph-update`. A scoped write can no longer lose an update made through
+///   this type; one made through the raw handle directly still can.
+/// - **It waits, with no deadline.** The caller blocks until the transaction commits or
+///   fails, including any time spent behind a store update that is still running.
+/// - **A panic in the closure is the caller's**: caught on the writer thread, which lives
+///   on, and resumed on the thread that asked.
+/// - **Never from inside a write.** Make a record's writes through the transaction you were
+///   given. A closure that asks for another write through this type is refused rather than
+///   left waiting for itself forever, and so is one through the `update` and `graph-update`
+///   doors when the writer's stack fits it (when it does not, the update moves to a larger
+///   writer thread and waits there for the lock this write holds, until its budget runs
+///   out). ⚠ `urn:iki:store:load` takes the write lock on the calling thread, which inside
+///   a closure is the writer thread already holding it: that one deadlocks.
+/// - **A stack sized for inserts and removes**, at least [`crate::limits::STACK_BASE`]. A
+///   SPARQL update over caller text belongs at the store's update door, which sizes its
+///   thread to the text and bounds it first; run through `Transaction::update` in a closure
+///   it gets neither.
+/// - On wasm there are no threads, and the closure runs inline.
+///
+/// ⚠ It is still a write the kernel cannot see: reads stay `Expiry::Always` on a store
+/// opened with `open_shared`, and a store opened with `open_shared_declaring` stays exactly
+/// as honest as the host's [`SharerWrites`] promise. Nothing here checks which graph a
+/// closure writes.
+///
+/// ```
+/// use ikigai_store::{DurableStore, StorageError};
+/// use oxigraph::model::{GraphNameRef, LiteralRef, NamedNodeRef, QuadRef};
+///
+/// let (store, handle) = DurableStore::in_memory_shared()?;
+/// let writer = store.shared_writer().expect("a shared store has a writer");
+/// let record = NamedNodeRef::new_unchecked("urn:example:record:1");
+/// let quad = move |p: &str, o: &'static str| {
+///     QuadRef::new(
+///         record,
+///         NamedNodeRef::new_unchecked(p),
+///         LiteralRef::new_simple_literal(o),
+///         GraphNameRef::DefaultGraph,
+///     )
+///     .into_owned()
+/// };
+/// let (title, body) = (quad("urn:example:title", "a title"), quad("urn:example:body", "a body"));
+///
+/// // Asked for from a thread spawned for it, the shape that trips the seed trap if the
+/// // write commits there. It does not: it commits on the store's writer thread.
+/// let asking = writer.clone();
+/// let committed_on = std::thread::spawn(move || {
+///     asking.write(move |txn| {
+///         txn.insert(&title);
+///         txn.insert(&body);
+///         Ok::<_, StorageError>(std::thread::current().name().map(str::to_owned))
+///     })
+/// })
+/// .join()
+/// .unwrap()?;
+/// assert_eq!(committed_on.as_deref(), Some("ikigai-store-writer"));
+/// assert_eq!(handle.len()?, 2);
+///
+/// // A record that fails part way writes none of itself.
+/// let another = quad("urn:example:title", "another title");
+/// let failed: Result<(), StorageError> = writer.write(move |txn| {
+///     txn.insert(&another);
+///     Err(StorageError::Io(std::io::Error::other("the record was incomplete")))
+/// });
+/// assert!(failed.is_err());
+/// assert_eq!(handle.len()?, 2);
+///
+/// // An owned store hands out no writer: its every write goes through a kernel door.
+/// assert!(DurableStore::in_memory()?.shared_writer().is_none());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone)]
+pub struct SharedWriter {
+    store: Arc<Store>,
+    writes: Arc<Mutex<()>>,
+    writer: Arc<crate::budget::Writer>,
+}
+
+impl std::fmt::Debug for SharedWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedWriter").finish_non_exhaustive()
+    }
+}
+
+impl SharedWriter {
+    /// The raw handle, for reads: the same `Arc<Store>` the shared constructor returned, so a
+    /// host can hand a module this one value instead of two.
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
+    /// Run `record` against one transaction on the store's writer thread, and commit it if
+    /// `record` returns `Ok`. See the type docs for what that buys and what it does not.
+    ///
+    /// The error type is the caller's, so long as a [`StorageError`] converts into it: a
+    /// failure to start, commit or reach the writer thread arrives as one.
+    pub fn write<T, E, F>(&self, record: F) -> std::result::Result<T, E>
+    where
+        F: FnOnce(&mut Transaction<'_>) -> std::result::Result<T, E> + Send + 'static,
+        T: Send + 'static,
+        E: From<StorageError> + Send + 'static,
+    {
+        let (store, writes) = (Arc::clone(&self.store), Arc::clone(&self.writes));
+        let job = move || -> std::result::Result<T, E> {
+            // Taken ON the writer thread, as the store's update doors take it: taken on the
+            // caller's thread it would wait for a door's job queued ahead of this one, which
+            // waits for the lock.
+            let _writes = writes.lock().unwrap_or_else(|e| e.into_inner());
+            let mut transaction = store.start_transaction()?;
+            let value = record(&mut transaction)?;
+            transaction.commit()?;
+            Ok(value)
+        };
+        match self.writer.call(crate::limits::STACK_BASE, job) {
+            Ok(outcome) => outcome,
+            Err(e) => Err(E::from(StorageError::Io(std::io::Error::other(
+                e.to_string(),
+            )))),
+        }
     }
 }
 
@@ -876,6 +1049,188 @@ fn endpoint_err(e: impl std::fmt::Display) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxigraph::model::{GraphNameRef, LiteralRef, NamedNodeRef, Quad, QuadRef};
+
+    fn quad(n: usize) -> Quad {
+        QuadRef::new(
+            NamedNodeRef::new_unchecked("urn:test:record"),
+            NamedNodeRef::new_unchecked("urn:test:p"),
+            LiteralRef::new_simple_literal(&n.to_string()),
+            GraphNameRef::DefaultGraph,
+        )
+        .into_owned()
+    }
+
+    /// ★ THE PIN (ledger #1207, the half of #1127 a raw-handle host owns): writes asked for
+    /// from many short-lived threads, the way a socket door asks, all commit on ONE thread
+    /// that is none of them, and once the store's own update door has run, on the thread
+    /// that door commits on. Without the writer every write commits on the thread that
+    /// asked, and this fails on every run, whatever seed the run happens to draw.
+    ///
+    /// (An update needing more stack than the writer has moves it to a larger long-lived
+    /// thread, once per size class, so the door's thread is read after the door has run.)
+    #[test]
+    fn a_shared_write_commits_on_the_stores_one_writer_thread_whatever_thread_asks() {
+        let (store, handle) = DurableStore::in_memory_shared().unwrap();
+        let writer = store.shared_writer().unwrap();
+        let door = || {
+            store
+                .evaluate("INSERT DATA {}", true, &Capability::root(), None, |_| {
+                    Ok(std::thread::current().id())
+                })
+                .unwrap()
+        };
+        let from_a_fresh_thread = |n: usize| {
+            let writer = writer.clone();
+            std::thread::spawn(move || {
+                let asked = std::thread::current().id();
+                let ran = writer
+                    .write(move |txn| {
+                        txn.insert(&quad(n));
+                        Ok::<_, StorageError>(std::thread::current().id())
+                    })
+                    .unwrap();
+                (asked, ran)
+            })
+            .join()
+            .unwrap()
+        };
+        let (asked, first) = from_a_fresh_thread(0);
+        assert_ne!(first, asked, "a write committed on the thread that asked");
+        assert_ne!(first, std::thread::current().id());
+        for n in 1..8 {
+            let (asked, ran) = from_a_fresh_thread(n);
+            assert_ne!(ran, asked, "a write committed on the thread that asked");
+            assert_eq!(ran, first, "a write committed on a thread of its own");
+        }
+        assert_eq!(handle.len().unwrap(), 8);
+
+        let doors = door();
+        assert_ne!(doors, std::thread::current().id());
+        for n in 8..16 {
+            let (asked, ran) = from_a_fresh_thread(n);
+            assert_ne!(ran, asked, "a write committed on the thread that asked");
+            assert_eq!(
+                ran, doors,
+                "the store's update door and the host's writes commit on two threads"
+            );
+        }
+        assert_eq!(door(), doors, "the update door left the shared writer");
+        assert_eq!(handle.len().unwrap(), 16);
+    }
+
+    #[test]
+    fn a_record_commits_whole_or_not_at_all() {
+        let (store, handle) = DurableStore::in_memory_shared().unwrap();
+        let writer = store.shared_writer().unwrap();
+        let failed: std::result::Result<(), StorageError> = writer.write(|txn| {
+            for n in 0..3 {
+                txn.insert(&quad(n));
+            }
+            Err(StorageError::Io(std::io::Error::other("incomplete")))
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            handle.len().unwrap(),
+            0,
+            "a failed record left part of itself"
+        );
+        let written = writer
+            .write(|txn| {
+                for n in 0..3 {
+                    txn.insert(&quad(n));
+                }
+                txn.len()
+            })
+            .unwrap();
+        assert_eq!(written, 3, "the transaction sees its own writes");
+        assert_eq!(handle.len().unwrap(), 3);
+    }
+
+    /// A write asked for from inside a write would wait for itself forever; it is refused
+    /// instead. Run on a thread of its own and bounded, so a regression fails rather than
+    /// hanging the suite. The door runs once first, so the writer's stack fits the nested
+    /// update and it is asked of the same thread (see the type docs for the other case).
+    #[test]
+    fn a_write_from_inside_a_write_is_refused_not_deadlocked() {
+        let (store, _handle) = DurableStore::in_memory_shared().unwrap();
+        let writer = store.shared_writer().unwrap();
+        store
+            .evaluate(
+                "INSERT DATA {}",
+                true,
+                &Capability::root(),
+                None,
+                |_| Ok(()),
+            )
+            .unwrap();
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (inner, door) = (writer.clone(), store.clone());
+            let refused = writer.write(move |_| {
+                let nested = inner.write(|_| Ok::<_, StorageError>(()));
+                let through_a_door = door.evaluate(
+                    "INSERT DATA {}",
+                    true,
+                    &Capability::root(),
+                    None,
+                    |_| Ok(()),
+                );
+                Ok::<_, StorageError>((
+                    nested.err().map(|e| e.to_string()),
+                    through_a_door.is_err(),
+                ))
+            });
+            let _ = done.send(refused);
+        });
+        let (nested, through_a_door) = outcome
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a nested write deadlocked")
+            .unwrap();
+        assert!(
+            nested
+                .as_deref()
+                .is_some_and(|e| e.contains("wait for itself")),
+            "{nested:?}"
+        );
+        assert!(
+            through_a_door,
+            "an update door asked from inside a write was not refused"
+        );
+    }
+
+    #[test]
+    fn a_panic_in_a_shared_write_reaches_its_caller_and_the_writer_lives_on() {
+        let (store, handle) = DurableStore::in_memory_shared().unwrap();
+        let writer = store.shared_writer().unwrap();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = writer.write(|txn| -> std::result::Result<(), StorageError> {
+                txn.insert(&quad(0));
+                panic!("boom")
+            });
+        }));
+        assert!(caught.is_err());
+        assert_eq!(handle.len().unwrap(), 0, "a panicking record committed");
+        writer
+            .write(|txn| {
+                txn.insert(&quad(1));
+                Ok::<_, StorageError>(())
+            })
+            .unwrap();
+        assert_eq!(handle.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn only_a_shared_store_hands_out_a_writer() {
+        assert!(DurableStore::in_memory().unwrap().shared_writer().is_none());
+        let (store, handle) = DurableStore::in_memory_shared().unwrap();
+        let writer = store.shared_writer().unwrap();
+        assert!(Arc::ptr_eq(writer.store(), &handle));
+        let (declaring, _) =
+            DurableStore::in_memory_shared_declaring(SharerWrites::only_the_default_graph())
+                .unwrap();
+        assert!(declaring.shared_writer().is_some());
+    }
 
     #[test]
     fn an_owned_in_memory_store_is_the_sole_writer() {
