@@ -669,6 +669,48 @@ unknown one is `CorruptionError`, so any quad an `rdf-12` build wrote using such
 cannot be read back by a build without it. For a *persistent* store that makes a sibling
 crate's feature a data-format decision, and dropping that sibling later a downgrade.
 
+### ⚠ `error[E0277]` inside `spareval` after `cargo add`: two `digest` crates (ledger #1148)
+
+If adding this crate to a project that already has a `Cargo.lock` ends in
+
+```text
+error[E0277]: the trait bound `CoreWrapper<CtVariableCoreWrapper<Sha256VarCore, _, _>>: Digest` is not satisfied
+   --> …/spareval-0.2.7/src/expression.rs:1146:70
+```
+
+the lock is the problem, not your code and not this crate's. `spareval` 0.2.7 (the SPARQL
+evaluator under every oxigraph 0.5.10 and 0.5.11) takes `md-5`, `sha1` and `sha2` each as
+`>=0.10, <0.12`, **independently**, and then bounds all five hash functions by `md-5`'s
+`Digest` trait. So the three must come from one family (`digest` 0.10 or `digest` 0.11),
+and nothing in any manifest says so.
+
+**When it happens.** A fresh resolve (no lock, or a plain `cargo update`) takes the highest
+of each, 0.11, and builds. An incremental one (`cargo add`, editing a manifest, `cargo update
+-p …`) prefers versions already in the lock *edge by edge*, so a lock that already holds
+`sha2` 0.10 (very common) keeps it for `spareval` while the new `md-5` and `sha1` arrive as
+0.11. Reproduced from scratch: a project depending on `sha2 = "0.10"`, then `cargo add
+ikigai-store`, fails exactly as above.
+
+**The fix.** See which edge is behind, then unlock just that copy so `spareval`'s edge is
+chosen again:
+
+```sh
+cargo tree -p spareval -e normal --depth 1      # md-5 v0.11.0, sha1 v0.11.0, sha2 v0.10.9
+cargo update -p sha2@0.10.9                     # the 0.10 copy it names; spareval moves to 0.11
+```
+
+Your own `sha2 = "0.10"` keeps its 0.10 copy beside the new 0.11 one; only `spareval`'s edge
+moves. A plain `cargo update` works too, and moves everything else with it.
+
+**What does not fix it.** Adding `md-5`, `sha1` and `sha2` to your own (or this crate's)
+`[dependencies]` at one shared version: a direct dependency is a separate edge, and Cargo
+never ties another crate's edges to it. Measured both ways: direct `0.11` pins beside a locked
+`sha2` 0.10 still leave `spareval` on 0.10, and direct `0.10` pins in a fresh resolve still
+leave it on 0.11. The defense belongs upstream ([oxigraph/oxigraph#1712]), where one
+`digest` family can be required or each hash bounded by its own crate's trait.
+
+[oxigraph/oxigraph#1712]: https://github.com/oxigraph/oxigraph/issues/1712
+
 ## ★ A query that would overflow the stack is refused, or run on one big enough (ledger #915)
 
 oxigraph's SPARQL parser and evaluator are recursive, and a stack overflow is not an error
