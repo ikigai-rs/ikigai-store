@@ -218,7 +218,13 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # writes were already serialized by the write lock, so the only behavior change is which thread they run on.
 # Also ledger #1122: a stale ignored nesting test now asserts the refusal, and `limits::on_sparql_stack` documents
 # that work handed to another thread leaves its stack.
-version = "0.2.12"
+# ★ 0.2.13 is THE FOOTPRINT RELEASE (ledger #1132): `urn:iki:store:graph-update` copied the whole target graph into
+# its private store on every write, so a ledger append cost in proportion to the ledger (RocksDB, debug: 23, 144 and
+# 614 ms at 100, 750 and 3,000 items). It now copies only the quads the update can observe or remove, read off its
+# patterns' constants (`confine::footprint`, crate-private): about 1 ms at all three. The boundary is unchanged (the
+# private store still holds nothing outside the graph, and the effects check is the same code). A patch: no API change,
+# and every answer the same, pinned by a differential test against the whole-graph copy.
+version = "0.2.13"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]

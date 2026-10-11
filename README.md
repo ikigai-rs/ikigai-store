@@ -258,8 +258,8 @@ Three more things, each of them a decision rather than an omission:
 - **`urn:cap:store:write` does not satisfy this door**, and is not meant to. A broad
   holder uses `urn:iki:store:update`, which copies nothing and sees the whole dataset.
   Accepting both here would mean the declared scope was not the enforced one.
-- **A scoped write copies only the part of the graph the update can observe** (ledger
-  #1132): the quads matching some pattern of its `WHERE`, its `DELETE` templates or its
+- **A scoped write copies only the part of the graph the update can observe** (0.2.13,
+  ledger #1132): the quads matching some pattern of its `WHERE`, its `DELETE` templates or its
   `DELETE DATA`, by their constants. A ledger append names its counter and its key, so it
   copies a quad or two however large the ledger is: on the RocksDB backing, an append took
   23, 144 and 614 ms in debug at 100, 750 and 3,000 items while the whole graph was copied
