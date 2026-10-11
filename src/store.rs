@@ -14,7 +14,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ikigai_core::{Capability, Error, Result};
-use oxigraph::model::{GraphNameRef, NamedOrBlankNode};
+use oxigraph::model::{
+    GraphNameRef, NamedNodeRef, NamedOrBlankNode, NamedOrBlankNodeRef, QuadRef, TermRef,
+};
+use oxigraph::store::QuadIter;
 
 use crate::budget::{AnswerBudget, Deadline, TimeBudget};
 
@@ -756,15 +759,44 @@ impl DurableStore {
     /// no accessor may turn an owned store into. The handle a shared store's constructor
     /// already gave away can write anyway, so this adds no authority: it only decides which
     /// THREAD those writes commit on.
+    ///
+    /// ★ **On a store opened with `open_shared_declaring` the writer carries the
+    /// declaration and enforces it** (ledger #1209): a write through it to a named graph the
+    /// [`SharerWrites`] did not name is refused, and the whole transaction with it. On a store
+    /// opened with `open_shared` nothing was declared, so nothing is refused.
+    ///
+    /// ★ This writer SHARES the store's own: its writer thread and its write lock, so a host's
+    /// write is ordered with every write door. [`SharedWriter::over`] is the other way to get
+    /// one, for a host that holds no `DurableStore` at all.
     pub fn shared_writer(&self) -> Option<SharedWriter> {
-        match self.coverage {
-            Coverage::Owned => None,
-            Coverage::Shared | Coverage::SharedDeclaring(_) => Some(SharedWriter {
-                store: Arc::clone(&self.store),
-                writes: Arc::clone(&self.writes),
-                writer: Arc::clone(&self.writer),
-            }),
-        }
+        let declared = match &self.coverage {
+            Coverage::Owned => return None,
+            Coverage::Shared => None,
+            Coverage::SharedDeclaring(writes) => Some(Arc::new(writes.clone())),
+        };
+        Some(SharedWriter {
+            store: Arc::clone(&self.store),
+            writes: Arc::clone(&self.writes),
+            writer: Arc::clone(&self.writer),
+            declared,
+        })
+    }
+
+    /// Run `work` on this store's writer thread under its write lock, and wait for it: how
+    /// `urn:iki:store:load` commits (ledger #1209), on the thread every other write commits
+    /// on. Refused at once when asked from that thread already, which would wait for itself.
+    pub(crate) fn on_writer<T: Send + 'static>(
+        self: &Arc<Self>,
+        work: impl FnOnce(&DurableStore) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let store = Arc::clone(self);
+        self.writer
+            .call(crate::limits::STACK_BASE, move || {
+                // Taken ON the writer thread, as `SharedWriter::write` takes it: see there.
+                let _writes = store.write_lock();
+                work(&store)
+            })
+            .and_then(|outcome| outcome)
     }
 
     /// Serialize this crate's writes against each other.
@@ -792,9 +824,23 @@ impl DurableStore {
     }
 }
 
-/// How a host holding a shared store's raw handle commits its own writes: on the store's one
-/// long-lived writer thread, a whole record per transaction (ledger #1207). Get one from
-/// [`DurableStore::shared_writer`]; clones share the thread.
+/// How a host holding a shared store's raw handle commits its own writes: on one long-lived
+/// writer thread, a whole record per transaction (ledger #1207), and only into the graphs it
+/// declared (ledger #1209). Clones share the thread.
+///
+/// # Two ways to get one
+///
+/// | | [`DurableStore::shared_writer`] | [`SharedWriter::over`] |
+/// | --- | --- | --- |
+/// | for a host holding | a `DurableStore` opened shared | a bare `Arc<Store>` and nothing else |
+/// | writer thread | **the store's own**, shared with its update, graph-update and load doors | **its own**, started on the first write |
+/// | write lock | the store's own, so a write is ordered with every door | its own, ordering only writes through this writer and its clones |
+/// | declaration | the store's: a [`SharerWrites`] from `open_shared_declaring`, none from `open_shared` | the [`SharerWrites`] passed in, always |
+///
+/// ⚠ **Never call `over` on a handle a `DurableStore` gave you.** It would start a second
+/// writer thread and a second lock beside the store's, and a scoped write through a door could
+/// then lose an update made here: take [`DurableStore::shared_writer`] instead. And make ONE
+/// `over` writer per store and clone it: each `over` is a thread of its own.
 ///
 /// # ★ Why the thread matters: the RocksDB seed trap (ledger #1127)
 ///
@@ -806,67 +852,86 @@ impl DurableStore {
 /// transaction. The skiplists stop growing upper levels, and every read walks a long top
 /// level until the memtable flushes: 2x to 20x slower reads after gonk's 750-append fill,
 /// and 6x to 68x after 750 browse annotations, against 1.0x when the same writes came from
-/// one thread. This crate's own doors have committed on one writer thread since 0.2.12;
-/// before this type, a host writing through the raw handle had to build its own (browse
-/// did). Now it commits on the SAME thread as the store's doors, so every write to the
-/// dataset advances one generator.
+/// one thread. This crate's own doors commit on one writer thread (the load door since
+/// 0.2.15); a writer from [`DurableStore::shared_writer`] commits on that SAME thread, so every
+/// write to the dataset advances one generator, and an [`over`](Self::over) writer on a
+/// thread of its own, which lives as long as the writer does.
+///
+/// # ★ Declared = enforced (ledger #1209)
+///
+/// A [`SharerWrites`] declaration is what lets a shared store cache scoped reads of every
+/// graph the sharer does NOT write, and a false one is the worst failure this crate has:
+/// silent, unbounded staleness. A writer that carries one keeps it:
+///
+/// - [`write_declared`](Self::write_declared) hands the closure a [`DeclaredTransaction`],
+///   whose every insert and remove is checked against the declaration. One outside it is
+///   refused ([`UndeclaredGraph`]) **and the whole transaction is rolled back**, even if the
+///   closure ignored the refusal and returned `Ok`.
+/// - [`write`](Self::write) hands the closure oxigraph's own [`Transaction`], which can write
+///   any graph, so on a writer carrying a declaration it is **refused before the closure
+///   runs**. It is for a writer with nothing declared (a store opened with `open_shared`).
+///
+/// The default graph is always writable, as [`SharerWrites`] has always said: it has no IRI,
+/// so no scoped read reaches it. A blank-node graph name never is, since no declaration can
+/// name one. A writer with no declaration refuses nothing.
+///
+/// ⚠ It covers writes made THROUGH this type. The raw handle a shared constructor returned
+/// can still write anything, and [`DurableStore::reserved_graphs_fingerprint`] stays the
+/// tripwire for that.
 ///
 /// # What a call does
 ///
-/// - **One transaction.** `write` opens a transaction on the writer thread, hands it to the
-///   closure, and commits it only if the closure returns `Ok`: a record of fifteen quads is
-///   one commit, and a reader sees all of it or none of it. On `Err` nothing is written.
-/// - **Ordered with the store's own writes.** It takes the store's write lock, as every
-///   write door does, and runs in the same queue as `urn:iki:store:update` and
-///   `urn:iki:store:graph-update`. A scoped write can no longer lose an update made through
-///   this type; one made through the raw handle directly still can.
+/// - **One transaction.** A write opens a transaction on the writer thread, hands it to the
+///   closure, and commits it only if the closure returns `Ok` (and, for `write_declared`,
+///   nothing it asked for was refused): a record of fifteen quads is one commit, and a reader
+///   sees all of it or none of it. On `Err` nothing is written.
+/// - **Ordered with the store's own writes** when it came from
+///   [`DurableStore::shared_writer`]: it takes the store's write lock, as every write door
+///   does, and runs in the same queue as `urn:iki:store:update`, `urn:iki:store:graph-update`
+///   and `urn:iki:store:load`. A scoped write can no longer lose an update made through this
+///   type; one made through the raw handle directly still can.
 /// - **It waits, with no deadline.** The caller blocks until the transaction commits or
 ///   fails, including any time spent behind a store update that is still running.
 /// - **A panic in the closure is the caller's**: caught on the writer thread, which lives
 ///   on, and resumed on the thread that asked.
 /// - **Never from inside a write.** Make a record's writes through the transaction you were
 ///   given. A closure that asks for another write through this type is refused rather than
-///   left waiting for itself forever, and so is one through the `update` and `graph-update`
-///   doors when the writer's stack fits it (when it does not, the update moves to a larger
-///   writer thread and waits there for the lock this write holds, until its budget runs
-///   out). ⚠ `urn:iki:store:load` takes the write lock on the calling thread, which inside
-///   a closure is the writer thread already holding it: that one deadlocks.
+///   left waiting for itself forever, and so is one through the `load` door, and through the
+///   `update` and `graph-update` doors when the writer's stack fits them (when it does not,
+///   the update moves to a larger writer thread and waits there for the lock this write
+///   holds, until its budget runs out).
 /// - **A stack sized for inserts and removes**, at least [`crate::limits::STACK_BASE`]. A
 ///   SPARQL update over caller text belongs at the store's update door, which sizes its
-///   thread to the text and bounds it first; run through `Transaction::update` in a closure
-///   it gets neither.
+///   thread to the text and bounds it first; run through `Transaction::update` in a `write`
+///   closure it gets neither.
 /// - On wasm there are no threads, and the closure runs inline.
 ///
 /// ⚠ It is still a write the kernel cannot see: reads stay `Expiry::Always` on a store
 /// opened with `open_shared`, and a store opened with `open_shared_declaring` stays exactly
-/// as honest as the host's [`SharerWrites`] promise. Nothing here checks which graph a
-/// closure writes.
+/// as honest as its declaration, which writes through this type can no longer break.
 ///
 /// ```
-/// use ikigai_store::{DurableStore, StorageError};
+/// use ikigai_store::{DurableStore, SharerWrites, StorageError, UndeclaredGraph};
 /// use oxigraph::model::{GraphNameRef, LiteralRef, NamedNodeRef, QuadRef};
 ///
-/// let (store, handle) = DurableStore::in_memory_shared()?;
+/// let (store, handle) =
+///     DurableStore::in_memory_shared_declaring(SharerWrites::only_the_default_graph())?;
 /// let writer = store.shared_writer().expect("a shared store has a writer");
 /// let record = NamedNodeRef::new_unchecked("urn:example:record:1");
-/// let quad = move |p: &str, o: &'static str| {
-///     QuadRef::new(
-///         record,
-///         NamedNodeRef::new_unchecked(p),
-///         LiteralRef::new_simple_literal(o),
-///         GraphNameRef::DefaultGraph,
-///     )
-///     .into_owned()
+/// let quad = move |p: &str, o: &'static str, g: GraphNameRef<'static>| {
+///     QuadRef::new(record, NamedNodeRef::new_unchecked(p), LiteralRef::new_simple_literal(o), g)
+///         .into_owned()
 /// };
-/// let (title, body) = (quad("urn:example:title", "a title"), quad("urn:example:body", "a body"));
+/// let title = quad("urn:example:title", "a title", GraphNameRef::DefaultGraph);
+/// let body = quad("urn:example:body", "a body", GraphNameRef::DefaultGraph);
 ///
 /// // Asked for from a thread spawned for it, the shape that trips the seed trap if the
 /// // write commits there. It does not: it commits on the store's writer thread.
 /// let asking = writer.clone();
 /// let committed_on = std::thread::spawn(move || {
-///     asking.write(move |txn| {
-///         txn.insert(&title);
-///         txn.insert(&body);
+///     asking.write_declared(move |txn| {
+///         txn.insert(&title)?;
+///         txn.insert(&body)?;
 ///         Ok::<_, StorageError>(std::thread::current().name().map(str::to_owned))
 ///     })
 /// })
@@ -875,13 +940,23 @@ impl DurableStore {
 /// assert_eq!(committed_on.as_deref(), Some("ikigai-store-writer"));
 /// assert_eq!(handle.len()?, 2);
 ///
-/// // A record that fails part way writes none of itself.
-/// let another = quad("urn:example:title", "another title");
-/// let failed: Result<(), StorageError> = writer.write(move |txn| {
-///     txn.insert(&another);
-///     Err(StorageError::Io(std::io::Error::other("the record was incomplete")))
-/// });
-/// assert!(failed.is_err());
+/// // A record that reaches a graph the declaration reserved writes none of itself.
+/// let elsewhere = quad(
+///     "urn:example:title",
+///     "another title",
+///     GraphNameRef::NamedNode(NamedNodeRef::new_unchecked("urn:example:reserved")),
+/// );
+/// let another = quad("urn:example:title", "another title", GraphNameRef::DefaultGraph);
+/// let refused = writer
+///     .write_declared(move |txn| {
+///         txn.insert(&another)?;
+///         txn.insert(&elsewhere)
+///     })
+///     .unwrap_err();
+/// assert_eq!(
+///     UndeclaredGraph::of(&refused).map(UndeclaredGraph::graph),
+///     Some("<urn:example:reserved>")
+/// );
 /// assert_eq!(handle.len()?, 2);
 ///
 /// // An owned store hands out no writer: its every write goes through a kernel door.
@@ -893,42 +968,150 @@ pub struct SharedWriter {
     store: Arc<Store>,
     writes: Arc<Mutex<()>>,
     writer: Arc<crate::budget::Writer>,
+    /// The graphs this writer may write, or `None` when nothing was declared.
+    declared: Option<Arc<SharerWrites>>,
 }
 
 impl std::fmt::Debug for SharedWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SharedWriter").finish_non_exhaustive()
+        f.debug_struct("SharedWriter")
+            .field("declared", &self.declared)
+            .finish_non_exhaustive()
     }
 }
 
 impl SharedWriter {
-    /// The raw handle, for reads: the same `Arc<Store>` the shared constructor returned, so a
-    /// host can hand a module this one value instead of two.
+    /// A writer over a bare `Store` handle, for a host that holds no [`DurableStore`]: its own
+    /// long-lived writer thread and its own write lock, writing only the graphs `writes`
+    /// declares (ledger #1207, #1209). See the type docs for how it differs from
+    /// [`DurableStore::shared_writer`], and never use it on a handle a `DurableStore` gave
+    /// out.
+    ///
+    /// Nothing starts until the first write, and the thread ends when the last clone is
+    /// dropped. Make one per store and clone it.
+    ///
+    /// ```
+    /// use ikigai_store::{SharedWriter, SharerWrites, StorageError, Store};
+    /// use oxigraph::model::{GraphNameRef, NamedNodeRef, QuadRef};
+    /// use std::sync::Arc;
+    ///
+    /// // A host that opened the store itself (`Store::open` on disk; in memory here).
+    /// let store = Arc::new(Store::new()?);
+    /// let writer = SharedWriter::over(
+    ///     Arc::clone(&store),
+    ///     SharerWrites::only_the_default_graph().and_named_graph("urn:example:notes"),
+    /// );
+    /// let note = NamedNodeRef::new_unchecked("urn:example:note:1");
+    /// let notes = GraphNameRef::NamedNode(NamedNodeRef::new_unchecked("urn:example:notes"));
+    /// writer.write_declared(move |txn| txn.insert(QuadRef::new(note, note, note, notes)))?;
+    /// assert_eq!(store.len()?, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn over(store: Arc<Store>, writes: SharerWrites) -> SharedWriter {
+        SharedWriter {
+            store,
+            writes: Arc::new(Mutex::new(())),
+            writer: Arc::default(),
+            declared: Some(Arc::new(writes)),
+        }
+    }
+
+    /// The raw handle, for reads: the same `Arc<Store>` the shared constructor returned (or
+    /// [`over`](Self::over) was given), so a host can hand a module this one value instead of
+    /// two.
     pub fn store(&self) -> &Arc<Store> {
         &self.store
     }
 
-    /// Run `record` against one transaction on the store's writer thread, and commit it if
-    /// `record` returns `Ok`. See the type docs for what that buys and what it does not.
+    /// The graphs this writer may write, or `None` when nothing was declared (a store opened
+    /// with `open_shared`), in which case it refuses nothing.
+    pub fn declared(&self) -> Option<&SharerWrites> {
+        self.declared.as_deref()
+    }
+
+    /// Run `record` against one [`DeclaredTransaction`] on the writer thread, and commit it if
+    /// `record` returns `Ok` and nothing it asked for was refused. See the type docs.
     ///
     /// The error type is the caller's, so long as a [`StorageError`] converts into it: a
-    /// failure to start, commit or reach the writer thread arrives as one.
+    /// failure to start, commit or reach the writer thread arrives as one, and so does a
+    /// refusal, which [`UndeclaredGraph::of`] recognizes.
+    pub fn write_declared<T, E, F>(&self, record: F) -> std::result::Result<T, E>
+    where
+        F: FnOnce(&mut DeclaredTransaction<'_>) -> std::result::Result<T, E> + Send + 'static,
+        T: Send + 'static,
+        E: From<StorageError> + Send + 'static,
+    {
+        let (store, declared) = (Arc::clone(&self.store), self.declared.clone());
+        self.on_writer(move || {
+            let mut transaction = DeclaredTransaction {
+                inner: store.start_transaction()?,
+                declared,
+                refused: None,
+            };
+            let value = record(&mut transaction)?;
+            match transaction.refused {
+                // The closure went on after a refusal, or swallowed it: the transaction is
+                // dropped uncommitted all the same.
+                Some(refused) => Err(E::from(refused.into_storage_error())),
+                None => {
+                    transaction.inner.commit()?;
+                    Ok(value)
+                }
+            }
+        })
+    }
+
+    /// Run `record` against one raw oxigraph [`Transaction`] on the writer thread, and commit
+    /// it if `record` returns `Ok`.
+    ///
+    /// ⚠ **Refused, before `record` runs, on a writer carrying a declaration** (ledger #1209):
+    /// a raw transaction can write any graph, so the declaration could not be kept. Use
+    /// [`write_declared`](Self::write_declared), which serves every writer. This one is for a
+    /// writer with nothing declared that needs what a [`DeclaredTransaction`] does not offer
+    /// (`Transaction::update`, `load_from_reader`, `clear`).
     pub fn write<T, E, F>(&self, record: F) -> std::result::Result<T, E>
     where
         F: FnOnce(&mut Transaction<'_>) -> std::result::Result<T, E> + Send + 'static,
         T: Send + 'static,
         E: From<StorageError> + Send + 'static,
     {
-        let (store, writes) = (Arc::clone(&self.store), Arc::clone(&self.writes));
+        if let Some(declared) = &self.declared {
+            return Err(E::from(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "this writer carries a `SharerWrites` declaration ({}), and a raw \
+                     `Transaction` could write any graph, so it would not be kept. Nothing was \
+                     written. Write through `SharedWriter::write_declared`, whose transaction \
+                     refuses a graph outside the declaration (ledger #1209)",
+                    describe(declared)
+                ),
+            ))));
+        }
+        let store = Arc::clone(&self.store);
+        self.on_writer(move || {
+            let mut transaction = store.start_transaction()?;
+            let value = record(&mut transaction)?;
+            transaction.commit()?;
+            Ok(value)
+        })
+    }
+
+    /// Run `job` on the writer thread under the write lock, and wait for its answer.
+    fn on_writer<T, E>(
+        &self,
+        job: impl FnOnce() -> std::result::Result<T, E> + Send + 'static,
+    ) -> std::result::Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<StorageError> + Send + 'static,
+    {
+        let writes = Arc::clone(&self.writes);
         let job = move || -> std::result::Result<T, E> {
             // Taken ON the writer thread, as the store's update doors take it: taken on the
             // caller's thread it would wait for a door's job queued ahead of this one, which
             // waits for the lock.
             let _writes = writes.lock().unwrap_or_else(|e| e.into_inner());
-            let mut transaction = store.start_transaction()?;
-            let value = record(&mut transaction)?;
-            transaction.commit()?;
-            Ok(value)
+            job()
         };
         match self.writer.call(crate::limits::STACK_BASE, job) {
             Ok(outcome) => outcome,
@@ -938,6 +1121,197 @@ impl SharedWriter {
         }
     }
 }
+
+/// A declaration in a sentence, for a refusal.
+fn describe(declared: &SharerWrites) -> String {
+    if declared.named_graphs().len() == 0 {
+        "the default graph only".to_string()
+    } else {
+        format!(
+            "the default graph and {}",
+            declared
+                .named_graphs()
+                .map(|g| format!("<{g}>"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+/// The transaction a [`SharedWriter::write_declared`] closure writes through: oxigraph's own,
+/// with every write checked against the writer's [`SharerWrites`] declaration (ledger #1209).
+///
+/// A write to a graph outside the declaration returns an [`UndeclaredGraph`] refusal, writes
+/// nothing, and marks the transaction so it is **not committed**, whatever the closure does
+/// next. Reads see the transaction's own writes, as oxigraph's do, and any graph: the raw
+/// handle could read them anyway, so a read is no new authority.
+pub struct DeclaredTransaction<'a> {
+    inner: Transaction<'a>,
+    declared: Option<Arc<SharerWrites>>,
+    refused: Option<UndeclaredGraph>,
+}
+
+impl std::fmt::Debug for DeclaredTransaction<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeclaredTransaction")
+            .field("declared", &self.declared)
+            .field("refused", &self.refused)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeclaredTransaction<'_> {
+    /// Add a quad, if its graph is declared.
+    pub fn insert<'b>(
+        &mut self,
+        quad: impl Into<QuadRef<'b>>,
+    ) -> std::result::Result<(), StorageError> {
+        let quad = quad.into();
+        self.permit(quad.graph_name)?;
+        self.inner.insert(quad);
+        Ok(())
+    }
+
+    /// Add quads, each of whose graphs must be declared. The first one that is not stops the
+    /// insert there and refuses the transaction.
+    pub fn extend<'b>(
+        &mut self,
+        quads: impl IntoIterator<Item = impl Into<QuadRef<'b>>>,
+    ) -> std::result::Result<(), StorageError> {
+        quads.into_iter().try_for_each(|quad| self.insert(quad))
+    }
+
+    /// Remove a quad, if its graph is declared: removing changes a graph as surely as adding.
+    pub fn remove<'b>(
+        &mut self,
+        quad: impl Into<QuadRef<'b>>,
+    ) -> std::result::Result<(), StorageError> {
+        let quad = quad.into();
+        self.permit(quad.graph_name)?;
+        self.inner.remove(quad);
+        Ok(())
+    }
+
+    /// Whether the dataset, as this transaction sees it, holds `quad`.
+    pub fn contains<'b>(
+        &self,
+        quad: impl Into<QuadRef<'b>>,
+    ) -> std::result::Result<bool, StorageError> {
+        self.inner.contains(quad)
+    }
+
+    /// The quads matching a pattern, as this transaction sees them (its own writes included).
+    pub fn quads_for_pattern(
+        &self,
+        subject: Option<NamedOrBlankNodeRef<'_>>,
+        predicate: Option<NamedNodeRef<'_>>,
+        object: Option<TermRef<'_>>,
+        graph_name: Option<GraphNameRef<'_>>,
+    ) -> QuadIter<'_> {
+        self.inner
+            .quads_for_pattern(subject, predicate, object, graph_name)
+    }
+
+    /// How many quads the dataset holds, as this transaction sees it. A full scan.
+    pub fn len(&self) -> std::result::Result<usize, StorageError> {
+        self.inner.len()
+    }
+
+    /// Whether the dataset, as this transaction sees it, is empty.
+    pub fn is_empty(&self) -> std::result::Result<bool, StorageError> {
+        self.inner.is_empty()
+    }
+
+    /// Refuse a write to `graph` unless the declaration names it, and remember the refusal so
+    /// the transaction is not committed.
+    fn permit(&mut self, graph: GraphNameRef<'_>) -> std::result::Result<(), StorageError> {
+        let Some(declared) = self.declared.as_deref() else {
+            return Ok(());
+        };
+        let permitted = match graph {
+            GraphNameRef::DefaultGraph => true,
+            GraphNameRef::NamedNode(iri) => declared.may_write(iri.as_str()),
+            // No declaration can name a blank node, so none permits one.
+            GraphNameRef::BlankNode(_) => false,
+        };
+        if permitted {
+            return Ok(());
+        }
+        let refused = UndeclaredGraph {
+            graph: graph.to_string(),
+            declared: describe(declared),
+        };
+        self.refused.get_or_insert_with(|| refused.clone());
+        Err(refused.into_storage_error())
+    }
+}
+
+/// The refusal of a write through a [`SharedWriter`] to a graph its [`SharerWrites`]
+/// declaration does not name (ledger #1209). It arrives inside a [`StorageError`] (kind
+/// `PermissionDenied`), or inside the caller's own error converted from one; recognize it with
+/// [`UndeclaredGraph::of`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndeclaredGraph {
+    graph: String,
+    declared: String,
+}
+
+impl UndeclaredGraph {
+    /// The graph the refused write named, in N-Quads graph-name form (`<urn:…>`, or `_:b0`).
+    pub fn graph(&self) -> &str {
+        &self.graph
+    }
+
+    /// The refusal inside `error`, if that is what it is: a [`StorageError`], or any error
+    /// whose source chain reaches one.
+    pub fn of<'e>(error: &'e (dyn std::error::Error + 'static)) -> Option<&'e UndeclaredGraph> {
+        let mut next = Some(error);
+        while let Some(error) = next {
+            if let Some(refused) = error.downcast_ref::<UndeclaredGraph>() {
+                return Some(refused);
+            }
+            if let Some(StorageError::Io(io)) = error.downcast_ref::<StorageError>() {
+                if let Some(refused) = io
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<UndeclaredGraph>())
+                {
+                    return Some(refused);
+                }
+            }
+            if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                if let Some(refused) = io
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<UndeclaredGraph>())
+                {
+                    return Some(refused);
+                }
+            }
+            next = error.source();
+        }
+        None
+    }
+
+    fn into_storage_error(self) -> StorageError {
+        StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            self,
+        ))
+    }
+}
+
+impl std::fmt::Display for UndeclaredGraph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a write to graph {} was refused: this writer's `SharerWrites` declaration names {}, \
+             and a write outside it would make cached reads of that graph stale with no signal. \
+             The whole transaction was rolled back (ledger #1209)",
+            self.graph, self.declared
+        )
+    }
+}
+
+impl std::error::Error for UndeclaredGraph {}
 
 /// What one reserved graph held when it was fingerprinted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

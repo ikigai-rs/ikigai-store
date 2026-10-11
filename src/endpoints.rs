@@ -1468,7 +1468,6 @@ impl Endpoint for LoadEndpoint {
                 // the caller's thread and under the write lock. Scanned outside the lock, in
                 // the lexing mode of the parser below (strict, by format). See `src/depth.rs`.
                 crate::depth::check_rdf_nesting(bytes, format, "content")?;
-                let _writes = self.store.write_lock();
                 let mut parser = RdfParser::from_format(format);
                 // ⚠ A `graph` that is present but unreadable is refused: read as absent, it
                 // would load the document into the DEFAULT graph (ledger #751).
@@ -1479,15 +1478,27 @@ impl Endpoint for LoadEndpoint {
                     })?;
                     parser = parser.with_default_graph(GraphNameRef::from(name));
                 }
-                let before = self.len()?;
-                self.store
-                    .dataset()
-                    .load_from_reader(parser, bytes)
-                    .map_err(|e| Error::InvalidArgument {
-                        name: "content".to_string(),
-                        detail: format!("parsing {media}: {e}"),
-                    })?;
-                let after = self.len()?;
+                // ★ Parsed and committed on the store's writer thread under its write lock
+                // (ledger #1209), as every other write door commits: committed on the
+                // caller's thread, a host loading from a thread per connection drew the same
+                // few RocksDB skiplist heights for every load (the ledger #1127 seed trap,
+                // 4.8x to 14.8x slower reads after 750 loads, against 1.0x through the
+                // update doors), and a `SharedWriter` closure that asked for a load waited
+                // for itself. The second now gets a refusal saying so. The document is copied
+                // to cross the thread, once; parsing it costs far more.
+                let document = bytes.to_vec();
+                let label = media.to_string();
+                let (before, after) = self.store.on_writer(move |store| {
+                    let before = count(store)?;
+                    store
+                        .dataset()
+                        .load_from_reader(parser, document.as_slice())
+                        .map_err(|e| Error::InvalidArgument {
+                            name: "content".to_string(),
+                            detail: format!("parsing {label}: {e}"),
+                        })?;
+                    Ok((before, count(store)?))
+                })?;
                 // The counts are a read (a document whose quads were all there already
                 // adds nothing), so only for a caller that may read the dataset.
                 Ok(plain(if inv.capability.allows(CAP_READ) {
@@ -1545,15 +1556,6 @@ impl Endpoint for LoadEndpoint {
                     .optional(),
             )
             .output("text/plain")
-    }
-}
-
-impl LoadEndpoint {
-    fn len(&self) -> Result<usize> {
-        self.store
-            .dataset()
-            .len()
-            .map_err(|e| Error::Endpoint(format!("counting quads: {e}")))
     }
 }
 

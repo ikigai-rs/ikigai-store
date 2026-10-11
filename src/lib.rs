@@ -233,6 +233,10 @@
 //! [`DurableStore::reserved_graphs_fingerprint`], which is offered here precisely so
 //! that every host does not invent its own.
 //!
+//! ★ **Writes through a [`SharedWriter`] keep it** (ledger #1209): the writer carries the
+//! declaration, and [`SharedWriter::write_declared`] refuses a graph outside it and rolls
+//! the whole transaction back. What stays a promise is the raw handle's own writes.
+//!
 //! # Cache ejection
 //!
 //! `ikigai-core`'s `cache-ejection.md` stops because there is nowhere durable to put an
@@ -285,6 +289,6 @@ pub use endpoints::{
     CAP_WRITE_GRAPH, GRAPH_UPDATE_THREAD, LOAD_THREAD, UPDATE_THREAD,
 };
 pub use store::{
-    Backing, DurableStore, GraphFingerprint, SharedWriter, SharerWrites, StorageError, Store,
-    Transaction,
+    Backing, DeclaredTransaction, DurableStore, GraphFingerprint, SharedWriter, SharerWrites,
+    StorageError, Store, Transaction, UndeclaredGraph,
 };

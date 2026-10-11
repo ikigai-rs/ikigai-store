@@ -49,7 +49,9 @@
 //!
 //! `DOOR` is `own-graph` (each write to its own graph through `urn:iki:store:graph-update`,
 //! the default), `one-graph` (every write to ONE graph through the same door, as a ledger does;
-//! that door copies the graph per write, so this is quadratic) or `update` (the broad door).
+//! that door copies the graph per write, so this is quadratic), `update` (the broad door) or
+//! `load` (each write a document through `urn:iki:store:load` into its own graph, asked from a
+//! thread spawned for it, as a socket door asks: ledger #1209).
 
 use futures::executor::block_on;
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
@@ -98,6 +100,35 @@ fn write(kernel: &Kernel, door: &str, i: usize) {
          <urn:x:post-bulk:predicate:body> \"a body long enough for the string table {i}\" . }}"
     );
     let update = format!("INSERT DATA {{ {quads} }}");
+    if door == "load" {
+        // The same four statements as a document, loaded into the write's own graph from a
+        // thread spawned for it, the way a socket door asks (ledger #1209).
+        let document = format!(
+            "<urn:x:post-bulk:item:{i:020}> <urn:x:post-bulk:predicate:title> \
+             \"the title of item number {i:08}\" .\n\
+             <urn:x:post-bulk:item:{i:020}> <urn:x:post-bulk:predicate:status> \
+             <urn:x:post-bulk:status:open> .\n\
+             <urn:x:post-bulk:item:{i:020}> <urn:x:post-bulk:predicate:number> \
+             \"{i}\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
+             <urn:x:post-bulk:item:{i:020}> <urn:x:post-bulk:predicate:body> \
+             \"a body long enough for the string table {i}\" .\n"
+        );
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                issue(
+                    kernel,
+                    Verb::Sink,
+                    "urn:iki:store:load",
+                    &[
+                        ("content", &document),
+                        ("format", "application/n-triples"),
+                        ("graph", &graph),
+                    ],
+                )
+            });
+        });
+        return;
+    }
     match door {
         "update" => issue(
             kernel,
@@ -212,6 +243,35 @@ fn a_read_after_a_bulk_write_answers_like_a_read_on_a_fresh_copy() {
         "a read right after 4,000 writes took {:?}, {:.1}x the {:?} it takes on a fresh copy \
          of the same data (the bound is {MAX_RATIO}x). This is the ledger #1127 shape: see this \
          file's header, and check that every write still runs on the store's writer thread",
+        measured.post_bulk,
+        measured.ratio(),
+        measured.fresh,
+    );
+}
+
+/// ★ The same bound for `urn:iki:store:load`, each load asked from a thread spawned for it
+/// (ledger #1209). Before the load door moved onto the writer thread this measured 4.8x,
+/// 11.0x and 14.8x in three debug runs; after, 0.88x to 1.21x in five. 750 loads, not 4,000:
+/// each load counts the dataset twice, so the fill is quadratic. The deterministic half is
+/// `a_load_asked_from_inside_a_shared_write_is_refused_not_deadlocked` in
+/// `tests/shared_writer.rs`, whose refusal only the writer's queue can give.
+#[cfg(feature = "persistent")]
+#[test]
+fn a_read_after_bulk_loads_from_fresh_threads_answers_like_a_read_on_a_fresh_copy() {
+    let measured = measure(
+        &|name| DurableStore::open_shared(scratch(&format!("load-{name}"))).unwrap(),
+        "load",
+        750,
+        3,
+    );
+    for name in ["bulk", "fresh"] {
+        let _ = std::fs::remove_dir_all(scratch(&format!("load-{name}")));
+    }
+    assert!(
+        measured.ratio() <= MAX_RATIO,
+        "a read right after 750 loads took {:?}, {:.1}x the {:?} it takes on a fresh copy of \
+         the same data (the bound is {MAX_RATIO}x). Check that `urn:iki:store:load` still \
+         commits on the store's writer thread (ledger #1209)",
         measured.post_bulk,
         measured.ratio(),
         measured.fresh,
