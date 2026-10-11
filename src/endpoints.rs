@@ -1193,7 +1193,7 @@ impl Endpoint for UpdateEndpoint {
                         } else {
                             crate::confine::Unreadable::EveryGraph
                         };
-                        let prepared = crate::confine::parse(&text, deadline, unreadable)?;
+                        let prepared = crate::confine::parse(&text, deadline, unreadable)?.prepared;
                         if crate::confine::reads_the_dataset(&prepared) && !may_read {
                             return Err(Error::Denied(format!(
                                 "this update has a `WHERE` clause, which reads the dataset, and \
@@ -1346,8 +1346,8 @@ impl Endpoint for GraphUpdateEndpoint {
                         } else {
                             crate::confine::Unreadable::Graph(&target)
                         };
-                        let prepared = crate::confine::parse(&text, deadline, unreadable)?;
-                        if crate::confine::reads_the_dataset(&prepared) && !may_read {
+                        let parsed = crate::confine::parse(&text, deadline, unreadable)?;
+                        if crate::confine::reads_the_dataset(&parsed.prepared) && !may_read {
                             return Err(Error::Denied(format!(
                                 "this update has a `WHERE` clause, which reads graph <{}>, and \
                              reading it needs the grant `{}` (or `{CAP_READ}`), which this \
@@ -1359,7 +1359,13 @@ impl Endpoint for GraphUpdateEndpoint {
                             )));
                         }
                         let _writes = store.write_lock();
-                        crate::confine::scoped_update(store.dataset(), &target, prepared, deadline)
+                        crate::confine::scoped_update(
+                            store.dataset(),
+                            &target,
+                            parsed.prepared,
+                            &parsed.footprint,
+                            deadline,
+                        )
                     },
                 )?;
                 // ⚠ The counts only for a caller that may read `G`: `+0` after an

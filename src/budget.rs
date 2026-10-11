@@ -358,6 +358,17 @@ pub(crate) struct Deadline {
 }
 
 impl Deadline {
+    /// A deadline nobody gives up on, for a unit test that calls an evaluation step directly.
+    #[cfg(test)]
+    pub(crate) fn never() -> Deadline {
+        Deadline {
+            token: CancellationToken::new(),
+            state: Arc::new(Mutex::new(State::Running)),
+            budget: Duration::from_secs(3600),
+            write: true,
+        }
+    }
+
     /// The token, for `SparqlEvaluator::with_cancellation_token` and for a serializer to
     /// check between rows.
     pub(crate) fn token(&self) -> CancellationToken {
