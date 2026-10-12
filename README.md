@@ -857,15 +857,47 @@ all three against a local stub, and CI runs it twice: in the default build, and 
 `http-client` gate feature on (`features: "*"`), where a control proves raw oxigraph really does
 reach the stub — so the refusals are not vacuous.
 
-⚠ What this does **not** bound: a triple term **built by SPARQL**. `INSERT DATA` text is bounded
-by `MAX_SPARQL_NESTING` (`<<` counts), but an update can wrap a STORED term in `TRIPLE(…)` and
-store the result — up to ~60 levels deeper per update — and oxigraph encodes, decodes, hashes and
-drops a stored triple term recursively too. In a debug build, 17 such updates built a term 1,020
-deep that aborted a 2 MiB thread reading the store directly through a shared handle, and 300
-aborted the host on the sized SPARQL thread. Reported, not fixed, in this release.
-
 `tests/triple_term_nesting.rs` reproduces the load abort in a child process in every syntax (it
 fails, with the child killed by `SIGABRT`, against 0.2.9 with `--features rdf-12`).
+
+### ★ An update cannot grow a stored triple term past the bound (ledger #1333)
+
+`INSERT DATA` text is bounded by `MAX_SPARQL_NESTING` (`<<` counts), but an update can wrap a
+STORED term and store the result: `DELETE { <a> <p> ?t } INSERT { <a> <p> ?n } WHERE { <a> <p>
+?t BIND(TRIPLE(<s>, <p>, …56 levels… ?t) AS ?n) }` adds 56 levels a request (a `<<( … )>>`
+template adds 6, the most the text scan admits), and every request is inside every text bound.
+oxigraph encodes, decodes and serializes a stored triple term recursively, so before 0.2.18 the
+term grew until a request touching it aborted the host (in a debug build, at about 11,800
+levels on the store's writer thread), through `urn:iki:store:update` and `urn:iki:store:graph-update`
+alike, by either constructor.
+
+Now both doors keep an invariant: **no update adds a quad whose object nests triple terms deeper
+than `depth::MAX_RDF_NESTING` (64)**, the depth a loaded document may have. An update that would
+is refused before it commits, as an `InvalidArgument` on `content` naming `MAX_RDF_NESTING`, and
+nothing of it is applied, its `DELETE` half included. What it costs:
+
+- **`graph-update`** checks the quads it is about to add, which it has in hand already: free.
+- **`update`** commits through oxigraph's own transaction, which does not say what it added, so
+  before commit it reads, as the transaction sees them, the quads its `INSERT` templates can
+  reach (by each template's subject, predicate and graph constants), and only when the text can
+  build a triple term at all (`<<`, `{|`, `~`, `TRIPLE` in any case, or a `\u` escape:
+  over-approximate on purpose). An update with constant objects, `INSERT DATA`, `DELETE WHERE`
+  and `CLEAR` read nothing extra.
+
+A quad the store held before the update is not the update's doing and is passed over, so a deep
+term written before this check does not make every later update fail; copying it to a new quad is
+refused like any other.
+
+⚠ What this does **not** reach. A host writing through its own handle (the `Arc<Store>` from a
+`*_shared` constructor, or a `SharedWriter` closure) writes what it builds; it can keep the same
+invariant with `depth::nests_deeper_than_the_bound`. And a store that **already holds** a term
+deeper than about a thousand levels, written before 0.2.18, still aborts whatever reads it:
+oxigraph decodes a stored term recursively before any code here sees it, so the read cannot be
+refused instead. Delete such a quad through a handle on a thread with a large stack.
+
+`tests/triple_term_growth.rs` reproduces the growth in a child process on a 2 MiB thread, at both
+doors and with both constructors (it fails, with the child killed by `SIGABRT`, against 0.2.17
+with `--features rdf-12`).
 
 ## ★ Every evaluation has a time budget (ledger #964)
 

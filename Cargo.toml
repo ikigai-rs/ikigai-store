@@ -260,6 +260,11 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # past it. Reproduced on 0.2.17 through `service::evaluator()`: a ~300-byte cross-join ASK over a 7-triple tuple ran
 # to the end unrefused, ~8x longer per pattern. A patch: purely additive. It STACKS on 0.2.16 and 0.2.17, both merged
 # and never published: this release carries all three.
+# ★ 0.2.18 ALSO carries the stored triple-term bound (ledger #1333), folded in before it published: no update, through
+# either door, adds a quad whose object nests triple terms deeper than `depth::MAX_RDF_NESTING` (64); refused before
+# commit, nothing applied. Reproduced on the 0.2.18 tree before it (rdf-12, debug): 56 levels a request by `TRIPLE(…)`
+# (6 by template) grew a term until the writer thread aborted the process at ~11,800 levels. Still a patch: additive
+# (one public fn, `depth::nests_deeper_than_the_bound`), and the only new refusal is of a write that would abort later.
 version = "0.2.18"
 edition = "2021"
 license = "MIT OR Apache-2.0"

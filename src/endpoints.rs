@@ -1193,7 +1193,8 @@ impl Endpoint for UpdateEndpoint {
                         } else {
                             crate::confine::Unreadable::EveryGraph
                         };
-                        let prepared = crate::confine::parse(&text, deadline, unreadable)?.prepared;
+                        let parsed = crate::confine::parse(&text, deadline, unreadable)?;
+                        let prepared = parsed.prepared;
                         if crate::confine::reads_the_dataset(&prepared) && !may_read {
                             return Err(Error::Denied(format!(
                                 "this update has a `WHERE` clause, which reads the dataset, and \
@@ -1214,6 +1215,19 @@ impl Endpoint for UpdateEndpoint {
                             .on_transaction(&mut transaction)
                             .execute()
                             .map_err(|e| Error::Endpoint(format!("update: {e}")))?;
+                        // ★ Committed only if it leaves no triple term deeper than the bound
+                        // (ledger #1333): an update can wrap a stored term in `TRIPLE(…)` a
+                        // few dozen levels a request until a read of it aborts the host. Read
+                        // only where the text can build one and only where its templates
+                        // reach. See `src/depth.rs`.
+                        if crate::depth::may_construct_triple_term(&text) {
+                            crate::confine::check_inserted(
+                                &transaction,
+                                store.dataset(),
+                                &parsed.inserts,
+                                deadline,
+                            )?;
+                        }
                         deadline.settle(|| {
                             transaction
                                 .commit()
