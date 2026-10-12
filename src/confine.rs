@@ -139,12 +139,14 @@ use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use spargebra::algebra::{
     AggregateExpression, Expression, GraphPattern, OrderExpression, PropertyPathExpression,
 };
-use spargebra::term::{GroundTerm, GroundTermPattern, NamedNodePattern, TermPattern};
+use spargebra::term::{
+    GraphNamePattern, GroundTerm, GroundTermPattern, NamedNodePattern, TermPattern,
+};
 use spargebra::{GraphUpdateOperation, Update};
 
 use crate::budget::Deadline;
 use oxigraph::sparql::PreparedSparqlUpdate;
-use oxigraph::store::Store;
+use oxigraph::store::{Store, Transaction};
 
 /// What a scoped update did to the real store.
 pub(crate) struct Applied {
@@ -190,18 +192,104 @@ pub(crate) fn parse(
     // every build (ledger #1083, `src/service.rs`).
     crate::service::refuse_service_in_update(&parsed, "content")?;
     let footprint = footprint(&parsed);
+    let inserts = insert_probes(&parsed);
     Ok(Parsed {
         prepared: crate::service::evaluator()
             .with_cancellation_token(deadline.token())
             .for_update(parsed),
         footprint,
+        inserts,
     })
 }
 
-/// A parsed, bounded update, and what of a scoped graph it can observe.
+/// A parsed, bounded update, what of a scoped graph it can observe, and where its `INSERT`
+/// templates can put a triple term.
 pub(crate) struct Parsed {
     pub prepared: PreparedSparqlUpdate,
     pub footprint: Footprint,
+    pub inserts: Vec<InsertProbe>,
+}
+
+/// One `INSERT` template that can put a triple term in the store, by its constants: every quad
+/// it adds matches each one given (ledger #1333).
+///
+/// A template whose object is an IRI, a literal or a blank node adds no triple term, and
+/// `INSERT DATA` adds only what its text spells, which [`crate::limits::check_sparql`] has
+/// already bounded, so neither has a probe. What is left is a template whose object is a
+/// variable (bound, perhaps, to a stored term the `WHERE` wrapped in `TRIPLE(…)`) or a
+/// `<<( … )>>` pattern around one.
+#[derive(Debug, PartialEq)]
+pub(crate) struct InsertProbe {
+    subject: Option<NamedOrBlankNode>,
+    predicate: Option<NamedNode>,
+    /// `None` for a `GRAPH ?g` template. `WITH` is already in the template as its graph
+    /// (spargebra injects it), so the default graph here is the default graph.
+    graph: Option<GraphName>,
+}
+
+/// The [`InsertProbe`]s of a parsed update.
+pub(crate) fn insert_probes(update: &Update) -> Vec<InsertProbe> {
+    let mut probes = Vec::new();
+    for operation in &update.operations {
+        let GraphUpdateOperation::DeleteInsert { insert, .. } = operation else {
+            continue;
+        };
+        for template in insert {
+            if matches!(
+                template.object,
+                TermPattern::NamedNode(_) | TermPattern::Literal(_) | TermPattern::BlankNode(_)
+            ) {
+                continue;
+            }
+            let probe = InsertProbe {
+                subject: term_pattern(&template.subject).and_then(subject),
+                predicate: named_node(&template.predicate),
+                graph: match &template.graph_name {
+                    GraphNamePattern::NamedNode(node) => Some(node.clone().into()),
+                    GraphNamePattern::DefaultGraph => Some(GraphName::DefaultGraph),
+                    GraphNamePattern::Variable(_) => None,
+                },
+            };
+            if !probes.contains(&probe) {
+                probes.push(probe);
+            }
+        }
+    }
+    probes
+}
+
+/// Refuse an update, before it commits, that has left a quad in `transaction` whose object
+/// nests triple terms deeper than [`crate::depth::MAX_RDF_NESTING`] and that `store` did not
+/// already hold (ledger #1333).
+///
+/// Reads, as the transaction sees them, the quads each of `probes` matches: every quad the
+/// update's templates added is among them. A quad the store held before this update is not
+/// this update's doing, and a store written before this check may hold one; it is passed
+/// over (the read that decoded it already survived it).
+pub(crate) fn check_inserted(
+    transaction: &Transaction<'_>,
+    store: &Store,
+    probes: &[InsertProbe],
+    deadline: &Deadline,
+) -> Result<()> {
+    for probe in probes {
+        let quads = transaction.quads_for_pattern(
+            probe.subject.as_ref().map(NamedOrBlankNode::as_ref),
+            probe.predicate.as_ref().map(NamedNode::as_ref),
+            None,
+            probe.graph.as_ref().map(GraphName::as_ref),
+        );
+        for quad in quads {
+            deadline.check()?;
+            let quad = quad.map_err(storage)?;
+            if crate::depth::nests_deeper_than_the_bound(quad.object.as_ref())
+                && !store.contains(&quad).map_err(storage)?
+            {
+                return Err(crate::depth::grown_too_deep("content"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Which quads of the scoped graph an update can OBSERVE OR REMOVE (ledger #1132): what
@@ -595,6 +683,16 @@ pub(crate) fn scoped_update(
         if *footprint == Footprint::Whole || !store.contains(quad).map_err(storage)? {
             added.push(quad);
         }
+    }
+    // ★ No added quad may nest triple terms past the bound (ledger #1333): an update can wrap
+    // a stored term in `TRIPLE(…)` and store it a few dozen levels deeper every request, until
+    // a request that decodes it aborts the host. `added` is exactly what is new, so checking it
+    // costs nothing for an update that builds no triple term.
+    if added
+        .iter()
+        .any(|quad| crate::depth::nests_deeper_than_the_bound(quad.object.as_ref()))
+    {
+        return Err(crate::depth::grown_too_deep("content"));
     }
     let now_registered = scratch
         .contains_named_graph(graph.as_ref())

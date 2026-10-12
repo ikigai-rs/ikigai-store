@@ -29,12 +29,27 @@
 //! No published crate exports it in a form this one can take: `ikigai-shacl` would pull rudof
 //! into a store. Keep the two Turtle readings in step until the fold.
 //!
-//! ⚠ Not bounded here: a triple term built by SPARQL rather than parsed. `INSERT DATA` text is
-//! bounded by [`crate::limits::check_sparql`] (`<<` counts as nesting), but an update can wrap a
-//! STORED term in `TRIPLE(…)` and store the result, one level deeper a call. See the README.
+//! ★ **The second half: a triple term an UPDATE builds** (ledger #1333). `INSERT DATA` text is
+//! bounded by [`crate::limits::check_sparql`] (`<<` counts as nesting), but an update can wrap
+//! a STORED term in `TRIPLE(…)` or a `<<( … )>>` template and store the result, a few dozen
+//! levels deeper a request, each request inside every text bound. oxigraph encodes, decodes and
+//! serializes a stored triple term recursively, so the term grows until a request that touches
+//! it aborts the host: a debug build aborted on the writer thread at about 11,800 levels
+//! (`tests/triple_term_growth.rs`). So the store keeps an invariant: **no update leaves a
+//! quad whose object nests deeper than [`MAX_RDF_NESTING`]**, the depth a loaded document may
+//! have, checked before the update commits ([`nests_deeper_than_the_bound`], applied by
+//! `crate::confine`). A refused update applies nothing.
+//!
+//! ⚠ What that does not reach: a host writing the store through its own handle (the
+//! `Arc<Store>` a `DurableStore::*_shared` constructor returns, or a [`crate::SharedWriter`]
+//! closure) writes what it builds, and can call [`nests_deeper_than_the_bound`] itself. And a
+//! store that already holds a deeper term, written before this check, still aborts whatever
+//! decodes it: oxigraph decodes a stored term recursively before any code here sees it, so
+//! nothing here can refuse that read instead.
 
 use ikigai_core::{Error, Result};
 use oxigraph::io::RdfFormat;
+use oxigraph::model::TermRef;
 
 /// How deep a loaded document may nest RDF 1.2 triple terms: **64**, counted per `<<( … )>>` or
 /// `<< … >>` in the Turtle family and per `rdf:parseType="Triple"` element in RDF/XML.
@@ -98,6 +113,80 @@ pub fn check_rdf_nesting(text: &[u8], format: RdfFormat, arg: &str) -> Result<()
         });
     }
     Ok(())
+}
+
+/// Whether `term` nests RDF 1.2 triple terms deeper than [`MAX_RDF_NESTING`]: the check the
+/// update doors make on every quad an update would add, before it commits (ledger #1333).
+///
+/// For a host that writes the store through its own handle and wants the same invariant: a
+/// term deeper than this is one a later read of the store may not survive, since oxigraph
+/// decodes and serializes a stored triple term recursively.
+///
+/// Read off the term's N-Triples form (`<<( s p o )>>` a level) with the scan
+/// [`check_rdf_nesting`] uses, because naming the triple-term variant would not compile in a
+/// build without RDF 1.2 (see the `rdf-12` gate in `Cargo.toml`). Writing that form recurses
+/// once per level, which is safe for the terms this is meant for: anything an update builds
+/// from a store that keeps the invariant is at most [`MAX_RDF_NESTING`] plus what one update's
+/// text can add. An IRI, a blank node or a literal answers `false` without being written.
+///
+/// ```
+/// use ikigai_store::depth::nests_deeper_than_the_bound;
+/// use oxigraph::model::{Literal, NamedNode, TermRef};
+///
+/// assert!(!nests_deeper_than_the_bound(TermRef::from(&NamedNode::new("urn:o").unwrap())));
+/// let quoted = Literal::new_simple_literal("<<( ".repeat(100));
+/// assert!(!nests_deeper_than_the_bound(TermRef::from(&quoted)));
+/// ```
+pub fn nests_deeper_than_the_bound(term: TermRef<'_>) -> bool {
+    if matches!(
+        term,
+        TermRef::NamedNode(_) | TermRef::BlankNode(_) | TermRef::Literal(_)
+    ) {
+        return false;
+    }
+    terse_exceeds(term.to_string().as_bytes(), Lexer::NTriples)
+}
+
+/// Whether SPARQL update `text` could build an RDF 1.2 triple term, judged from the text
+/// alone, erring toward yes: the gate on [`crate::confine::check_inserted`], which reads the
+/// quads an update's `INSERT` templates can reach, so that an update that cannot build a
+/// triple term does not pay for it.
+///
+/// The constructors are the `<<( … )>>` term, the `<< … >>` reified triple, an annotation
+/// block `{| … |}`, a reifier `~`, and the `TRIPLE(…)` function, any of which can wrap a term
+/// bound from the store. So: any `<<`, `{|` or `~`, the word `triple` in any case (and so in an
+/// IRI or a string too), and any `\u`/`\U` escape, since spargebra's
+/// `standard-unicode-escaping` feature rewrites those before tokenizing and a sibling crate
+/// could turn it on. A false positive costs a read of the reachable quads; a false negative
+/// would be the abort. Without a constructor an update can only copy a stored term, never
+/// deepen one.
+///
+/// ⚠ **This is a COPY** of `ikigai-sparql`'s `stored::may_construct_triple_term`
+/// (ikigai-rs/ikigai-linkeddata PR 41); ledger #976 is where the copies fold into one.
+pub(crate) fn may_construct_triple_term(text: &str) -> bool {
+    text.contains("<<")
+        || text.contains("{|")
+        || text.contains('~')
+        || text.contains("\\u")
+        || text.contains("\\U")
+        || text.to_ascii_lowercase().contains("triple")
+}
+
+/// The refusal of an update that would leave a triple term deeper than [`MAX_RDF_NESTING`],
+/// on argument `arg`.
+pub(crate) fn grown_too_deep(arg: &str) -> Error {
+    Error::InvalidArgument {
+        name: arg.to_string(),
+        detail: format!(
+            "this update would leave the store holding an RDF 1.2 triple term nested deeper \
+             than {MAX_RDF_NESTING} (MAX_RDF_NESTING), so nothing was applied: the store \
+             encodes, decodes and serializes a triple term recursively, once per level, so a \
+             deep enough one aborts the whole host on whatever request reads it, and a term \
+             that grows by an update at a time has no other limit. Nest terms less deeply, or \
+             reify instead (`<< … >>` names a triple with a fresh reifier rather than nesting \
+             it)"
+        ),
+    }
 }
 
 /// Which of oxttl's lexer modes reads the text.
@@ -561,5 +650,67 @@ mod tests {
             matches!(&err, Error::InvalidArgument { name, .. } if name == "content"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn every_constructor_spelling_is_detected() {
+        for text in [
+            "INSERT { <urn:a> <urn:p> <<( <urn:s> <urn:p> ?t )>> } WHERE { <urn:a> <urn:p> ?t }",
+            "INSERT { <urn:a> <urn:p> << <urn:s> <urn:p> ?t >> } WHERE { <urn:a> <urn:p> ?t }",
+            "INSERT { <urn:s> <urn:p> ?t {| <urn:q> <urn:r> |} } WHERE { <urn:a> <urn:p> ?t }",
+            "INSERT { <urn:s> <urn:p> ?t ~ <urn:r> } WHERE { <urn:a> <urn:p> ?t }",
+            "INSERT { <urn:a> <urn:p> ?n } WHERE { <urn:a> <urn:p> ?t \
+             BIND(tRiPlE(<urn:s>, <urn:p>, ?t) AS ?n) }",
+            "INSERT { <urn:a> <urn:p> ?n } WHERE { <urn:a> <urn:p> ?t \
+             BIND(\\u0054RIPLE(<urn:s>, <urn:p>, ?t) AS ?n) }",
+        ] {
+            assert!(may_construct_triple_term(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn plain_updates_are_not_gated_in() {
+        for text in [
+            "INSERT DATA { <urn:s> <urn:p> \"o\" }",
+            "DELETE WHERE { ?s ?p ?o }",
+            "CLEAR ALL",
+            "INSERT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o FILTER(?o < 3) }",
+        ] {
+            assert!(!may_construct_triple_term(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_argument_and_the_bound() {
+        let err = grown_too_deep("content").to_string();
+        assert!(
+            err.starts_with("invalid argument `content`") && err.contains("MAX_RDF_NESTING"),
+            "{err}"
+        );
+    }
+
+    /// The stored-term check at and past the bound. Only where RDF 1.2 is on (this crate's
+    /// `rdf-12` gate implies it), since nothing else can hold a triple term.
+    #[cfg(feature = "rdf-12")]
+    #[test]
+    fn a_stored_term_is_measured_at_and_past_the_bound() {
+        use oxigraph::model::{Literal, NamedNode, Term, Triple};
+        // Built, not parsed: oxrdf's term parser refuses deep nesting itself.
+        let wrap = |bottom: Term, n: usize| {
+            let (s, p) = (
+                NamedNode::new("urn:s").unwrap(),
+                NamedNode::new("urn:p").unwrap(),
+            );
+            (0..n).fold(bottom, |t, _| Triple::new(s.clone(), p.clone(), t).into())
+        };
+        let term = |n: usize| wrap(NamedNode::new("urn:o").unwrap().into(), n);
+        assert!(!nests_deeper_than_the_bound(term(1).as_ref()));
+        assert!(!nests_deeper_than_the_bound(term(MAX_RDF_NESTING).as_ref()));
+        assert!(nests_deeper_than_the_bound(
+            term(MAX_RDF_NESTING + 1).as_ref()
+        ));
+        // A literal inside the term, carrying the opening text, is text.
+        let quoted = wrap(Literal::new_simple_literal("<<( ".repeat(100)).into(), 3);
+        assert!(!nests_deeper_than_the_bound(quoted.as_ref()));
     }
 }
