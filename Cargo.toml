@@ -265,7 +265,12 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # commit, nothing applied. Reproduced on the 0.2.18 tree before it (rdf-12, debug): 56 levels a request by `TRIPLE(…)`
 # (6 by template) grew a term until the writer thread aborted the process at ~11,800 levels. Still a patch: additive
 # (one public fn, `depth::nests_deeper_than_the_bound`), and the only new refusal is of a write that would abort later.
-version = "0.2.18"
+# ★ 0.2.19 reads `<<(` as ONE token (ledger #1354): through 0.2.18 the SPARQL text scan read its `(` as an expression's,
+# every level of a `<<( … )>>` template kept one more less-than reading alive, and a template 7 deep was refused as
+# MAX_SCAN_BRANCHES. Triple terms now count against `depth::MAX_RDF_NESTING` apart from the brackets
+# (`MAX_SPARQL_NESTING`), so a template nests to 64 and the refusal past it names that bound. A patch: no signature
+# changed; `check_sparql` admits more triple-term text than before, and no text it admitted that parses is refused now.
+version = "0.2.19"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
