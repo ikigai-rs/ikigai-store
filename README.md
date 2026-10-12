@@ -776,7 +776,8 @@ both readings and refuses on the deeper (`src/limits.rs` has the argument).
   so a per-host knob would only be a way to turn the protection off; a host that needs a
   tighter limit can refuse earlier at its own door with `ikigai_store::limits::check_sparql`,
   which is public for that, and must parse on `limits::on_sparql_stack` if it parses
-  SPARQL itself.
+  SPARQL itself (or on `budget::EvaluationBudget::run`, which sizes the same stack AND bounds
+  the time: next section).
 
 `tests/sparql_nesting.rs` reproduces the abort in a child process on a 2 MiB thread at all
 ten doors (it fails, with the child killed by `SIGABRT`, against 0.2.6);
@@ -962,6 +963,53 @@ budget grant is never REQUIRED, so it appears in no endpoint's declared `require
 - **Memory is not budgeted here** — the answer's SIZE is, in the next section (0.2.9).
 - **On wasm there are no threads**, so an evaluation runs inline: only the algebra bounds
   apply.
+
+### A consumer's OWN evaluations: `EvaluationBudget` (0.2.18, ledger #1327)
+
+A crate that builds its own oxigraph evaluation over a dataset of its own (intray's `rd
+match=`, which asks a caller's ASK of every pending tuple's graph; any crate following
+`ikigai_store::service`) got the stack bound from `limits` and nothing about time. The
+ikigai-layers audit measured what that costs: a cross join of k unconstrained triple patterns
+under one FILTER over all their variables, asked of a 7-triple tuple, grows about 7.5x a
+pattern, so a ~300-byte template holds a thread for minutes, once per pending tuple
+(`tests/match_time_budget.rs` reproduces it: k=4, 5, 6 take 12 ms, 98 ms, 836 ms in a debug
+build, and k=10 extrapolates past an hour). The store's own doors already refused it at their
+budget; a consumer's evaluation did not.
+
+`budget::EvaluationBudget` hands the doors' machinery out:
+
+```rust
+use ikigai_store::budget::{check_query, EvaluationBudget, TimeBudget};
+
+// ONCE, when the host builds the space, and cloned into it: the clones share the overdue
+// count, which is what caps the cores. One made per request caps nothing.
+let budget = EvaluationBudget::new(TimeBudget::new(Duration::from_secs(2)));
+
+// Per request: the caller's capability chooses the budget as the doors choose it (a
+// `urn:cap:store:budget:<ms>` grant raises it, root gets the ceiling) and `requested` (the
+// consumer's own `budget=`, if it has one) can only lower it.
+let matched = budget.run(&text.clone(), inv.capability, None, move |token| {
+    let query = spargebra::SparqlParser::new().parse_query(&text)/* … */;
+    check_query(&query, "match")?;               // the algebra bounds still apply
+    for tuple in pending {                        // a loop of your own checks the token
+        if token.is_cancelled() { break; }
+        // evaluator().with_cancellation_token(token.clone()).for_query(query.clone())…
+    }
+    Ok(ids)
+})?;
+```
+
+- **The caller is answered at the budget** with `Error::Timeout` naming it, on a thread sized as
+  `limits::on_sparql_stack` sizes one, so `run` replaces that call.
+- **The token is not a deadline.** oxigraph checks it only where it touches the dataset, and a
+  cross product spends its time over rows already in memory: cancelled at 50 ms, the k=7
+  template returned ~0.9 s later, and k=8 6.3 s after a 200 ms token (debug). So the worker
+  runs on after its caller is answered, holding a core; it is COUNTED
+  (`EvaluationBudget::overdue_evaluations`), and while `TimeBudget::max_overdue` are overdue,
+  `run` refuses at once with a transient `Error::Unavailable`. That is the price of the
+  deadline without a hook inside oxigraph's loops: a burst of such templates can make SPARQL
+  (only SPARQL, only through that budget) unavailable until one finishes, rather than let each
+  pin another core.
 
 ## ★ Every answer has a size bound, and past it is refused (ledger #970)
 

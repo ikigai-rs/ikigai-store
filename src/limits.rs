@@ -48,7 +48,9 @@
 //! are slow well before they are deep. This module is about the stack — an abort takes
 //! down every request at once. Time is [`crate::budget`]'s (ledger #964): this crate's doors
 //! run every evaluation within one, on a thread sized exactly as [`on_sparql_stack`] sizes
-//! it.
+//! it. ★ A consumer evaluating SPARQL over a dataset of its OWN runs it through
+//! [`crate::budget::EvaluationBudget::run`] instead of [`on_sparql_stack`]: the same stack, and
+//! a time budget (ledger #1327).
 //!
 //! # The scan is exact about what it skips, and that took an automaton
 //!
