@@ -33,8 +33,10 @@ const BOUND: usize = 64;
 /// Levels one request adds: inside the text nesting bound (`BIND(` and the braces around it
 /// take the rest of `MAX_SPARQL_NESTING`), and the number linkeddata measured with.
 const PER_REQUEST: usize = 56;
-/// Levels one `<<( … )>>` template request adds: the most the text scan admits, since each
-/// level keeps one more reading of `<` open (`MAX_SCAN_BRANCHES` refuses 7).
+/// Levels one `<<( … )>>` template request adds in the growth probe: the six that 0.2.18's text
+/// scan admitted (it refused 7 as too ambiguous to bound, `MAX_SCAN_BRANCHES`, ledger #1354),
+/// kept so the probe still grows over many requests. One request may now nest a template to
+/// the bound itself (`a_template_nests_to_the_bound_in_one_request_and_no_further`).
 const TEMPLATE_PER_REQUEST: usize = 6;
 
 /// `TRIPLE(<urn:s>, <urn:p>, … ?t …)`, `n` deep.
@@ -65,8 +67,7 @@ fn grow(door: &str, n: usize) -> String {
 }
 
 /// The same growth with the `<<( … )>>` template instead of `TRIPLE(…)`: the update's INSERT
-/// builds the term, not its WHERE. Prefixed names inside the parentheses, so that only the
-/// `<<(`s keep the text scan's readings of `<` open.
+/// builds the term, not its WHERE.
 fn grow_by_template(door: &str, n: usize) -> String {
     let term = format!("{}?t{}", "<<( ex:s ex:p ".repeat(n), " )>>".repeat(n));
     match door {
@@ -244,6 +245,52 @@ fn a_triple_term_grown_across_updates_is_refused_past_the_bound_and_aborts_nothi
 }
 
 // ------------------------------------------------------------------ at and over the bound
+
+/// Ledger #1354: through 0.2.18 a `<<( … )>>` template 7 deep was refused by the text scan as
+/// too ambiguous to bound (`MAX_SCAN_BRANCHES`), with a message about less-thans, far below the
+/// depth a load allows. Now one request nests a template to `MAX_RDF_NESTING` and commits; one
+/// level more is refused naming that bound, by the text scan when the template alone is too
+/// deep, and by the check before commit when it wraps a stored term past it. Either way
+/// nothing of it is applied.
+#[cfg(feature = "rdf-12")]
+#[test]
+fn a_template_nests_to_the_bound_in_one_request_and_no_further() {
+    for door in ["update", "graph-update"] {
+        let k = kernel();
+        update(&k, door, &seed(door)).unwrap();
+        // The reproduction: 7 levels, refused as MAX_SCAN_BRANCHES through 0.2.18.
+        update(&k, door, &grow_by_template(door, 7)).unwrap_or_else(|e| panic!("{door}: {e}"));
+        assert_eq!(depth(&k), 7, "{door}");
+        let k = kernel();
+        update(&k, door, &seed(door)).unwrap();
+        let err = update(&k, door, &grow_by_template(door, BOUND + 1))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("invalid argument `content`")
+                && err.contains("MAX_RDF_NESTING")
+                && !err.contains("MAX_SCAN_BRANCHES"),
+            "{door}: {err}"
+        );
+        assert_eq!(depth(&k), 0, "{door}: the refused update changed the store");
+        update(&k, door, &grow_by_template(door, BOUND)).unwrap_or_else(|e| panic!("{door}: {e}"));
+        assert_eq!(depth(&k), BOUND, "{door}");
+        // Wrapping the stored term in a whole template's worth: 128 levels built, then refused
+        // before commit, and the store keeps what it had.
+        let err = update(&k, door, &grow_by_template(door, BOUND))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("invalid argument `content`") && err.contains("MAX_RDF_NESTING"),
+            "{door}: {err}"
+        );
+        assert_eq!(
+            depth(&k),
+            BOUND,
+            "{door}: the refused update changed the store"
+        );
+    }
+}
 
 /// An update that leaves the term exactly at the bound commits; one level more is refused,
 /// and nothing of it is applied, its `DELETE` half included.

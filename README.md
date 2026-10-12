@@ -734,7 +734,8 @@ Two layers now stand in front of the parser, at all ten doors:
 | bound | value | what it stops |
 | --- | --- | --- |
 | `limits::MAX_SPARQL_BYTES` | 1 MiB | any query or update larger, refused before parsing |
-| `limits::MAX_SPARQL_NESTING` | 64 | brackets `(` `{` `[` `<<`, and runs of `!`, nested deeper — refused before parsing |
+| `limits::MAX_SPARQL_NESTING` | 64 | brackets `(` `{` `[`, and runs of `!`, nested deeper — refused before parsing |
+| `depth::MAX_RDF_NESTING` | 64 | RDF 1.2 triple terms `<<( … )>>` and `<< … >>` nested deeper — counted apart from the brackets (0.2.19, ledger #1354), refused before parsing |
 | the SPARQL thread | 16 MiB + 512 bytes per byte of text (a debug build: + 64 MiB, and 2 KiB a byte) | everything else that recurses, run on a stack sized for it |
 
 **The bounds refuse, never truncate**: the refusal is an `InvalidArgument` on `query` (or
@@ -755,7 +756,14 @@ bytes of stack per byte, a property path).
 comments is wrong in a way an attacker can use: in an expression, `?a<'> ) '` is a
 less-than followed by a string, and a scan that skipped `<'>` as an IRI never sees the
 string open. So at each `<` where a less-than is grammatically possible, the scan follows
-both readings and refuses on the deeper (`src/limits.rs` has the argument).
+both readings and refuses on the deeper (`src/limits.rs` has the argument). `<<(` and `)>>`
+are single tokens, and the scan reads them so: through 0.2.18 it read `<<(`'s `(` as an
+expression's, every level of a triple-term template kept one more reading alive, and a template
+**7 deep** was refused as too ambiguous to bound (`MAX_SCAN_BRANCHES`), with a message about
+less-thans (ledger #1354). Since 0.2.19 a template nests to `MAX_RDF_NESTING`, the depth a load
+allows, and the refusal past it names that bound. A text at both bounds at once (64 function
+calls around 64 triple terms) recurses 128 levels, which the SPARQL thread holds with room to
+spare in either build (`tests/sparql_stack_measure.rs`).
 
 ⚠ What this does **not** do, plainly:
 
@@ -862,10 +870,11 @@ fails, with the child killed by `SIGABRT`, against 0.2.9 with `--features rdf-12
 
 ### ★ An update cannot grow a stored triple term past the bound (ledger #1333)
 
-`INSERT DATA` text is bounded by `MAX_SPARQL_NESTING` (`<<` counts), but an update can wrap a
-STORED term and store the result: `DELETE { <a> <p> ?t } INSERT { <a> <p> ?n } WHERE { <a> <p>
-?t BIND(TRIPLE(<s>, <p>, …56 levels… ?t) AS ?n) }` adds 56 levels a request (a `<<( … )>>`
-template adds 6, the most the text scan admits), and every request is inside every text bound.
+`INSERT DATA` text is bounded by the text scan (triple terms against `MAX_RDF_NESTING`), but an
+update can wrap a STORED term and store the result: `DELETE { <a> <p> ?t } INSERT { <a> <p> ?n }
+WHERE { <a> <p> ?t BIND(TRIPLE(<s>, <p>, …56 levels… ?t) AS ?n) }` adds 56 levels a request (a
+`<<( … )>>` template adds up to 64 since 0.2.19, and added 6 before it), and every request is
+inside every text bound.
 oxigraph encodes, decodes and serializes a stored triple term recursively, so before 0.2.18 the
 term grew until a request touching it aborted the host (in a debug build, at about 11,800
 levels on the store's writer thread), through `urn:iki:store:update` and `urn:iki:store:graph-update`

@@ -86,8 +86,9 @@
 //! # SPARQL text is bounded before it is parsed
 //!
 //! oxigraph's parser and evaluator recurse, and a stack overflow aborts the whole process,
-//! so every door that parses caller text refuses one over [`limits::MAX_SPARQL_BYTES`] or
-//! nested deeper than [`limits::MAX_SPARQL_NESTING`], and parses and evaluates the rest on a
+//! so every door that parses caller text refuses one over [`limits::MAX_SPARQL_BYTES`],
+//! nested deeper than [`limits::MAX_SPARQL_NESTING`], or nesting triple terms deeper than
+//! [`depth::MAX_RDF_NESTING`], and parses and evaluates the rest on a
 //! thread whose stack is sized for it. [`limits`] has the measurements and the one subtle
 //! part — a `<` can be an IRI or a less-than, and the scan follows both (ledger #915).
 //!
