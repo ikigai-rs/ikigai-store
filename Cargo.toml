@@ -254,7 +254,13 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # nested write across two of them deadlocked in memory. A patch: no signature changed, `over` stays infallible, and a
 # single `over` per handle behaves as before. It STACKS on 0.2.16, which was merged and never published: this release
 # carries both.
-version = "0.2.17"
+# ★ 0.2.18 hands the store's time budget to a CONSUMER (ledger #1327): `budget::EvaluationBudget` runs SPARQL a crate
+# evaluates over a dataset of its own (intray's `rd match=`) on a sized thread, answers its caller with a typed
+# `Timeout` at the budget, hands the work oxigraph's cancellation token, and counts and caps the workers that run on
+# past it. Reproduced on 0.2.17 through `service::evaluator()`: a ~300-byte cross-join ASK over a 7-triple tuple ran
+# to the end unrefused, ~8x longer per pattern. A patch: purely additive. It STACKS on 0.2.16 and 0.2.17, both merged
+# and never published: this release carries all three.
+version = "0.2.18"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
