@@ -31,7 +31,9 @@
 //!
 //! So a consumer evaluating caller-supplied SPARQL wants **all three**: [`evaluator`] for the
 //! guarantee, [`refuse_service`] (or the update form) for a typed answer, and for an update,
-//! [`refuse_load`], because nothing else stops `LOAD`. `FROM` / `FROM NAMED` / `GRAPH <iri>`
+//! [`refuse_load`], because nothing else stops `LOAD`. ★ None of them bounds TIME: run the
+//! evaluation through [`crate::budget::EvaluationBudget::run`] and hand its token to
+//! `with_cancellation_token` (ledger #1327). `FROM` / `FROM NAMED` / `GRAPH <iri>`
 //! need nothing: oxigraph reads them as names of graphs in the store and never fetches them.
 //!
 //! The door checks are separate from the evaluator because a `SERVICE SILENT` swallows the

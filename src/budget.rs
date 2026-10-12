@@ -67,6 +67,11 @@
 //!
 //! The real fix for this layer is upstream: `spareval` checking its token in those loops.
 //!
+//! **A consumer's own evaluations get all three through [`EvaluationBudget`]** (ledger #1327):
+//! intray's `rd match=` asks a caller's ASK of a dataset of its own, never through a door, and
+//! until 0.2.18 got the stack bound and nothing about time. Layer 1 is [`check_query`], which
+//! the consumer calls itself.
+//!
 //! # Who sets the budget
 //!
 //! **The host, and a caller can only tighten it.** A store has a [`TimeBudget`] (set with
@@ -334,6 +339,139 @@ impl TimeBudget {
             .map(Duration::from_millis)
             .unwrap_or_default();
         granted.max(self.base).min(self.ceiling)
+    }
+}
+
+/// The time budget for SPARQL a CONSUMER evaluates itself, over a dataset of its own rather
+/// than through this store's doors (ledger #1327).
+///
+/// A crate that builds its own oxigraph evaluation (intray's `rd match=`, which asks a
+/// caller's ASK of every pending tuple's graph; any crate following [`crate::service`]) gets
+/// the stack bound from [`crate::limits`] and nothing about time. The store's doors already run
+/// every evaluation within a [`TimeBudget`]; this hands the same machinery out, so a consumer
+/// gets the same three promises with no copy of it:
+///
+/// - **The caller is answered at the budget** with a typed [`Error::Timeout`] naming it, never
+///   later and never with a partial answer. `work` runs on a thread of its own, sized for
+///   `text` as [`crate::limits::on_sparql_stack`] sizes one, so `run` REPLACES that call.
+/// - **The evaluation is told to stop**: `work` gets the oxigraph [`CancellationToken`] to hand
+///   `with_cancellation_token`, and a loop of the consumer's own (one evaluation per tuple)
+///   checks `is_cancelled()` between steps.
+/// - **What still cannot be stopped is counted and capped.** oxigraph checks the token only
+///   where it touches the dataset, so a cross product over rows already in memory runs on past
+///   it: measured here, an ASK of 8 unconstrained patterns over a 7-triple graph, cancelled
+///   at 200 ms, returned 6.3 s later (debug build; `tests/match_time_budget.rs`). There is no
+///   way to stop a Rust thread from outside it, so such an evaluation goes on holding a core
+///   after its caller was answered. While [`TimeBudget::max_overdue`] are overdue, `run`
+///   refuses at once with a transient [`Error::Unavailable`] rather than start another.
+///
+/// ★ **Make ONE per host (or per space) and clone it**: the clones share the overdue count,
+/// which is what caps the cores. One made per request caps nothing.
+///
+/// The budget a request gets is chosen as the store's doors choose it: the
+/// [`TimeBudget`]'s base, raised by a `urn:cap:store:budget:<ms>` grant ([`cap_budget`]) the
+/// caller's capability holds, the ceiling for root, and lowered (never raised) by a
+/// `requested` milliseconds, which a consumer reads from its own `budget=` argument if it has
+/// one ([`effective_budget`]).
+///
+/// ```
+/// use ikigai_core::{Capability, Error};
+/// use ikigai_store::budget::{check_query, EvaluationBudget, TimeBudget};
+/// use ikigai_store::service::{evaluator, refuse_service};
+/// use oxigraph::io::RdfFormat;
+/// use oxigraph::sparql::QueryResults;
+/// use oxigraph::store::Store;
+/// use std::time::Duration;
+///
+/// // Once, when the host builds the space; every request shares it.
+/// let budget = EvaluationBudget::new(TimeBudget::new(Duration::from_millis(500)));
+///
+/// let template = "ASK { ?s <urn:p> \"v\" }".to_string();
+/// let tuple = b"<urn:s> <urn:p> \"v\" .".to_vec();
+/// let caller = Capability::scoped(["urn:cap:space:read"]);
+/// let endpoint = |e: &dyn std::fmt::Display| Error::Endpoint(format!("match: {e}"));
+/// let matched = budget.run(&template.clone(), &caller, None, move |token| {
+///     // Everything that touches the text happens in here: the parse recurses too.
+///     let query = spargebra::SparqlParser::new().parse_query(&template).map_err(|e| {
+///         Error::InvalidArgument { name: "match".into(), detail: e.to_string() }
+///     })?;
+///     check_query(&query, "match")?;
+///     refuse_service(&query, "match")?;
+///     let store = Store::new().map_err(|e| endpoint(&e))?;
+///     store.load_from_slice(RdfFormat::Turtle, &tuple[..]).map_err(|e| endpoint(&e))?;
+///     match evaluator()
+///         .with_cancellation_token(token.clone())
+///         .for_query(query)
+///         .on_store(&store)
+///         .execute()
+///         .map_err(|e| endpoint(&e))?
+///     {
+///         QueryResults::Boolean(b) => Ok(b),
+///         _ => Ok(false),
+///     }
+/// })?;
+/// assert!(matched);
+/// assert_eq!(budget.overdue_evaluations(), 0);
+/// # Ok::<_, Error>(())
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct EvaluationBudget {
+    budget: TimeBudget,
+    overdue: Arc<AtomicUsize>,
+}
+
+impl EvaluationBudget {
+    /// Evaluations within `budget`. [`EvaluationBudget::default`] is [`TimeBudget::default`]:
+    /// the store's own 5 s base and 120 s ceiling.
+    pub fn new(budget: TimeBudget) -> Self {
+        EvaluationBudget {
+            budget,
+            overdue: Arc::default(),
+        }
+    }
+
+    /// The time budget these evaluations run under.
+    pub fn time_budget(&self) -> TimeBudget {
+        self.budget
+    }
+
+    /// How many evaluations run through this (or a clone of it) are still running after their
+    /// callers were answered with a timeout, right now. See [`EvaluationBudget`].
+    pub fn overdue_evaluations(&self) -> usize {
+        self.overdue.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Run `work`, the evaluation of the SPARQL `text`, for a caller holding `capability`,
+    /// within the budget that capability gets, or `requested` milliseconds when that is
+    /// smaller (a `requested` that is not a positive whole number is refused on `budget`).
+    ///
+    /// `text` sizes the thread's stack and nothing else: parse it inside `work`. `work` must
+    /// own what it uses (`'static`), because its thread may outlive this call.
+    ///
+    /// Refused with [`Error::Timeout`] naming the budget when it runs past it, and with
+    /// [`Error::Unavailable`] at once while [`TimeBudget::max_overdue`] are overdue. On wasm
+    /// there are no threads and `work` runs inline, unbounded in time.
+    pub fn run<T, F>(
+        &self,
+        text: &str,
+        capability: &Capability,
+        requested: Option<&str>,
+        work: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&CancellationToken) -> Result<T> + Send + 'static,
+    {
+        let budget = effective_budget(requested, self.budget.for_capability(capability))?;
+        run(
+            text,
+            false,
+            budget,
+            &self.overdue,
+            self.budget.max_overdue(),
+            None,
+            move |deadline| work(&deadline.token),
+        )
     }
 }
 

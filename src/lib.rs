@@ -282,7 +282,7 @@ pub mod service;
 pub mod sparql;
 pub mod store;
 
-pub use budget::{AnswerBudget, TimeBudget};
+pub use budget::{AnswerBudget, EvaluationBudget, TimeBudget};
 pub use config::StoreConfig;
 pub use endpoints::{
     cap_read_graph, cap_write_graph, space, CAP_READ, CAP_READ_ANY, CAP_READ_GRAPH, CAP_WRITE,
