@@ -1106,13 +1106,25 @@ let writer = SharedWriter::over(Arc::clone(&store), SharerWrites::only_the_defau
 
 | | `DurableStore::shared_writer()` | `SharedWriter::over(store, writes)` |
 | --- | --- | --- |
-| writer thread | the store's own, shared with its doors | its own, started on the first write |
-| write lock | the store's own: ordered with every door | its own: ordered with its clones only |
-| declaration | the store's (`open_shared_declaring`), or none (`open_shared`) | `writes`, always |
+| writer thread | the store's own, shared with its doors | on a handle a `DurableStore` gave out, the store's own; on a store the host opened, the handle's own, started by the first `over` and shared by every later one |
+| write lock | the store's own: ordered with every door | the same split: ordered with every door, or with every `over` writer on that handle |
+| declaration | the store's (`open_shared_declaring`), or none (`open_shared`) | `writes`, narrowed to the store's declaration, or to the first `over`'s on a store the host opened |
 
-⚠ Never call `over` on a handle a `DurableStore` gave out: it would start a second thread and
-a second lock beside the store's, and a scoped write through a door could lose an update made
-through it. And make one `over` writer per store and clone it; each `over` is a thread.
+Every `over` on one handle shares one writer (0.2.16 for a handle a `DurableStore` gave out,
+ledger #1276; 0.2.17 for a store the host opened itself, ledger #1324). Before that, two
+writers on one RocksDB dataset each had a thread and a lock, and a read-modify-write through
+one could lose half of a record rewritten through the other (`tests/provenance.rs`: a
+15-quad record left as 1 quad).
+
+- A later `over` is **narrowed** to the declaration it joins: a graph the first `over` (or the
+  store) did not declare is refused through it. Make the widest writer first: the host's,
+  before it hands the handle to a module. A module can then take
+  `SharedWriter::over(Arc::clone(writer.store()), <its graph>)` and be both ordered with the
+  host's writes and fenced to its own graph.
+- Once every writer on a handle is dropped, the next `over` starts a fresh writer, and its
+  declaration is the new ceiling.
+- ⚠ The record is of the `Arc`, not the dataset: `Arc::new(store.clone())` is a handle nobody
+  recorded, and `over` on it makes a second writer. Pass the handle on as it came.
 
 ## Configuration
 
