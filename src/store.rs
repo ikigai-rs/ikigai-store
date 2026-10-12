@@ -856,9 +856,9 @@ impl DurableStore {
 /// | | [`DurableStore::shared_writer`] | [`SharedWriter::over`] |
 /// | --- | --- | --- |
 /// | for a host holding | a `DurableStore` opened shared | an `Arc<Store>`: a handle a shared constructor gave out, or a store it opened itself |
-/// | writer thread | **the store's own**, shared with its update, graph-update and load doors | the store's own on a handle a `DurableStore` gave out; otherwise **its own**, started on the first write |
-/// | write lock | the store's own, so a write is ordered with every door | the same split: the store's own, or its own, ordering only writes through this writer and its clones |
-/// | declaration | the store's: a [`SharerWrites`] from `open_shared_declaring`, none from `open_shared` | the [`SharerWrites`] passed in, narrowed to the store's own declaration when it joined a store that made one |
+/// | writer thread | **the store's own**, shared with its update, graph-update and load doors | the store's own on a handle a `DurableStore` gave out; on a store the host opened itself, **the handle's own**, started by the first `over` on it and shared by every later one |
+/// | write lock | the store's own, so a write is ordered with every door | the same split: the store's own, or the handle's own, ordering every `over` writer on that handle |
+/// | declaration | the store's: a [`SharerWrites`] from `open_shared_declaring`, none from `open_shared` | the [`SharerWrites`] passed in, narrowed to the store's own declaration when it joined a store that made one, or to the first `over`'s on a store the host opened |
 ///
 /// ★ **`over` on a handle a `DurableStore` gave out joins that store's writer** (ledger
 /// #1276). Until 0.2.16 it started a second writer thread and a second lock beside the
@@ -870,10 +870,20 @@ impl DurableStore {
 /// handed only the raw handle can therefore take `over` with its own narrow declaration and
 /// be both ordered with the store and fenced to its own graphs.
 ///
-/// ⚠ The record is of the `Arc` the constructor returned (and its clones), not of the
-/// dataset: a `Store` cloned and re-wrapped in a new `Arc` is not recognized, and `over` on it
-/// makes a second writer again. Pass the handle on as it came. And on a store a host opened
-/// itself, make ONE `over` writer and clone it: each `over` there is a thread of its own.
+/// ★ **And every `over` on one handle a host opened itself shares one writer** (ledger
+/// #1324). Until 0.2.17 each `over` there was a thread and a lock of its own, so a host's
+/// writer and a module's writer made with `over` on one handle could lose half of a record
+/// exactly as above (`ikigai-browse`'s race test; on RocksDB, 1 quad of 15). The first `over`
+/// on a handle now records it, and a later one joins that writer, narrowed to the first one's
+/// declaration as a joined writer is narrowed to a store's: a later `over` declaring a graph
+/// the first did not has that graph **refused**, so make the widest writer first (the host's,
+/// before it hands the handle to a module). Once every writer on the handle is dropped, the
+/// next `over` starts a fresh writer and its declaration is the new ceiling.
+///
+/// ⚠ The record is of the `Arc` (the one the constructor returned, or the one `over` was
+/// first given) and its clones, not of the dataset: a `Store` cloned and re-wrapped in a new
+/// `Arc` is not recognized, and `over` on it makes a second writer again. Pass the handle on as
+/// it came.
 ///
 /// # ★ Why the thread matters: the RocksDB seed trap (ledger #1127)
 ///
@@ -888,8 +898,8 @@ impl DurableStore {
 /// one thread. This crate's own doors commit on one writer thread (the load door since
 /// 0.2.15); a writer from [`DurableStore::shared_writer`], or from [`over`](Self::over) on the
 /// handle a shared constructor gave out, commits on that SAME thread, so every write to the
-/// dataset advances one generator, and an `over` writer on a store the host opened itself on
-/// a thread of its own, which lives as long as the writer does.
+/// dataset advances one generator, and the `over` writers on a store the host opened itself on
+/// one thread of the handle's own, which lives as long as one of them does.
 ///
 /// # ★ Declared = enforced (ledger #1209)
 ///
@@ -924,7 +934,9 @@ impl DurableStore {
 ///   constructor gave out: it takes the store's write lock, as every write door
 ///   does, and runs in the same queue as `urn:iki:store:update`, `urn:iki:store:graph-update`
 ///   and `urn:iki:store:load`. A scoped write can no longer lose an update made through this
-///   type; one made through the raw handle directly still can.
+///   type; one made through the raw handle directly still can. From `over` on a store the
+///   host opened itself, it is ordered the same way with every other `over` writer on that
+///   handle.
 /// - **It waits, with no deadline.** The caller blocks until the transaction commits or
 ///   fails, including any time spent behind a store update that is still running.
 /// - **A panic in the closure is the caller's**: caught on the writer thread, which lives
@@ -1023,9 +1035,15 @@ impl SharedWriter {
     ///   lives, it **joins the store's writer**: its thread and its write lock, so every write
     ///   is ordered with the store's doors, and it writes only graphs that both `writes` and
     ///   the store's own declaration permit (ledger #1276).
-    /// - On any other handle, a store the host opened itself, it has its own long-lived writer
-    ///   thread and its own write lock. Nothing starts until the first write, and the thread
-    ///   ends when the last clone is dropped. Make one per store and clone it.
+    /// - On any other handle, a store the host opened itself, the first `over` starts the
+    ///   handle's writer: a long-lived thread and a write lock, recorded as the handle's.
+    ///   Nothing starts until the first write, and the thread ends when the last writer on the
+    ///   handle is dropped. **Every later `over` on the same `Arc` joins it** (ledger #1324),
+    ///   writing only graphs that both `writes` and the first `over`'s declaration permit: a
+    ///   graph the first did not declare is refused, so make the widest writer first. Once
+    ///   every writer on the handle is gone, the next `over` starts afresh.
+    ///
+    /// It is infallible either way: a join never fails, it narrows.
     ///
     /// See the type docs for how it differs from [`DurableStore::shared_writer`].
     ///
@@ -1044,25 +1062,28 @@ impl SharedWriter {
     /// let notes = GraphNameRef::NamedNode(NamedNodeRef::new_unchecked("urn:example:notes"));
     /// writer.write_declared(move |txn| txn.insert(QuadRef::new(note, note, note, notes)))?;
     /// assert_eq!(store.len()?, 1);
+    ///
+    /// // A module handed the same handle joins that writer, held to what the first declared.
+    /// let module = SharedWriter::over(
+    ///     Arc::clone(&store),
+    ///     SharerWrites::only_the_default_graph()
+    ///         .and_named_graph("urn:example:notes")
+    ///         .and_named_graph("urn:example:elsewhere"),
+    /// );
+    /// let declared = module.declared().unwrap().named_graphs().collect::<Vec<_>>();
+    /// assert_eq!(declared, ["urn:example:notes"]);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn over(store: Arc<Store>, writes: SharerWrites) -> SharedWriter {
-        match given_out::of(&store) {
-            Some(joined) => SharedWriter {
-                store,
-                writes: joined.writes,
-                writer: joined.writer,
-                declared: Some(Arc::new(match &joined.declared {
-                    Some(ceiling) => writes.within(ceiling),
-                    None => writes,
-                })),
-            },
-            None => SharedWriter {
-                store,
-                writes: Arc::new(Mutex::new(())),
-                writer: Arc::default(),
-                declared: Some(Arc::new(writes)),
-            },
+        let joined = given_out::join_or_start(&store, &writes);
+        SharedWriter {
+            store,
+            writes: joined.writes,
+            writer: joined.writer,
+            declared: Some(Arc::new(match &joined.declared {
+                Some(ceiling) => writes.within(ceiling),
+                None => writes,
+            })),
         }
     }
 
@@ -1172,9 +1193,10 @@ impl SharedWriter {
     }
 }
 
-/// The handles the shared constructors gave out, and the writer each belongs to: the
-/// provenance a bare `Arc<Store>` cannot carry itself, since `Store` is oxigraph's type
-/// (ledger #1276). Read by [`SharedWriter::over`] alone.
+/// The handles the shared constructors gave out, and the handles [`SharedWriter::over`] was
+/// first called on, with the writer each belongs to: the provenance a bare `Arc<Store>` cannot
+/// carry itself, since `Store` is oxigraph's type (ledger #1276, #1324). Read by
+/// [`SharedWriter::over`] alone.
 ///
 /// ★ **Keyed on the `Arc`'s address, and that is sound only because each entry holds a
 /// `Weak` to it.** A `Weak` keeps the allocation (never the dataset: the `Store` inside is
@@ -1183,23 +1205,25 @@ impl SharedWriter {
 /// handle or its writer is gone, and only then can the address be reused.
 ///
 /// ⚠ It knows the `Arc`, not the dataset: a `Store` is itself a cheap clone of one dataset,
-/// and a clone re-wrapped in a new `Arc` is a handle no constructor recorded.
+/// and a clone re-wrapped in a new `Arc` is a handle nobody recorded.
 /// `tests/provenance.rs` pins that limit.
 mod given_out {
     use super::{SharerWrites, Store};
     use std::sync::{Arc, Mutex, Weak};
 
-    /// One handle a shared constructor returned.
+    /// One recorded handle: one a shared constructor returned, or one `over` was first
+    /// called on.
     pub(super) struct GivenOut {
         pub(super) handle: Weak<Store>,
         pub(super) writes: Weak<Mutex<()>>,
         pub(super) writer: Weak<crate::budget::Writer>,
-        /// The store's own declaration, or `None` when it declared nothing (`open_shared`).
+        /// The ceiling a joining `over` is narrowed to: the store's own declaration, or
+        /// `None` when it declared nothing (`open_shared`); for a handle `over` recorded, the
+        /// first `over`'s declaration.
         pub(super) declared: Option<SharerWrites>,
     }
 
-    /// The store writer a handle belongs to, while some `DurableStore` clone or
-    /// `SharedWriter` still holds it.
+    /// The writer a handle belongs to.
     pub(super) struct Joined {
         pub(super) writes: Arc<Mutex<()>>,
         pub(super) writer: Arc<crate::budget::Writer>,
@@ -1212,25 +1236,56 @@ mod given_out {
         entry.handle.strong_count() > 0 && entry.writer.strong_count() > 0
     }
 
+    fn given() -> std::sync::MutexGuard<'static, Vec<GivenOut>> {
+        GIVEN_OUT.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub(super) fn record(entry: GivenOut) {
-        let mut given = GIVEN_OUT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut given = given();
         given.retain(alive);
         given.push(entry);
     }
 
-    /// The writer `handle` belongs to, or `None` for a handle no shared constructor gave
-    /// out, or one whose store and every writer it gave out are gone.
-    pub(super) fn of(handle: &Arc<Store>) -> Option<Joined> {
-        let mut given = GIVEN_OUT.lock().unwrap_or_else(|e| e.into_inner());
+    /// The writer `handle` belongs to, while some `DurableStore` clone or `SharedWriter`
+    /// still holds it; otherwise a new writer, recorded as the handle's with `writes` as the
+    /// ceiling every later `over` on it is narrowed to (ledger #1324).
+    ///
+    /// The lookup and the record are one step under one lock, so two `over` calls racing on
+    /// a handle nobody recorded yet still end up on one writer.
+    pub(super) fn join_or_start(handle: &Arc<Store>, writes: &SharerWrites) -> Joined {
+        let mut given = given();
         given.retain(alive);
-        let entry = given
+        if let Some(at) = given
             .iter()
-            .find(|entry| std::ptr::eq(entry.handle.as_ptr(), Arc::as_ptr(handle)))?;
-        Some(Joined {
-            writes: entry.writes.upgrade()?,
-            writer: entry.writer.upgrade()?,
-            declared: entry.declared.clone(),
-        })
+            .position(|entry| std::ptr::eq(entry.handle.as_ptr(), Arc::as_ptr(handle)))
+        {
+            let entry = &given[at];
+            match (entry.writes.upgrade(), entry.writer.upgrade()) {
+                (Some(writes), Some(writer)) => {
+                    return Joined {
+                        writes,
+                        writer,
+                        declared: entry.declared.clone(),
+                    }
+                }
+                // The last writer went between the prune and here: nothing is left to join.
+                _ => {
+                    given.swap_remove(at);
+                }
+            }
+        }
+        let joined = Joined {
+            writes: Arc::new(Mutex::new(())),
+            writer: Arc::default(),
+            declared: Some(writes.clone()),
+        };
+        given.push(GivenOut {
+            handle: Arc::downgrade(handle),
+            writes: Arc::downgrade(&joined.writes),
+            writer: Arc::downgrade(&joined.writer),
+            declared: joined.declared.clone(),
+        });
+        joined
     }
 }
 

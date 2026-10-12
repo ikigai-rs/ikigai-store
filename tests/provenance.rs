@@ -14,6 +14,13 @@
 //! the store's writer (its thread, its lock) and enforces both declarations: the store's,
 //! which is the promise its cached reads rest on, and the caller's, which is the module's own
 //! fence. Neither can widen the other.
+//!
+//! The same for a store the host opened itself (ledger #1324): on 0.2.16 two `over` writers on
+//! one bare `Arc<Store>` were still two threads and two locks, and the race below lost the same
+//! record (1 quad of 15) between a host's writer and a module's. Five tests in the second half
+//! failed on 0.2.16 (two threads, eight threads when raced, a wider declaration let through, a
+//! nested write deadlocked, the lost update). Now the first `over` on a handle records it and
+//! every later one joins that writer, narrowed to the first one's declaration.
 
 use ikigai_store::{DurableStore, SharedWriter, SharerWrites, StorageError, Store};
 use oxigraph::model::{GraphNameRef, NamedNodeRef, Quad, QuadRef};
@@ -208,29 +215,158 @@ fn a_rewrapped_clone_of_the_handle_carries_no_provenance() {
     assert_ne!(commits_on(&theirs), commits_on(&ours));
 }
 
-/// ★ THE LOST UPDATE, on RocksDB, where it happens (on the in-memory backend every
-/// transaction holds a store-wide lock from start to commit, so it cannot). A read-modify-write
-/// is held open on the store's writer: it reads the default graph, waits, then removes what
-/// it read. A record is rewritten through an `over` writer in that window.
-///
-/// On 0.2.15 the rewrite committed inside the window (its own thread, its own lock) and the
-/// door's commit then removed the quads the rewrite had kept: 15 quads became 1, which
-/// neither serial order produces. Joined, the rewrite waits for the door and lands whole.
-#[cfg(feature = "persistent")]
-#[test]
-fn a_rewrite_through_over_cannot_land_inside_a_stores_read_modify_write() {
-    use std::sync::mpsc::{channel, RecvTimeoutError};
-    use std::time::Duration;
+// ------------------------------------------------- a handle the host opened itself (ledger #1324)
 
+/// ★ THE CLAIM of ledger #1324: two `over` writers on one `Arc<Store>` the host opened
+/// itself (no `DurableStore` anywhere) committed on two writer threads, under two locks. The
+/// first `over` on a handle now registers it, and every later `over` on the same `Arc` joins
+/// that writer.
+#[test]
+fn two_overs_on_a_handle_the_host_opened_share_one_writer() {
+    let handle = Arc::new(Store::new().unwrap());
+    let first = SharedWriter::over(Arc::clone(&handle), SharerWrites::only_the_default_graph());
+    let second = SharedWriter::over(Arc::clone(&handle), SharerWrites::only_the_default_graph());
+    assert_eq!(
+        commits_on(&first),
+        commits_on(&second),
+        "two `over` writers on one host-opened handle commit on two threads"
+    );
+}
+
+/// The same when the `over` calls race: registration is one step under the registry's lock,
+/// so threads asking at once all land on one writer, never one each.
+#[test]
+fn overs_asked_for_at_once_on_one_handle_share_one_writer() {
+    let handle = Arc::new(Store::new().unwrap());
+    let start = Arc::new(std::sync::Barrier::new(8));
+    let writers = (0..8)
+        .map(|_| {
+            let (handle, start) = (Arc::clone(&handle), Arc::clone(&start));
+            std::thread::spawn(move || {
+                start.wait();
+                SharedWriter::over(handle, SharerWrites::only_the_default_graph())
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|t| t.join().unwrap())
+        .collect::<Vec<_>>();
+    let threads = writers
+        .iter()
+        .map(commits_on)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(threads.len(), 1, "{} writer threads", threads.len());
+}
+
+/// ★ The first `over` on a handle sets the ceiling, as a store's own declaration does for a
+/// handle it gave out: a later `over` declaring MORE than the first gets the extra graphs
+/// refused (the first writer's caller made no promise about them, and widening is the change
+/// that can be made later without breaking anyone); one declaring LESS keeps its own fence.
+#[test]
+fn a_later_over_on_a_host_opened_handle_is_narrowed_to_the_first() {
+    let handle = Arc::new(Store::new().unwrap());
+    let first = SharedWriter::over(
+        Arc::clone(&handle),
+        SharerWrites::only_the_default_graph().and_named_graph(DECLARED),
+    );
+    let wider = SharedWriter::over(
+        Arc::clone(&handle),
+        SharerWrites::only_the_default_graph()
+            .and_named_graph(DECLARED)
+            .and_named_graph(OTHER),
+    );
+    assert!(
+        refused(&wider, OTHER),
+        "a later `over` widened the first one's declaration"
+    );
+    assert!(!refused(&wider, DECLARED));
+    assert_eq!(
+        wider.declared().unwrap().named_graphs().collect::<Vec<_>>(),
+        vec![DECLARED],
+        "a joined writer reports the declaration it enforces"
+    );
+    let narrower = SharedWriter::over(Arc::clone(&handle), SharerWrites::only_the_default_graph());
+    assert!(refused(&narrower, DECLARED));
+    // The first writer's own declaration is untouched by either.
+    assert!(!refused(&first, DECLARED));
+    assert!(refused(&first, OTHER));
+}
+
+/// A handle whose `over` writers are all gone has nothing left to join: the next `over` gets a
+/// fresh writer, and its declaration is the new ceiling.
+#[test]
+fn a_host_opened_handle_whose_writers_are_gone_gets_a_fresh_writer() {
+    let handle = Arc::new(Store::new().unwrap());
+    let first = SharedWriter::over(Arc::clone(&handle), SharerWrites::only_the_default_graph());
+    let first_thread = commits_on(&first);
+    let clone = first.clone();
+    drop(first);
+    assert_eq!(commits_on(&clone), first_thread, "a clone keeps the writer");
+    drop(clone);
+
+    let fresh = SharedWriter::over(
+        Arc::clone(&handle),
+        SharerWrites::only_the_default_graph().and_named_graph(OTHER),
+    );
+    assert_ne!(commits_on(&fresh), first_thread);
+    assert!(
+        !refused(&fresh, OTHER),
+        "a fresh writer was held to a ceiling set by writers that are gone"
+    );
+}
+
+/// A write through one `over` writer from inside another's write on the same handle would wait
+/// for itself: refused. Before ledger #1324 it DEADLOCKED in memory, the shape PR 41 fixed for a
+/// handle a `DurableStore` gave out: the nested write ran on a second thread whose transaction
+/// waited for the store-wide lock the outer in-memory transaction held.
+#[test]
+fn a_nested_write_across_two_overs_on_one_handle_is_refused_not_deadlocked() {
+    let handle = Arc::new(Store::new().unwrap());
+    let outer = SharedWriter::over(Arc::clone(&handle), SharerWrites::only_the_default_graph());
+    let inner = SharedWriter::over(handle, SharerWrites::only_the_default_graph());
+    let (done, outcome) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(outer.write_declared(move |_| {
+            Ok::<_, StorageError>(
+                inner
+                    .write_declared(|_| Ok::<_, StorageError>(()))
+                    .err()
+                    .map(|e| e.to_string()),
+            )
+        }));
+    });
+    let nested = outcome
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("a nested write deadlocked")
+        .unwrap();
+    assert!(
+        nested
+            .as_deref()
+            .is_some_and(|e| e.contains("wait for itself")),
+        "{nested:?}"
+    );
+}
+
+/// A scratch directory for one RocksDB test, removed first.
+#[cfg(feature = "persistent")]
+fn scratch(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "ikigai-store-provenance-{}-{:?}",
+        "ikigai-store-provenance-{name}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
     let _ = std::fs::remove_dir_all(&path);
-    let (store, handle) = DurableStore::open_shared(&path).unwrap();
-    let ours = store.shared_writer().unwrap();
-    let theirs = SharedWriter::over(Arc::clone(&handle), SharerWrites::only_the_default_graph());
+    path
+}
+
+/// The read-modify-write race both lost-update tests run. A read-modify-write is held open
+/// on `door`: it reads the default graph, waits, then removes what it read. A 15-quad record
+/// is rewritten through `rewriter` in that window. Returns whether the rewrite committed
+/// inside the window, and how many quads are left.
+#[cfg(feature = "persistent")]
+fn race(door: SharedWriter, rewriter: SharedWriter, handle: &Store) -> (bool, usize) {
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::time::Duration;
 
     // A 15-quad record: fourteen fields and a body.
     let record = |body: usize| -> Vec<Quad> {
@@ -244,7 +380,7 @@ fn a_rewrite_through_over_cannot_land_inside_a_stores_read_modify_write() {
     };
     let first = record(0);
     let to_write = first.clone();
-    theirs
+    rewriter
         .write_declared(move |txn| txn.extend(to_write.iter().map(Quad::as_ref)))
         .unwrap();
     assert_eq!(handle.len().unwrap(), 15);
@@ -253,7 +389,7 @@ fn a_rewrite_through_over_cannot_land_inside_a_stores_read_modify_write() {
     let (read, was_read) = channel();
     let (go, wait) = channel::<()>();
     let door = std::thread::spawn(move || {
-        ours.write_declared(move |txn| {
+        door.write_declared(move |txn| {
             let seen = txn
                 .quads_for_pattern(None, None, None, Some(GraphNameRef::DefaultGraph))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -271,7 +407,7 @@ fn a_rewrite_through_over_cannot_land_inside_a_stores_read_modify_write() {
     let (committed, was_committed) = channel();
     let rewrite = std::thread::spawn(move || {
         let (old, new) = (first, record(1));
-        let outcome = theirs.write_declared(move |txn| {
+        let outcome = rewriter.write_declared(move |txn| {
             for quad in &old {
                 txn.remove(quad.as_ref())?;
             }
@@ -288,7 +424,25 @@ fn a_rewrite_through_over_cannot_land_inside_a_stores_read_modify_write() {
     go.send(()).unwrap();
     door.join().unwrap().unwrap();
     rewrite.join().unwrap().unwrap();
-    let left = handle.len().unwrap();
+    (landed_in_the_window, handle.len().unwrap())
+}
+
+/// ★ THE LOST UPDATE, on RocksDB, where it happens (on the in-memory backend every
+/// transaction holds a store-wide lock from start to commit, so it cannot). The read-modify-
+/// write is held open on the store's writer, and the record is rewritten through an `over`
+/// writer on the handle the store gave out.
+///
+/// On 0.2.15 the rewrite committed inside the window (its own thread, its own lock) and the
+/// door's commit then removed the quads the rewrite had kept: 15 quads became 1, which
+/// neither serial order produces. Joined, the rewrite waits for the door and lands whole.
+#[cfg(feature = "persistent")]
+#[test]
+fn a_rewrite_through_over_cannot_land_inside_a_stores_read_modify_write() {
+    let path = scratch("given-out");
+    let (store, handle) = DurableStore::open_shared(&path).unwrap();
+    let ours = store.shared_writer().unwrap();
+    let theirs = SharedWriter::over(Arc::clone(&handle), SharerWrites::only_the_default_graph());
+    let (landed_in_the_window, left) = race(ours, theirs, &handle);
     drop(handle);
     drop(store);
     let _ = std::fs::remove_dir_all(&path);
@@ -296,6 +450,30 @@ fn a_rewrite_through_over_cannot_land_inside_a_stores_read_modify_write() {
     assert!(
         !landed_in_the_window,
         "the `over` rewrite committed while the store's writer was held (left {left} quads)"
+    );
+    assert_eq!(left, 15, "a serial order leaves the whole edited record");
+}
+
+/// ★ THE SAME LOST UPDATE between two `over` writers on a RocksDB `Store` the host opened
+/// itself (ledger #1324): the shape `ikigai-browse`'s
+/// `race::browse_own_writer_beside_the_hosts_loses_half_a_record` found, a host's writer and
+/// a module's writer each made with `over` on one handle. On 0.2.16 each had its own thread
+/// and lock, and the record came out as 1 quad of 15. Now the second joins the first.
+#[cfg(feature = "persistent")]
+#[test]
+fn a_rewrite_through_a_second_over_cannot_land_inside_the_firsts_read_modify_write() {
+    let path = scratch("host-opened");
+    let handle = Arc::new(Store::open(&path).unwrap());
+    let hosts = SharedWriter::over(Arc::clone(&handle), SharerWrites::only_the_default_graph());
+    let modules = SharedWriter::over(Arc::clone(&handle), SharerWrites::only_the_default_graph());
+    let (landed_in_the_window, left) = race(hosts, modules, &handle);
+    drop(handle);
+    let _ = std::fs::remove_dir_all(&path);
+
+    assert!(
+        !landed_in_the_window,
+        "the second `over` writer's rewrite committed while the first's write was held \
+         (left {left} quads)"
     );
     assert_eq!(left, 15, "a serial order leaves the whole edited record");
 }
