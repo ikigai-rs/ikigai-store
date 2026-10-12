@@ -30,7 +30,8 @@
 //! into a store. Keep the two Turtle readings in step until the fold.
 //!
 //! ★ **The second half: a triple term an UPDATE builds** (ledger #1333). `INSERT DATA` text is
-//! bounded by [`crate::limits::check_sparql`] (`<<` counts as nesting), but an update can wrap
+//! bounded by [`crate::limits::check_sparql`] (`<<( … )>>` and `<< … >>` count against this
+//! module's [`MAX_RDF_NESTING`], ledger #1354), but an update can wrap
 //! a STORED term in `TRIPLE(…)` or a `<<( … )>>` template and store the result, a few dozen
 //! levels deeper a request, each request inside every text bound. oxigraph encodes, decodes and
 //! serializes a stored triple term recursively, so the term grows until a request that touches

@@ -38,6 +38,16 @@
 //! | `VALUES` | | | ≥ 600000, flat | ≥ 40000, flat |
 //! | `INSERT DATA` | | | | ≥ 40000, flat |
 //! | unary `-`, `+`, path `^` | ≥ 20000, no recursion | | | |
+//! | `<<( … )>>` in a pattern (`triple-terms`) | 439 | 3441 | 368 | 1367 |
+//! | `<<( … )>>` in an expression (`expr-triple-terms`, a `TRIPLE` call a level) | 616 | 3193 | 42 | 2630 |
+//! | `<<( … )>>` in an `INSERT` template (`u-triple-terms`) | 441 | 3449 | 441 | 2855 |
+//! | `<<( … )>>` in `INSERT DATA` (`u-data-triple-terms`) | 441 | 3449 | 441 | 3449 |
+//!
+//! The four triple-term rows were measured 2026-10-12 with `--features rdf-12` (ledger #1354),
+//! when the text scan began counting triple terms against `MAX_RDF_NESTING` apart from the
+//! brackets, so a text may now hold 64 of each. The costliest pair, 62 `STR(` calls around 64
+//! expression triple terms, needs ~7 MiB in a debug build (33 and 42 levels to 2 MiB) against
+//! the 80 MiB a debug SPARQL thread gets, and well under 1 MiB of the 16 MiB in release.
 //!
 //! Re-measured in a DEBUG build 2026-10-09 for ledger #1003 (`run, debug` for the chains and
 //! lists; `IN` and the arithmetic chains also in release). Per byte, the costliest debug
@@ -279,6 +289,40 @@ fn shape(name: &str, n: usize) -> (bool, String) {
                 "SELECT * WHERE {{ FILTER({}true{}) }}",
                 r("!(", n),
                 r(")", n)
+            ),
+        ),
+        // RDF 1.2 triple terms (`--features rdf-12`; without it each is a parse error, after
+        // the parser has recursed through all of it). Ledger #1354.
+        "triple-terms" => (
+            false,
+            format!(
+                "SELECT * WHERE {{ ?s ?p {}?o{} }}",
+                r("<<( <urn:s> <urn:p> ", n),
+                r(" )>>", n)
+            ),
+        ),
+        "expr-triple-terms" => (
+            false,
+            format!(
+                "SELECT * WHERE {{ BIND({}1{} AS ?x) }}",
+                r("<<( <urn:s> <urn:p> ", n),
+                r(" )>>", n)
+            ),
+        ),
+        "u-triple-terms" => (
+            true,
+            format!(
+                "INSERT {{ <urn:s> <urn:q> {}?o{} }} WHERE {{ <urn:s> <urn:p> ?o }}",
+                r("<<( <urn:s> <urn:p> ", n),
+                r(" )>>", n)
+            ),
+        ),
+        "u-data-triple-terms" => (
+            true,
+            format!(
+                "INSERT DATA {{ <urn:s> <urn:q> {}<urn:o>{} }}",
+                r("<<( <urn:s> <urn:p> ", n),
+                r(" )>>", n)
             ),
         ),
         other => panic!("unknown shape {other}"),

@@ -11,8 +11,9 @@
 //!
 //! 1. **[`check_sparql`] refuses, never truncates.** A query or update over
 //!    [`MAX_SPARQL_BYTES`], or that nests deeper than [`MAX_SPARQL_NESTING`] — brackets,
-//!    and runs of the one prefix operator spargebra recurses on, `!` — is refused with a
-//!    typed `InvalidArgument` naming the bound, before anything is parsed. Those are the
+//!    and runs of the one prefix operator spargebra recurses on, `!` — or nests RDF 1.2
+//!    triple terms deeper than [`MAX_RDF_NESTING`], is refused with a typed
+//!    `InvalidArgument` naming the bound, before anything is parsed. Those are the
 //!    cheapest ways to recurse (ONE byte a level; ~2.3 KiB of stack a level for a bracket
 //!    in a release build), so this is the check that turns a 3 KB query that killed a host
 //!    into a refusal.
@@ -66,7 +67,8 @@
 //!
 //! So the scan follows **every reading** the grammar allows, as a small set of branches, and
 //! refuses on the deepest. At a `<` it forks: an IRI (when the text up to the next `>` could
-//! be one), a `<<` triple-term opener (when one follows), and a less-than — the last only
+//! be one), a `<<` or `<<(` triple-term opener (when one follows; `<<(` and its closer `)>>`
+//! are single tokens, so that `(` opens no expression), and a less-than — the last only
 //! when the innermost open bracket is `(`, because every SPARQL expression sits directly
 //! inside parentheses, so that is the only place a less-than can occur. Branches in the
 //! same lexical state with the same open brackets are merged, so an ordinary query runs as
@@ -80,6 +82,7 @@
 //! a sibling could; when the text contains such an escape, the scan also runs over the
 //! unescaped text and refuses on either.
 
+use crate::depth::MAX_RDF_NESTING;
 use ikigai_core::{Error, Result};
 
 /// The most bytes a SPARQL query or update may carry: **1 MiB**.
@@ -90,8 +93,9 @@ use ikigai_core::{Error, Result};
 /// entries on a 2 MiB thread). What this bounds is the stack [`on_sparql_stack`] may need.
 pub const MAX_SPARQL_BYTES: usize = 1 << 20;
 
-/// The deepest a SPARQL query or update may nest `(`, `{`, `[` and `<<` — with a run of `!`
-/// counting one level for each — **64**.
+/// The deepest a SPARQL query or update may nest `(`, `{` and `[` — with a run of `!`
+/// counting one level for each — **64**. Triple terms (`<<( … )>>`, `<< … >>`) are counted
+/// apart, against [`MAX_RDF_NESTING`] (ledger #1354).
 ///
 /// The deepest legitimate query in the ecosystem's tests and stored queries nests about 5
 /// (a scan of ~700 of them, 2026-10-09). On a 2 MiB thread oxigraph 0.5.11's parser
@@ -179,14 +183,22 @@ pub(crate) fn sparql_stack_size_for_len(len: usize) -> usize {
     }
 }
 
-/// Refuse a SPARQL query or update that exceeds [`MAX_SPARQL_BYTES`] or nests deeper than
-/// [`MAX_SPARQL_NESTING`], naming the argument `arg` and the bound. Never truncates.
+/// Refuse a SPARQL query or update that exceeds [`MAX_SPARQL_BYTES`], nests its brackets
+/// deeper than [`MAX_SPARQL_NESTING`], or nests RDF 1.2 triple terms deeper than
+/// [`MAX_RDF_NESTING`], naming the argument `arg` and the bound. Never truncates.
+///
+/// The two depths are counted apart (ledger #1354): `(`, `{`, `[` and a run of `!` against
+/// [`MAX_SPARQL_NESTING`]; `<<( … )>>` and `<< … >>` against [`MAX_RDF_NESTING`], the depth
+/// a loaded document may nest triple terms, so an update may write any term a load may. A
+/// text at both bounds at once recurses 128 levels in the parser, which the thread
+/// [`on_sparql_stack`] gives it holds many times over (`tests/sparql_stack_measure.rs`).
 ///
 /// Every door in this crate that parses caller text calls this first. It is public so a
 /// host with its own SPARQL face over oxigraph can apply the same bound; that host must
 /// still parse on a big enough stack (see [`on_sparql_stack`]).
 ///
 /// ```
+/// use ikigai_store::depth::MAX_RDF_NESTING;
 /// use ikigai_store::limits::{check_sparql, MAX_SPARQL_NESTING};
 ///
 /// assert!(check_sparql("SELECT * WHERE { ?s ?p ?o FILTER((1)) }", "query").is_ok());
@@ -196,6 +208,17 @@ pub(crate) fn sparql_stack_size_for_len(len: usize) -> usize {
 /// // Brackets in a string, an IRI or a comment are not nesting.
 /// let quoted = format!("SELECT * WHERE {{ ?s ?p \"{}\" }} # {}", "(".repeat(100), "[".repeat(100));
 /// assert!(check_sparql(&quoted, "query").is_ok());
+/// // A triple-term template nests to the depth a load allows, and no further.
+/// let template = |n: usize| {
+///     format!(
+///         "INSERT {{ <urn:a> <urn:p> {}?t{} }} WHERE {{ <urn:a> <urn:p> ?t }}",
+///         "<<( <urn:s> <urn:p> ".repeat(n),
+///         " )>>".repeat(n)
+///     )
+/// };
+/// assert!(check_sparql(&template(MAX_RDF_NESTING), "content").is_ok());
+/// let refusal = check_sparql(&template(MAX_RDF_NESTING + 1), "content").unwrap_err().to_string();
+/// assert!(refusal.contains("`content`") && refusal.contains("MAX_RDF_NESTING"));
 /// ```
 pub fn check_sparql(text: &str, arg: &str) -> Result<()> {
     if text.len() > MAX_SPARQL_BYTES {
@@ -217,15 +240,28 @@ pub fn check_sparql(text: &str, arg: &str) -> Result<()> {
         ),
         None => depth,
     };
-    if depth > MAX_SPARQL_NESTING {
+    if depth.brackets > MAX_SPARQL_NESTING {
         return Err(Error::InvalidArgument {
             name: arg.to_string(),
             detail: format!(
                 "this SPARQL text nests its brackets deeper than {MAX_SPARQL_NESTING} \
-                 (MAX_SPARQL_NESTING), counting `(`, `{{`, `[`, `<<` and each `!` of a run, \
+                 (MAX_SPARQL_NESTING), counting `(`, `{{`, `[` and each `!` of a run, \
                  outside strings, IRIs and comments. It is refused before parsing because the parser recurses once \
                  per level and a stack overflow aborts the whole host, not one request. Real \
                  queries nest well under 10; flatten this one"
+            ),
+        });
+    }
+    if depth.terms > MAX_RDF_NESTING {
+        return Err(Error::InvalidArgument {
+            name: arg.to_string(),
+            detail: format!(
+                "this SPARQL text nests RDF 1.2 triple terms deeper than {MAX_RDF_NESTING} \
+                 (MAX_RDF_NESTING), counting `<<( … )>>` and `<< … >>` outside strings, IRIs \
+                 and comments: the depth a loaded document may nest them. It is refused before \
+                 parsing because the parser and the store recurse once per level and a stack \
+                 overflow aborts the whole host, not one request. Nest terms less deeply, or \
+                 reify instead"
             ),
         });
     }
@@ -368,10 +404,13 @@ enum Lex {
 struct Reading {
     lex: Lex,
     /// Bytes still to pass over without reading them (an escape's second byte, the rest of
-    /// a `'''`, the second `<` of `<<`).
+    /// a `'''`, the second `<` of `<<`, the `<(` of `<<(`, the `>>` of `)>>`).
     skip: u8,
-    /// The open brackets, innermost last; `<` stands for `<<`.
+    /// The open brackets, innermost last; `<` stands for `<<` and `T` for `<<(`.
     open: Vec<u8>,
+    /// How many of `open` are triple terms (`<` or `T`): they count toward
+    /// [`crate::depth::MAX_RDF_NESTING`], the rest toward [`MAX_SPARQL_NESTING`].
+    terms: usize,
     /// The last byte of code read, whitespace and comments aside — enough to know whether
     /// what came before a `<` could have been a less-than's left operand.
     last: u8,
@@ -381,18 +420,42 @@ struct Reading {
     bangs: usize,
 }
 
-/// The deepest any reading of `text` nests, stopping early once one passes the bound.
-/// `Err(n)` when more than `n` readings were alive at once.
-fn deepest(text: &[u8]) -> std::result::Result<usize, usize> {
+/// How deep a reading of a text nests, in the two counts [`check_sparql`] bounds.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct Depth {
+    /// `(`, `{` and `[`, and each `!` of a run: bounded by [`MAX_SPARQL_NESTING`].
+    brackets: usize,
+    /// `<<( … )>>` triple terms and `<< … >>` reified triples: bounded by
+    /// [`crate::depth::MAX_RDF_NESTING`], the depth a loaded document may nest them.
+    terms: usize,
+}
+
+impl Depth {
+    fn max(self, other: Depth) -> Depth {
+        Depth {
+            brackets: self.brackets.max(other.brackets),
+            terms: self.terms.max(other.terms),
+        }
+    }
+
+    fn over(self) -> bool {
+        self.brackets > MAX_SPARQL_NESTING || self.terms > crate::depth::MAX_RDF_NESTING
+    }
+}
+
+/// The deepest any reading of `text` nests, in each count, stopping early once one passes
+/// its bound. `Err(n)` when more than `n` readings were alive at once.
+fn deepest(text: &[u8]) -> std::result::Result<Depth, usize> {
     let mut readings = vec![Reading {
         lex: Lex::Code,
         skip: 0,
         open: Vec::new(),
+        terms: 0,
         last: b'(',
         bangs: 0,
     }];
     let mut forks: Vec<Reading> = Vec::new();
-    let mut deepest = 0;
+    let mut deepest = Depth::default();
     for (at, &byte) in text.iter().enumerate() {
         for reading in readings.iter_mut() {
             step(reading, text, at, byte, &mut forks);
@@ -408,9 +471,12 @@ fn deepest(text: &[u8]) -> std::result::Result<usize, usize> {
             }
         }
         for reading in &readings {
-            deepest = deepest.max(reading.open.len() + reading.bangs);
+            deepest = deepest.max(Depth {
+                brackets: reading.open.len() - reading.terms + reading.bangs,
+                terms: reading.terms,
+            });
         }
-        if deepest > MAX_SPARQL_NESTING {
+        if deepest.over() {
             break;
         }
     }
@@ -481,11 +547,22 @@ fn code(reading: &mut Reading, text: &[u8], at: usize, byte: u8, forks: &mut Vec
             reading.open.push(byte);
             reading.last = byte;
         }
+        // `)>>` is one token: the closer of a `<<(` triple term.
+        b')' if next(1) == Some(b'>')
+            && next(2) == Some(b'>')
+            && reading.open.last() == Some(&b'T') =>
+        {
+            reading.open.pop();
+            reading.terms -= 1;
+            reading.skip = 2;
+            reading.last = b'>';
+        }
         b')' => close(reading, b'('),
         b'}' => close(reading, b'{'),
         b']' => close(reading, b'['),
         b'>' if next(1) == Some(b'>') && reading.open.last() == Some(&b'<') => {
             reading.open.pop();
+            reading.terms -= 1;
             reading.skip = 1;
             reading.last = byte;
         }
@@ -498,18 +575,28 @@ fn code(reading: &mut Reading, text: &[u8], at: usize, byte: u8, forks: &mut Vec
                     lex: Lex::Iri,
                     skip: 0,
                     open: reading.open.clone(),
+                    terms: reading.terms,
                     last: b'>',
                     bangs: 0,
                 });
             }
             if next(1) == Some(b'<') {
+                // `<<(` is ONE token, a triple term's opener with no space allowed inside it
+                // (spargebra's `TripleTerm`, `TripleTermData` and `ExprTripleTerm`): one level,
+                // and its `(` is not an expression's, so no less-than reading opens inside it
+                // until a real `(` does. Read as `<<` then `(`, every level kept one more
+                // reading of `<` alive and the scan refused 7 levels as ambiguous (ledger
+                // #1354). `<<` then `(` has no reading of its own: nothing a reified triple
+                // holds starts with `(`.
+                let term = next(2) == Some(b'(');
                 let mut open = reading.open.clone();
-                open.push(b'<');
+                open.push(if term { b'T' } else { b'<' });
                 alternatives.push(Reading {
                     lex: Lex::Code,
-                    skip: 1,
+                    skip: if term { 2 } else { 1 },
                     open,
-                    last: b'<',
+                    terms: reading.terms + 1,
+                    last: if term { b'(' } else { b'<' },
                     bangs: 0,
                 });
             }
@@ -569,8 +656,14 @@ fn could_be_iri(text: &[u8], at: usize) -> bool {
 mod tests {
     use super::*;
 
+    /// The deepest any reading nests its brackets.
     fn depth(text: &str) -> usize {
-        deepest(text.as_bytes()).unwrap()
+        deepest(text.as_bytes()).unwrap().brackets
+    }
+
+    /// The deepest any reading nests triple terms.
+    fn terms(text: &str) -> usize {
+        deepest(text.as_bytes()).unwrap().terms
     }
 
     #[test]
@@ -645,7 +738,9 @@ mod tests {
 
     #[test]
     fn triple_terms_nest_and_the_unescaped_reading_is_scanned_too() {
-        assert_eq!(depth("{ << << ?s ?p ?o >> ?q ?r >> ?x ?y }"), 3);
+        assert_eq!(depth("{ << << ?s ?p ?o >> ?q ?r >> ?x ?y }"), 1);
+        assert_eq!(terms("{ << << ?s ?p ?o >> ?q ?r >> ?x ?y }"), 2);
+        assert_eq!(terms("{ ?a ?b <<( <<( ?s ?p ?o )>> ?q ?r )>> }"), 2);
         let escaped = format!(
             "SELECT * WHERE {{ FILTER({}1{}) }}",
             r"\u0028".repeat(100),
@@ -653,6 +748,122 @@ mod tests {
         );
         assert!(depth(&escaped) < MAX_SPARQL_NESTING);
         assert!(check_sparql(&escaped, "query").is_err());
+    }
+
+    /// An update whose `INSERT` template is a triple term `n` deep around `?t`, with `s p`
+    /// as given, at the broad door's shape (`graph` false) or the graph door's.
+    fn template(sp: &str, n: usize, graph: bool) -> String {
+        let term = format!("{}?t{}", format!("<<( {sp} ").repeat(n), " )>>".repeat(n));
+        if graph {
+            format!(
+                "PREFIX ex: <urn:ex:> DELETE {{ GRAPH <urn:g> {{ <urn:a> <urn:p> ?t }} }} \
+                 INSERT {{ GRAPH <urn:g> {{ <urn:a> <urn:p> {term} }} }} \
+                 WHERE {{ GRAPH <urn:g> {{ <urn:a> <urn:p> ?t }} }}"
+            )
+        } else {
+            format!(
+                "PREFIX ex: <urn:ex:> DELETE {{ <urn:a> <urn:p> ?t }} \
+                 INSERT {{ <urn:a> <urn:p> {term} }} WHERE {{ <urn:a> <urn:p> ?t }}"
+            )
+        }
+    }
+
+    /// Ledger #1354: a 7-deep `<<( … )>>` template was refused as too ambiguous to bound
+    /// (`MAX_SCAN_BRANCHES`, 2^7 readings: each `<<(`'s `(` read as an expression's kept a
+    /// less-than reading of the next `<` alive), far below the depth a load allows. `<<(` is
+    /// one token, so the template nests to `MAX_RDF_NESTING` and the refusal past it names
+    /// that bound.
+    #[test]
+    fn a_triple_term_template_nests_to_the_rdf_bound_and_the_refusal_names_it() {
+        for sp in [
+            "ex:s ex:p",
+            "<urn:s> <urn:p>",
+            "<urn:s> a",
+            "?s ?p",
+            "\"s\" ex:p",
+        ] {
+            for graph in [false, true] {
+                for n in [7, 8, MAX_RDF_NESTING] {
+                    check_sparql(&template(sp, n, graph), "content")
+                        .unwrap_or_else(|e| panic!("{sp} graph={graph} at {n}: {e}"));
+                }
+                let over = template(sp, MAX_RDF_NESTING + 1, graph);
+                let err = check_sparql(&over, "content").unwrap_err().to_string();
+                assert!(
+                    err.starts_with("invalid argument `content`")
+                        && err.contains("MAX_RDF_NESTING")
+                        && !err.contains("MAX_SCAN_BRANCHES"),
+                    "{sp} graph={graph}: {err}"
+                );
+            }
+        }
+        // In an expression too, where every `(` used to open a less-than reading.
+        let expr = |n: usize| {
+            format!(
+                "SELECT * WHERE {{ BIND({}1{} AS ?x) FILTER(?x = {}?y{}) }}",
+                "<<( <urn:s> <urn:p> ".repeat(n),
+                " )>>".repeat(n),
+                "<<( ?s <urn:p> ".repeat(n),
+                " )>>".repeat(n)
+            )
+        };
+        check_sparql(&expr(MAX_RDF_NESTING), "query").unwrap();
+        let err = check_sparql(&expr(MAX_RDF_NESTING + 1), "query").unwrap_err();
+        assert!(err.to_string().contains("MAX_RDF_NESTING"), "{err}");
+    }
+
+    #[test]
+    fn triple_terms_and_brackets_are_counted_apart() {
+        // 64 brackets (`{`, `FILTER(` and 62 more) around 64 triple terms: both at their bound.
+        let both = |brackets: usize, terms: usize| {
+            format!(
+                "SELECT * WHERE {{ FILTER({}{}1{} = ?x{}) }}",
+                "(".repeat(brackets - 2),
+                "<<( <urn:s> <urn:p> ".repeat(terms),
+                " )>>".repeat(terms),
+                ")".repeat(brackets - 2)
+            )
+        };
+        let at = both(MAX_SPARQL_NESTING, MAX_RDF_NESTING);
+        assert_eq!(
+            deepest(at.as_bytes()).unwrap(),
+            Depth {
+                brackets: MAX_SPARQL_NESTING,
+                terms: MAX_RDF_NESTING
+            }
+        );
+        check_sparql(&at, "query").unwrap();
+        let err = check_sparql(&both(MAX_SPARQL_NESTING + 1, 1), "query").unwrap_err();
+        assert!(err.to_string().contains("MAX_SPARQL_NESTING"), "{err}");
+        let err = check_sparql(&both(3, MAX_RDF_NESTING + 1), "query").unwrap_err();
+        assert!(err.to_string().contains("MAX_RDF_NESTING"), "{err}");
+        // A bracket INSIDE a triple term (a built-in call in `INSERT DATA`) is a bracket.
+        assert_eq!(
+            deepest(b"INSERT DATA { <urn:a> <urn:p> <<( <urn:s> <urn:p> STR((1)) )>> }").unwrap(),
+            Depth {
+                brackets: 3,
+                terms: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_triple_term_closes_only_on_its_own_token() {
+        // `) >>` is not `)>>`: the parser fails there, and the term stays open in the count.
+        let split = "{ ".to_string() + &"<<( ex:s ex:p ?o ) >> ".repeat(5) + "}";
+        assert_eq!(terms(&split), 5);
+        // `)>>` closes a `<<(` and `>>` a `<<`, never the other, so neither can make a
+        // reading look shallower than it is.
+        assert_eq!(depth("{ ( ( )>> )>> ( }"), 3);
+        assert_eq!(terms("{ <<( ?s ?p ?o >> <<( ?s ?p ?o >> }"), 2);
+        // `<< (` with a space is `<<` and a `(`: one term level and one bracket.
+        assert_eq!(
+            deepest(b"{ << ( ?s ?p ?o ) >> }").unwrap(),
+            Depth {
+                brackets: 2,
+                terms: 1
+            }
+        );
     }
 
     #[test]
