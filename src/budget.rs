@@ -485,7 +485,9 @@ where
 /// ⚠ It covers the writes THIS crate performs (`urn:iki:store:load` since 0.2.15, ledger
 /// #1209), and the host's own writes when it makes them through
 /// [`SharedWriter`](crate::SharedWriter) (ledger #1207), which runs them here, or on a
-/// writer of its own for [`SharedWriter::over`](crate::SharedWriter::over). A host
+/// writer of its own for [`SharedWriter::over`](crate::SharedWriter::over) on a store the
+/// host opened itself (on a handle a shared constructor gave out, `over` runs them here too,
+/// ledger #1276). A host
 /// that writes through the raw handle (`open_shared`) or commits inside
 /// [`crate::limits::on_sparql_stack`], which spawns a thread per call, on a fresh thread per
 /// write meets the same degeneration, and the fix is the same: write from a thread that lives.
