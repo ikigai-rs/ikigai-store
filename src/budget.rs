@@ -85,7 +85,11 @@
 //!
 //! Why the capability: it is the one thing a host already stamps per door that a caller
 //! cannot forge, and it follows a request down its sub-requests, attenuated, so a handler
-//! running a store query on its caller's behalf runs it on its caller's budget. A per-space
+//! querying on its caller's behalf runs on its caller's budget, except an ikigai-script run:
+//! its capability is narrowed to the script's authority, so a runner's budget grant never
+//! follows it on its own; a script DECLARES a budget at publish, and its run gets the least of
+//! that, its publisher's grant at publish, the host's ceiling and the runner's own grant
+//! (ledger #1384). A per-space
 //! option (`ikigai-sparql`'s `space_with_budget`) cannot tell two doors on ONE kernel apart,
 //! and two spaces over one store forfeit caching (see
 //! [`DurableStore::spaces_bound`](crate::DurableStore::spaces_bound)) — which is why this
@@ -371,8 +375,9 @@ impl TimeBudget {
 /// The budget a request gets is chosen as the store's doors choose it: the
 /// [`TimeBudget`]'s base, raised by a `urn:cap:store:budget:<ms>` grant ([`cap_budget`]) the
 /// caller's capability holds, the ceiling for root, and lowered (never raised) by a
-/// `requested` milliseconds, which a consumer reads from its own `budget=` argument if it has
-/// one ([`effective_budget`]).
+/// `requested` milliseconds, which a consumer reads from an argument of its own if it has one
+/// ([`effective_budget`]); [`with_argument`](Self::with_argument) names that argument in a
+/// timeout's advice, which otherwise names none (ledger #1383).
 ///
 /// ```
 /// use ikigai_core::{Capability, Error};
@@ -418,6 +423,9 @@ impl TimeBudget {
 pub struct EvaluationBudget {
     budget: TimeBudget,
     overdue: Arc<AtomicUsize>,
+    /// The consumer's own argument that lowers the budget, for a timeout's advice; `None`
+    /// leaves the advice out (ledger #1383).
+    argument: Option<Arc<str>>,
 }
 
 impl EvaluationBudget {
@@ -427,7 +435,56 @@ impl EvaluationBudget {
         EvaluationBudget {
             budget,
             overdue: Arc::default(),
+            argument: None,
         }
+    }
+
+    /// Name the argument of the consumer's OWN that lowers the budget, for the advice in a
+    /// timeout's sentence: `Some("match_budget")` tells the caller "a request's
+    /// `match_budget=` can only lower it", and `None` (the default) leaves that clause out
+    /// (ledger #1383).
+    ///
+    /// ★ **Name only an argument your caller can actually pass**, the one whose value you
+    /// hand [`run`](Self::run) as `requested`. The store's own doors say `budget=` because
+    /// they take it; a consumer that does not take one says nothing rather than send its
+    /// caller looking for an argument that is refused. Clones keep the name, as they keep the
+    /// overdue count.
+    ///
+    /// ```
+    /// use ikigai_core::{Capability, Error};
+    /// use ikigai_store::budget::{EvaluationBudget, TimeBudget};
+    /// use std::time::Duration;
+    ///
+    /// let timeout = |budget: &EvaluationBudget| {
+    ///     let (release, held) = std::sync::mpsc::channel::<()>();
+    ///     let caller = Capability::scoped(["urn:cap:space:read"]);
+    ///     // Work that waits to be released, so it can only time out.
+    ///     let result = budget.run("ASK {}", &caller, None, move |_| {
+    ///         let _ = held.recv();
+    ///         Ok(())
+    ///     });
+    ///     let _ = release.send(());
+    ///     match result {
+    ///         Err(Error::Timeout(sentence)) => sentence,
+    ///         other => panic!("expected a timeout, got {other:?}"),
+    ///     }
+    /// };
+    ///
+    /// let budget = EvaluationBudget::new(TimeBudget::new(Duration::from_millis(50)));
+    /// // By default the sentence names no argument: this consumer takes none.
+    /// assert!(timeout(&budget).ends_with(
+    ///     "The budget is set by the host. Narrow the query — fewer joins, a bound subject, \
+    ///      a LIMIT — or ask the host for a larger budget"
+    /// ));
+    /// // A consumer that reads `requested` from its own `match_budget=` says so.
+    /// let budget = budget.with_argument(Some("match_budget"));
+    /// assert!(timeout(&budget)
+    ///     .contains("The budget is set by the host, and a request's `match_budget=` can only lower it."));
+    /// ```
+    #[must_use]
+    pub fn with_argument(mut self, argument: Option<&str>) -> Self {
+        self.argument = argument.map(Arc::from);
+        self
     }
 
     /// The time budget these evaluations run under.
@@ -463,13 +520,19 @@ impl EvaluationBudget {
         F: FnOnce(&CancellationToken) -> Result<T> + Send + 'static,
     {
         let budget = effective_budget(requested, self.budget.for_capability(capability))?;
-        run(
-            text,
-            false,
+        let deadline = Deadline {
+            token: CancellationToken::new(),
+            state: Arc::new(Mutex::new(State::Running)),
             budget,
+            write: false,
+            argument: self.argument.clone(),
+        };
+        on_its_own_thread(
+            text,
             &self.overdue,
             self.budget.max_overdue(),
             None,
+            deadline,
             move |deadline| work(&deadline.token),
         )
     }
@@ -493,6 +556,10 @@ pub(crate) struct Deadline {
     budget: Duration,
     /// Whether this evaluation is an update, for the refusal's wording.
     write: bool,
+    /// The argument the refusal tells its caller lowers the budget, if the caller has one
+    /// (ledger #1383): `budget` at this store's doors, the consumer's own name (or none)
+    /// through an [`EvaluationBudget`].
+    argument: Option<Arc<str>>,
 }
 
 impl Deadline {
@@ -504,6 +571,7 @@ impl Deadline {
             state: Arc::new(Mutex::new(State::Running)),
             budget: Duration::from_secs(3600),
             write: true,
+            argument: Some(DOOR_ARGUMENT.into()),
         }
     }
 
@@ -517,7 +585,7 @@ impl Deadline {
     /// between rows.
     pub(crate) fn check(&self) -> Result<()> {
         if self.token.is_cancelled() {
-            return Err(timeout(self.budget, self.write));
+            return Err(timeout(self.budget, self.write, self.argument.as_deref()));
         }
         Ok(())
     }
@@ -528,7 +596,7 @@ impl Deadline {
     pub(crate) fn settle<R>(&self, commit: impl FnOnce() -> Result<R>) -> Result<R> {
         let mut state = lock(&self.state);
         if *state == State::Abandoned {
-            return Err(timeout(self.budget, self.write));
+            return Err(timeout(self.budget, self.write, self.argument.as_deref()));
         }
         *state = State::Settled;
         commit()
@@ -541,12 +609,22 @@ fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn timeout(budget: Duration, write: bool) -> Error {
-    // The wording is `ikigai-sparql`'s, so a consumer reading both sees one sentence.
+/// The argument this store's own doors read a request's lower bound from (`budget=`).
+const DOOR_ARGUMENT: &str = "budget";
+
+fn timeout(budget: Duration, write: bool, argument: Option<&str>) -> Error {
+    // At the doors (`argument` is `budget`) the wording is `ikigai-sparql`'s, so a consumer
+    // reading both sees one sentence. Through an `EvaluationBudget` it names the consumer's
+    // own argument, or none: a caller cannot pass an argument its door does not take
+    // (ledger #1383).
+    let lower = match argument {
+        Some(arg) => format!(", and a request's `{arg}=` can only lower it"),
+        None => String::new(),
+    };
     Error::Timeout(format!(
         "{} ran past its time budget of {} ms and was stopped (ledger #964).{} The budget is \
-         set by the host, and a request's `budget=` can only lower it. Narrow the query — \
-         fewer joins, a bound subject, a LIMIT — or ask the host for a larger budget",
+         set by the host{lower}. Narrow the query — fewer joins, a bound subject, a LIMIT — \
+         or ask the host for a larger budget",
         if write {
             "this SPARQL update"
         } else {
@@ -563,6 +641,8 @@ fn timeout(budget: Duration, write: bool) -> Error {
 ///
 /// `overdue` is the store's count of evaluations still running after their callers gave up;
 /// at `max_overdue` this refuses before starting anything. See the module docs.
+///
+/// A timeout's advice names the doors' `budget=`; [`EvaluationBudget::run`] names its own.
 pub(crate) fn run<T, F>(
     text: &str,
     write: bool,
@@ -581,6 +661,7 @@ where
         state: Arc::new(Mutex::new(State::Running)),
         budget,
         write,
+        argument: Some(DOOR_ARGUMENT.into()),
     };
     on_its_own_thread(text, overdue, max_overdue, writer, deadline, work)
 }
@@ -798,6 +879,7 @@ where
         )));
     }
     let (budget, write) = (deadline.budget, deadline.write);
+    let argument = deadline.argument.clone();
     let stack = crate::limits::sparql_stack_size(text);
     let (tx, rx) = std::sync::mpsc::channel();
     let state = Arc::clone(&deadline.state);
@@ -850,7 +932,7 @@ where
                     *state = State::Abandoned;
                     overdue.fetch_add(1, Ordering::SeqCst);
                     token.cancel();
-                    return Err(timeout(budget, write));
+                    return Err(timeout(budget, write, argument.as_deref()));
                 }
             }
             // Settled: it reached its commit point in time, and its answer is on the way.
