@@ -60,10 +60,21 @@
 //! - **It is counted.** An evaluation still running after its caller gave up is OVERDUE;
 //!   [`DurableStore::overdue_evaluations`](crate::DurableStore::overdue_evaluations) says how
 //!   many there are right now.
-//! - **It is capped.** While [`TimeBudget::max_overdue`] evaluations are overdue, every new
-//!   evaluation is refused at once with a transient [`Error::Unavailable`] saying why. That
-//!   bounds how many cores one store's callers can pin, at the price of refusing SPARQL (and
-//!   only SPARQL) until one finishes.
+//! - **It is capped, and the cap is on what is IN FLIGHT** (ledger #1427). A read reserves one
+//!   of [`TimeBudget::max_overdue`] slots before its thread starts and gives it back when the
+//!   thread ends, however it ends. So at most that many reads evaluate on one store at once,
+//!   and so at most that many can outlive their callers: **one store's callers can pin at most
+//!   `max_overdue` cores with reads, plus the store's one writer thread** (an update runs there
+//!   and takes no slot; the writer bounds updates to one core already, and one waiting in its
+//!   queue holds none). A read that finds every slot taken WAITS for one, within its own budget
+//!   (the wait counts against it), and is refused with a transient [`Error::Unavailable`] if
+//!   none comes free; while `max_overdue` evaluations are OVERDUE, every new one, read or
+//!   update, is refused at once with an `Unavailable` saying why. The price is that SPARQL
+//!   reads on one store run at most `max_overdue` at a time. Through 0.2.20 nothing was
+//!   reserved and the cap was checked against the overdue count alone, which rises only at a
+//!   timeout: eight requests arriving together at a cap of 1 all started, and all eight
+//!   outlived their callers. Through an [`EvaluationBudget`] the same holds for a consumer's
+//!   evaluations, which are all reads.
 //!
 //! The real fix for this layer is upstream: `spareval` checking its token in those loops.
 //!
@@ -136,7 +147,6 @@
 //! `DISTINCT`, `GROUP BY` or the build side of a join materializes its input inside the
 //! evaluator, where this crate cannot count it; that is bounded by time (above), not by this.
 
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -187,8 +197,11 @@ pub fn cap_budget(millis: u64) -> String {
 /// number, walk and reasoning as `ikigai-sparql`'s.
 ///
 /// A join's operands are its triple patterns (a sequence path `:a/:b/:c` is parsed into one
-/// triple pattern per step) and every nested group, sub-`SELECT` and path pattern joined beside
-/// them; an `OPTIONAL`, `UNION` or `MINUS` side is a join of its own. oxigraph's greedy join
+/// triple pattern per step), counted THROUGH every nested plain group and every `GRAPH <g>` or
+/// `GRAPH ?g` block, because the planner erases those wrappers and flattens the join before it
+/// orders it (ledger #1426); and one each for a sub-`SELECT`, a path pattern, a filtered group
+/// or anything else joined beside them. An `OPTIONAL`, `UNION` or `MINUS` side is a join of its
+/// own, counted on its own. oxigraph's greedy join
 /// reordering is about cubic in this number: measured (by the `ikigai-sparql` arc), 32
 /// patterns plan in ~4 ms, 64 in ~70 ms, 100 in ~350 ms, 200 in 7 s, and 1,000 path steps in
 /// 19 s. The largest join the ecosystem runs has 11 patterns (survey, 2026-10-09). 32 rather
@@ -262,8 +275,9 @@ impl Default for TimeBudget {
     }
 }
 
-/// A quarter of this machine's available parallelism, and at least one: how many cores the
-/// runaway evaluations of one store may hold before it refuses new ones.
+/// A quarter of this machine's available parallelism, and at least one: how many reads one
+/// store evaluates at once, and so how many cores its runaway evaluations may hold (ledger
+/// #1427; see the module docs).
 pub fn default_max_overdue() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get() / 4)
@@ -290,8 +304,9 @@ impl TimeBudget {
         self
     }
 
-    /// How many evaluations may still be running after their callers gave up before the
-    /// store refuses new ones (at least 1). See the module docs for what that trades.
+    /// How many reads may evaluate at once, and so how many may still be running after their
+    /// callers gave up (at least 1); at that many overdue, new evaluations are refused at once.
+    /// See the module docs for what that trades (ledger #1427).
     pub fn with_max_overdue(mut self, n: usize) -> Self {
         self.max_overdue = n.max(1);
         self
@@ -307,7 +322,7 @@ impl TimeBudget {
         self.ceiling
     }
 
-    /// The cap on overdue evaluations.
+    /// The cap on reads in flight, and so on overdue evaluations.
     pub fn max_overdue(&self) -> usize {
         self.max_overdue
     }
@@ -366,7 +381,8 @@ impl TimeBudget {
 ///   it: measured here, an ASK of 8 unconstrained patterns over a 7-triple graph, cancelled
 ///   at 200 ms, returned 6.3 s later (debug build; `tests/match_time_budget.rs`). There is no
 ///   way to stop a Rust thread from outside it, so such an evaluation goes on holding a core
-///   after its caller was answered. While [`TimeBudget::max_overdue`] are overdue, `run`
+///   after its caller was answered. So at most [`TimeBudget::max_overdue`] run at once (a
+///   `run` waits within its budget for one to end), and while that many are overdue, `run`
 ///   refuses at once with a transient [`Error::Unavailable`] rather than start another.
 ///
 /// ★ **Make ONE per host (or per space) and clone it**: the clones share the overdue count,
@@ -422,7 +438,7 @@ impl TimeBudget {
 #[derive(Clone, Debug, Default)]
 pub struct EvaluationBudget {
     budget: TimeBudget,
-    overdue: Arc<AtomicUsize>,
+    evaluations: Arc<Evaluations>,
     /// The consumer's own argument that lowers the budget, for a timeout's advice; `None`
     /// leaves the advice out (ledger #1383).
     argument: Option<Arc<str>>,
@@ -434,7 +450,7 @@ impl EvaluationBudget {
     pub fn new(budget: TimeBudget) -> Self {
         EvaluationBudget {
             budget,
-            overdue: Arc::default(),
+            evaluations: Arc::default(),
             argument: None,
         }
     }
@@ -499,7 +515,7 @@ impl EvaluationBudget {
     /// How many evaluations run through this (or a clone of it) are still running after their
     /// callers were answered with a timeout, right now. See [`EvaluationBudget`].
     pub fn overdue_evaluations(&self) -> usize {
-        self.overdue.load(std::sync::atomic::Ordering::SeqCst)
+        self.evaluations.overdue()
     }
 
     /// Run `work`, the evaluation of the SPARQL `text`, for a caller holding `capability`,
@@ -510,8 +526,9 @@ impl EvaluationBudget {
     /// own what it uses (`'static`), because its thread may outlive this call.
     ///
     /// Refused with [`Error::Timeout`] naming the budget when it runs past it, and with
-    /// [`Error::Unavailable`] at once while [`TimeBudget::max_overdue`] are overdue. On wasm
-    /// there are no threads and `work` runs inline, unbounded in time.
+    /// [`Error::Unavailable`] at once while [`TimeBudget::max_overdue`] are overdue, or when
+    /// that many are running and none ends within the budget. On wasm there are no threads and
+    /// `work` runs inline, unbounded in time.
     pub fn run<T, F>(
         &self,
         text: &str,
@@ -533,7 +550,7 @@ impl EvaluationBudget {
         };
         on_its_own_thread(
             text,
-            &self.overdue,
+            &self.evaluations,
             self.budget.max_overdue(),
             None,
             deadline,
@@ -643,15 +660,17 @@ fn timeout(budget: Duration, write: bool, argument: Option<&str>) -> Error {
 /// thread of its own, an update on `writer`'s thread when one is given (ledger #1127 — see
 /// [`Writer`]).
 ///
-/// `overdue` is the store's count of evaluations still running after their callers gave up;
-/// at `max_overdue` this refuses before starting anything. See the module docs.
+/// `evaluations` is the store's count of reads in flight and of evaluations still running
+/// after their callers gave up: a read takes one of `max_overdue` slots before it starts
+/// (waiting within its budget for one), and while `max_overdue` are overdue this refuses
+/// before starting anything. See [`Evaluations`] and the module docs.
 ///
 /// A timeout's advice names the doors' `budget=`; [`EvaluationBudget::run`] names its own.
 pub(crate) fn run<T, F>(
     text: &str,
     write: bool,
     budget: Duration,
-    overdue: &Arc<AtomicUsize>,
+    evaluations: &Arc<Evaluations>,
     max_overdue: usize,
     writer: Option<&Writer>,
     work: F,
@@ -667,7 +686,7 @@ where
         write,
         argument: Some(DOOR_ARGUMENT.into()),
     };
-    on_its_own_thread(text, overdue, max_overdue, writer, deadline, work)
+    on_its_own_thread(text, evaluations, max_overdue, writer, deadline, work)
 }
 
 /// The one long-lived thread a store's UPDATES and LOADS run on (ledger #1127, #1209).
@@ -844,7 +863,7 @@ impl Writer {
 #[cfg(target_family = "wasm")]
 fn on_its_own_thread<T, F>(
     text: &str,
-    overdue: &Arc<AtomicUsize>,
+    evaluations: &Arc<Evaluations>,
     max_overdue: usize,
     writer: Option<&Writer>,
     deadline: Deadline,
@@ -853,14 +872,14 @@ fn on_its_own_thread<T, F>(
 where
     F: FnOnce(&Deadline) -> Result<T>,
 {
-    let _ = (text, overdue, max_overdue, writer);
+    let _ = (text, evaluations, max_overdue, writer);
     work(&deadline)
 }
 
 #[cfg(not(target_family = "wasm"))]
 fn on_its_own_thread<T, F>(
     text: &str,
-    overdue: &Arc<AtomicUsize>,
+    evaluations: &Arc<Evaluations>,
     max_overdue: usize,
     writer: Option<&Writer>,
     deadline: Deadline,
@@ -870,43 +889,52 @@ where
     T: Send + 'static,
     F: FnOnce(&Deadline) -> Result<T> + Send + 'static,
 {
-    use std::sync::atomic::Ordering;
     use std::sync::mpsc::RecvTimeoutError;
 
-    let running = overdue.load(Ordering::SeqCst);
-    if running >= max_overdue {
-        return Err(Error::Unavailable(format!(
-            "{running} SPARQL evaluations on this store are still running after their \
-             callers' time budgets ran out (the most it allows is {max_overdue}); oxigraph \
-             cannot always stop one partway, so new ones are refused until one finishes, \
-             rather than letting each request hold another core. Retry shortly"
-        )));
-    }
     let (budget, write) = (deadline.budget, deadline.write);
+    let started = std::time::Instant::now();
+    // ★ A read reserves its slot BEFORE it starts (ledger #1427); see `Evaluations`. An update
+    // runs on the store's one writer thread, which bounds updates to one core already, so it
+    // takes no slot; it is still refused while the cap is filled by overdue work.
+    let slot = if writer.is_none() {
+        evaluations.reserve(max_overdue, budget)?;
+        true
+    } else {
+        evaluations.refuse_at_the_cap(max_overdue)?;
+        false
+    };
+    // What is left of the caller's budget after waiting for a slot: the wait counts, as an
+    // update's wait in the writer's queue counts.
+    let remaining = budget.saturating_sub(started.elapsed());
     let argument = deadline.argument.clone();
     let stack = crate::limits::sparql_stack_size(text);
     let (tx, rx) = std::sync::mpsc::channel();
     let state = Arc::clone(&deadline.state);
     let token = deadline.token.clone();
-    let worker_overdue = Arc::clone(overdue);
+    // Released when the worker ends, however it ends, including when it never runs.
+    let hold = Hold {
+        evaluations: Arc::clone(evaluations),
+        state: Arc::clone(&deadline.state),
+        slot,
+    };
     let body = move || {
+        let hold = hold;
         // A write can wait in the writer's queue past its caller's budget: then the caller has
         // already been answered and counted it overdue, and running it would only be work
-        // whose commit `settle` refuses.
+        // whose commit `settle` refuses. `hold` leaves the count when it drops.
         if *lock(&deadline.state) == State::Abandoned {
-            worker_overdue.fetch_sub(1, Ordering::SeqCst);
             return;
         }
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&deadline)));
         {
             let mut state = lock(&deadline.state);
-            match *state {
-                State::Abandoned => {
-                    worker_overdue.fetch_sub(1, Ordering::SeqCst);
-                }
-                _ => *state = State::Settled,
+            if *state != State::Abandoned {
+                *state = State::Settled;
             }
         }
+        // The slot is free before the caller hears, so a caller that asks again at once
+        // never finds its own last evaluation still holding it.
+        drop(hold);
         // The caller may be gone (it gave up); that is the case `Abandoned` counted.
         let _ = tx.send(outcome);
     };
@@ -927,14 +955,16 @@ where
         }
     }
     let lost = || Error::Endpoint("internal: a SPARQL worker ended without answering".into());
-    let outcome = match rx.recv_timeout(budget) {
+    let outcome = match rx.recv_timeout(remaining) {
         Ok(outcome) => outcome,
         Err(RecvTimeoutError::Timeout) => {
             {
                 let mut state = lock(&state);
                 if *state == State::Running {
                     *state = State::Abandoned;
-                    overdue.fetch_add(1, Ordering::SeqCst);
+                    // Counted under the state lock, so the worker's `Hold` sees `Abandoned`
+                    // only once the count holds it.
+                    evaluations.abandoned();
                     token.cancel();
                     return Err(timeout(budget, write, argument.as_deref()));
                 }
@@ -947,6 +977,153 @@ where
     match outcome {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// The evaluations one store (or one [`EvaluationBudget`] and its clones) has running: how
+/// many READS hold a slot, and how many evaluations of any kind are overdue (ledger #1427).
+///
+/// ★ **Why a slot is reserved at the START.** The cap exists to bound how many cores runaway
+/// evaluations can pin, and any evaluation may turn out to be one: oxigraph cannot always stop
+/// one partway, and nothing can stop a Rust thread from outside it. Until 0.2.21 the cap was
+/// checked against the OVERDUE count, which rises only when a caller gives up, and nothing was
+/// reserved; so every request that arrived before the first timeout passed the check, and
+/// eight concurrent requests at a cap of 1 left eight evaluations overdue at once
+/// (`tests/overdue_cap_in_flight.rs`). Counting what is IN FLIGHT is the only count that can
+/// keep the promise, since the overdue ones are a subset of it.
+///
+/// So a read takes a slot before its thread starts and gives it back when the thread ends,
+/// whether it answered, timed out or panicked. A read that finds every slot taken WAITS for
+/// one, within its own budget (the wait counts against it), rather than being refused: slots
+/// held by evaluations still inside their budgets are ordinary concurrency, and refusing it
+/// would refuse the second of two simultaneous fast reads on a store whose cap is 1. While
+/// the cap is filled by OVERDUE evaluations, a new one is refused at once, as it always was.
+#[derive(Debug, Default)]
+// On wasm an evaluation runs inline, so nothing waits on `changed` or reads `running`.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+pub(crate) struct Evaluations {
+    counts: Mutex<Counts>,
+    /// Signaled whenever a slot is released or an evaluation becomes overdue.
+    changed: std::sync::Condvar,
+}
+
+#[derive(Debug, Default)]
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // as `Evaluations`
+struct Counts {
+    /// Reads holding a slot: started (or about to), not yet ended.
+    running: usize,
+    /// Evaluations (reads or updates) still running after their callers were answered with a
+    /// timeout, or updates still queued after theirs were.
+    overdue: usize,
+}
+
+impl Evaluations {
+    fn counts(&self) -> std::sync::MutexGuard<'_, Counts> {
+        // Plain counters, valid whatever a panicking holder left: poisoning means nothing.
+        self.counts.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How many evaluations are overdue right now.
+    pub(crate) fn overdue(&self) -> usize {
+        self.counts().overdue
+    }
+
+    /// How many reads hold a slot right now. For tests.
+    #[cfg(test)]
+    fn running(&self) -> usize {
+        self.counts().running
+    }
+
+    /// Refuse at once while `max` evaluations are overdue.
+    #[cfg(not(target_family = "wasm"))]
+    fn refuse_at_the_cap(&self, max: usize) -> Result<()> {
+        let overdue = self.counts().overdue;
+        if overdue >= max {
+            return Err(at_the_cap(overdue, max));
+        }
+        Ok(())
+    }
+
+    /// Take a slot for a read, waiting at most `budget` for one. Refused at once while `max`
+    /// evaluations are overdue, and when no slot came free within the budget.
+    #[cfg(not(target_family = "wasm"))]
+    fn reserve(&self, max: usize, budget: Duration) -> Result<()> {
+        let until = std::time::Instant::now() + budget;
+        let mut counts = self.counts();
+        loop {
+            if counts.overdue >= max {
+                return Err(at_the_cap(counts.overdue, max));
+            }
+            if counts.running < max {
+                counts.running += 1;
+                return Ok(());
+            }
+            let now = std::time::Instant::now();
+            if now >= until {
+                return Err(Error::Unavailable(format!(
+                    "{} SPARQL evaluations are running on this store, and the most it runs at \
+                     once is {max}, so that work oxigraph cannot stop partway can hold no more \
+                     than that many cores; none ended within this request's time budget of {} \
+                     ms. Retry shortly",
+                    counts.running,
+                    budget.as_millis()
+                )));
+            }
+            counts = self
+                .changed
+                .wait_timeout(counts, until - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    /// A caller gave up on its evaluation, which is still running (or queued).
+    #[cfg(not(target_family = "wasm"))]
+    fn abandoned(&self) {
+        self.counts().overdue += 1;
+        self.changed.notify_all();
+    }
+}
+
+/// The refusal while `max` evaluations are overdue. Its wording is a contract consumers test
+/// ("the most it allows is", "still running").
+#[cfg(not(target_family = "wasm"))]
+fn at_the_cap(overdue: usize, max: usize) -> Error {
+    Error::Unavailable(format!(
+        "{overdue} SPARQL evaluations on this store are still running after their callers' \
+         time budgets ran out (the most it allows is {max}); oxigraph cannot always stop one \
+         partway, so new ones are refused until one finishes, rather than letting each request \
+         hold another core. Retry shortly"
+    ))
+}
+
+/// What a worker holds until it ends: its slot (a read's), and its place in the overdue count
+/// if its caller gave up. Released on drop, so a worker that panics, is skipped in the
+/// writer's queue, or is never started (a thread that failed to spawn) gives both back.
+#[cfg(not(target_family = "wasm"))]
+struct Hold {
+    evaluations: Arc<Evaluations>,
+    state: Arc<Mutex<State>>,
+    slot: bool,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Drop for Hold {
+    fn drop(&mut self) {
+        // Read before the counts are locked: the caller counts `overdue` while holding the
+        // state lock, so `Abandoned` seen here was already counted (lock order: state, then
+        // counts, never the reverse).
+        let abandoned = *lock(&self.state) == State::Abandoned;
+        {
+            let mut counts = self.evaluations.counts();
+            if self.slot {
+                counts.running = counts.running.saturating_sub(1);
+            }
+            if abandoned {
+                counts.overdue = counts.overdue.saturating_sub(1);
+            }
+        }
+        self.evaluations.changed.notify_all();
     }
 }
 
@@ -1440,8 +1617,15 @@ impl Cost {
                 self.nodes += patterns.len();
                 self.widest_join = self.widest_join.max(patterns.len());
             }
-            GraphPattern::Join { .. } => {
-                // The planner flattens nested joins and reorders all their operands at once.
+            // ★ A `GRAPH` block is NOT one operand (ledger #1426). `sparopt` erases the
+            // wrapper before planning (`GraphPattern::from_sparql_algebra`'s `Graph` arm pushes
+            // the graph name, IRI or variable, down into each quad pattern and returns the
+            // inner pattern), and then flattens nested joins and reorders all their operands
+            // at once. So a block's patterns count toward the ENCLOSING join, as a nested
+            // join's do. Counted as one operand, six blocks of 31 patterns passed as a join of
+            // 31 and planned as one of 186: 3.8 s on an empty store, uncancellable. `UNION`,
+            // `OPTIONAL` and `MINUS` branches stay joins of their own (the `other` arm).
+            GraphPattern::Join { .. } | GraphPattern::Graph { .. } => {
                 let mut operands = 0;
                 let mut todo = vec![pattern];
                 while let Some(next) = todo.pop() {
@@ -1450,6 +1634,10 @@ impl Cost {
                             self.nodes += 1;
                             todo.push(left);
                             todo.push(right);
+                        }
+                        GraphPattern::Graph { inner, .. } => {
+                            self.nodes += 1;
+                            todo.push(inner);
                         }
                         GraphPattern::Bgp { patterns } => {
                             self.nodes += patterns.len();
@@ -1518,8 +1706,7 @@ impl Cost {
                 }
                 self.pattern(inner);
             }
-            GraphPattern::Graph { inner, .. }
-            | GraphPattern::Service { inner, .. }
+            GraphPattern::Service { inner, .. }
             | GraphPattern::Project { inner, .. }
             | GraphPattern::Distinct { inner }
             | GraphPattern::Reduced { inner }
@@ -1603,11 +1790,11 @@ impl Cost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
-    fn counter() -> Arc<AtomicUsize> {
-        Arc::new(AtomicUsize::new(0))
+    fn counter() -> Arc<Evaluations> {
+        Arc::default()
     }
 
     #[test]
@@ -1655,7 +1842,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, 7);
-        assert_eq!(overdue.load(Ordering::SeqCst), 0);
+        assert_eq!(overdue.overdue(), 0);
     }
 
     #[test]
@@ -1685,7 +1872,7 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
         // The worker sees the token and ends; the count goes back to zero.
         let wait = Instant::now();
-        while overdue.load(Ordering::SeqCst) != 0 {
+        while overdue.overdue() != 0 {
             assert!(
                 wait.elapsed() < Duration::from_secs(5),
                 "worker never ended"
@@ -1713,7 +1900,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::Timeout(_)));
-        assert_eq!(overdue.load(Ordering::SeqCst), 1);
+        assert_eq!(overdue.overdue(), 1);
         let refused = run(
             "q",
             false,
@@ -1730,7 +1917,7 @@ mod tests {
         );
         release.send(()).unwrap();
         let wait = Instant::now();
-        while overdue.load(Ordering::SeqCst) != 0 {
+        while overdue.overdue() != 0 {
             assert!(wait.elapsed() < Duration::from_secs(5));
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1744,6 +1931,104 @@ mod tests {
             |_| Ok(()),
         )
         .unwrap();
+    }
+
+    /// ★ Ledger #1427: the cap bounds reads IN FLIGHT. Six concurrent reads at a cap of 2
+    /// never run more than two at once, and all six are answered: the rest wait for a slot.
+    #[test]
+    fn reads_in_flight_never_exceed_the_cap_and_the_rest_wait() {
+        let evaluations = counter();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                let (evaluations, active, peak) = (
+                    Arc::clone(&evaluations),
+                    Arc::clone(&active),
+                    Arc::clone(&peak),
+                );
+                std::thread::spawn(move || {
+                    run(
+                        "q",
+                        false,
+                        Duration::from_secs(10),
+                        &evaluations,
+                        2,
+                        None,
+                        move |_| {
+                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(50));
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        assert!(peak.load(Ordering::SeqCst) <= 2, "{peak:?} at once");
+        assert_eq!(evaluations.running(), 0, "every slot was given back");
+        assert_eq!(evaluations.overdue(), 0);
+    }
+
+    /// A read that waits its whole budget for a slot is refused, transiently, saying why, and
+    /// its work never runs.
+    #[test]
+    fn a_read_that_waits_past_its_budget_for_a_slot_is_refused() {
+        let evaluations = counter();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let evaluations = Arc::clone(&evaluations);
+            std::thread::spawn(move || {
+                run(
+                    "q",
+                    false,
+                    Duration::from_secs(30),
+                    &evaluations,
+                    1,
+                    None,
+                    move |_| {
+                        let _ = held.recv();
+                        Ok(())
+                    },
+                )
+            })
+        };
+        let wait = Instant::now();
+        while evaluations.running() == 0 {
+            assert!(wait.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let ran = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&ran);
+        let start = Instant::now();
+        let refused = run(
+            "q",
+            false,
+            Duration::from_millis(50),
+            &evaluations,
+            1,
+            None,
+            move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(start.elapsed() >= Duration::from_millis(50), "it waited");
+        assert!(
+            matches!(&refused, Error::Unavailable(m) if m.contains("the most it runs at once is 1")
+                && m.contains("50 ms")),
+            "{refused}"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "the refused work never ran");
+        assert_eq!(evaluations.overdue(), 0, "waiting is not overdue");
+        release.send(()).unwrap();
+        holder.join().unwrap().unwrap();
+        assert_eq!(evaluations.running(), 0);
     }
 
     #[test]
@@ -1792,7 +2077,7 @@ mod tests {
             );
         });
         assert!(caught.is_err());
-        assert_eq!(overdue.load(Ordering::SeqCst), 0);
+        assert_eq!(overdue.overdue(), 0);
     }
 
     /// ★ The deterministic half of ledger #1127 (`tests/post_bulk_read.rs` measures the
@@ -1900,11 +2185,11 @@ mod tests {
             matches!(&err, Error::Timeout(m) if m.contains("Nothing was written")),
             "{err}"
         );
-        assert_eq!(overdue.load(Ordering::SeqCst), 1);
+        assert_eq!(overdue.overdue(), 1);
         release.send(()).unwrap();
         blocker.join().unwrap().unwrap();
         let wait = Instant::now();
-        while overdue.load(Ordering::SeqCst) != 0 {
+        while overdue.overdue() != 0 {
             assert!(wait.elapsed() < Duration::from_secs(5));
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1938,7 +2223,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, 7);
-        assert_eq!(overdue.load(Ordering::SeqCst), 0);
+        assert_eq!(overdue.overdue(), 0);
     }
 
     #[test]

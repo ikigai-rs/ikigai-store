@@ -248,9 +248,12 @@ pub struct DurableStore {
     budget: TimeBudget,
     /// How large a SPARQL answer may be — see [`with_answer_budget`](Self::with_answer_budget).
     answer: AnswerBudget,
-    /// How many evaluations are still running after their callers gave up, shared by every
-    /// clone — see [`overdue_evaluations`](Self::overdue_evaluations).
-    overdue: Arc<AtomicUsize>,
+    /// The reads in flight and the evaluations still running after their callers gave up,
+    /// shared by every clone — see [`overdue_evaluations`](Self::overdue_evaluations).
+    evaluations: Arc<crate::budget::Evaluations>,
+    /// The most bytes a document `urn:iki:store:load` takes may hold, and the most bytes of
+    /// terms its statements may spell out — see [`with_max_load_bytes`](Self::with_max_load_bytes).
+    max_load_bytes: usize,
     /// The one thread every update on this store runs on, shared by every clone (ledger
     /// #1127): a write committed on a freshly spawned thread degrades RocksDB's memtable. See
     /// `budget::Writer`.
@@ -299,7 +302,8 @@ impl DurableStore {
             refused: false,
             budget: TimeBudget::default(),
             answer: AnswerBudget::default(),
-            overdue: Arc::new(AtomicUsize::new(0)),
+            evaluations: Arc::default(),
+            max_load_bytes: crate::limits::MAX_LOAD_BYTES,
             writer: Arc::default(),
         })
     }
@@ -353,7 +357,8 @@ impl DurableStore {
             refused: false,
             budget: TimeBudget::default(),
             answer: AnswerBudget::default(),
-            overdue: Arc::new(AtomicUsize::new(0)),
+            evaluations: Arc::default(),
+            max_load_bytes: crate::limits::MAX_LOAD_BYTES,
             writer: Arc::default(),
         })
     }
@@ -726,15 +731,43 @@ impl DurableStore {
         self.answer
     }
 
+    /// Set the most bytes a document `urn:iki:store:load` takes may hold, and the most bytes
+    /// of terms its statements may spell out once parsed (builder; ledger #1428). Every clone
+    /// made AFTER this carries it, so call it before [`space`](crate::space). The default is
+    /// [`MAX_LOAD_BYTES`](crate::limits::MAX_LOAD_BYTES); [`crate::limits`] says what it
+    /// bounds and why there are two halves. At least 1.
+    ///
+    /// ```
+    /// use ikigai_store::DurableStore;
+    ///
+    /// // A restore of a large dataset through the load door asks for more than the default.
+    /// let store = DurableStore::in_memory()?.with_max_load_bytes(1 << 30);
+    /// assert_eq!(store.max_load_bytes(), 1 << 30);
+    /// # Ok::<(), ikigai_core::Error>(())
+    /// ```
+    pub fn with_max_load_bytes(mut self, bytes: usize) -> Self {
+        self.max_load_bytes = bytes.max(1);
+        self
+    }
+
+    /// The most bytes a loaded document may hold, and may spell out. See
+    /// [`with_max_load_bytes`](Self::with_max_load_bytes).
+    pub fn max_load_bytes(&self) -> usize {
+        self.max_load_bytes
+    }
+
     /// How many SPARQL evaluations over this dataset are still running after their callers
     /// were answered with a timeout, right now.
     ///
     /// Usually 0, and back to 0 within milliseconds of a timeout: oxigraph stops when it
     /// next reads a quad. A number that STAYS up is a query shape oxigraph cannot stop
-    /// partway (see [`crate::budget`]), holding a core each; at
-    /// [`TimeBudget::max_overdue`] the store refuses new evaluations until one ends.
+    /// partway (see [`crate::budget`]), holding a core each. At most
+    /// [`TimeBudget::max_overdue`] reads run at once, so at most that many overdue reads hold
+    /// cores; updates count here too (the one on the writer thread, and any whose callers gave
+    /// up while they waited in its queue, which hold no core). At `max_overdue` overdue the
+    /// store refuses new evaluations until one ends (ledger #1427).
     pub fn overdue_evaluations(&self) -> usize {
-        self.overdue.load(Ordering::SeqCst)
+        self.evaluations.overdue()
     }
 
     /// Run one evaluation of `text` (an update when `write`) for a caller holding
@@ -758,7 +791,7 @@ impl DurableStore {
             text,
             write,
             budget,
-            &self.overdue,
+            &self.evaluations,
             self.budget.max_overdue(),
             write.then_some(&*self.writer),
             work,

@@ -81,6 +81,38 @@
 //! so `\u0028` is a `(`. oxigraph does not enable it, but feature unification is global and
 //! a sibling could; when the text contains such an escape, the scan also runs over the
 //! unescaped text and refuses on either.
+//!
+//! # A loaded DOCUMENT is bounded too (ledger #1428)
+//!
+//! `urn:iki:store:load` parses RDF, not SPARQL, so none of the above reaches it; its depth bound
+//! is [`crate::depth`]'s. Three more bounds, all checked before the store's writer is asked for
+//! anything, so a refused document never waits behind another write or holds one up:
+//!
+//! - **Bytes.** A document over [`MAX_LOAD_BYTES`] (or the host's bound,
+//!   [`DurableStore::with_max_load_bytes`](crate::DurableStore::with_max_load_bytes)) is
+//!   refused, naming the bound.
+//! - **No XML entities.** oxrdfxml resolves an `<!ENTITY>` value against the entities declared
+//!   before it AT DECLARATION TIME and stores it expanded, so a chain of entities each naming
+//!   the last a few times ("billion laughs") turns ~500 bytes into megabytes and ~700 into
+//!   gigabytes. An RDF/XML document that declares any entity is refused; one with a DOCTYPE
+//!   that declares none still loads.
+//! - **What the statements spell out.** The same shape needs no entities: a Turtle or TriG
+//!   `@prefix` or `@base`, an RDF/XML namespace or `xml:base`, and the door's own `graph`
+//!   argument are each written once and copied into every statement that uses them, so a
+//!   prefix IRI of 128 KB and a thousand three-name statements spell out ~400 MB of terms, and
+//!   the copying alone holds a core for as long as the document is long. So the document is
+//!   parsed once WITHOUT storing anything, counting the bytes of every term its statements
+//!   produce (IRIs, literal values, non-plain datatypes, language tags, blank-node labels, the
+//!   graph name), and refused past the same bound: the rule a decoder follows, to count what
+//!   it PRODUCES, not what it reads (ledger #1331). N-Triples and N-Quads write every term out
+//!   in full, so what they produce never exceeds what they carry; a restore of a whole dataset
+//!   as N-Quads (gonk's, 84 MB on 2026-10-13) passes on the byte bound alone.
+//!
+//! ⚠ **The document is parsed twice.** The counting pass stores nothing, and the load parses
+//! again on the writer to store it. Holding the parsed statements between the two instead
+//! would keep a document's whole expansion in memory per concurrent caller, where the writer
+//! used to parse one document at a time; a second parse of a document that passed costs a
+//! fraction of the insert.
 
 use crate::depth::MAX_RDF_NESTING;
 use ikigai_core::{Error, Result};
@@ -92,6 +124,12 @@ use ikigai_core::{Error, Result};
 /// 20,000 of them, and `VALUES` and `INSERT DATA` recurse not at all (measured to 40,000
 /// entries on a 2 MiB thread). What this bounds is the stack [`on_sparql_stack`] may need.
 pub const MAX_SPARQL_BYTES: usize = 1 << 20;
+
+/// The most bytes a document `urn:iki:store:load` takes may hold, and the most bytes of
+/// terms its statements may spell out once parsed, unless the host sets another bound
+/// ([`DurableStore::with_max_load_bytes`](crate::DurableStore::with_max_load_bytes)):
+/// **256 MiB** (ledger #1428).
+pub const MAX_LOAD_BYTES: usize = 256 << 20;
 
 /// The deepest a SPARQL query or update may nest `(`, `{` and `[` — with a run of `!`
 /// counting one level for each — **64**. Triple terms (`<<( … )>>`, `<< … >>`) are counted
@@ -650,6 +688,113 @@ fn could_be_iri(text: &[u8], at: usize) -> bool {
         }
     }
     false
+}
+
+/// Refuse an RDF document `urn:iki:store:load` was handed, before the store's writer is asked
+/// for anything (ledger #1428): over `limit` bytes; RDF/XML declaring an XML entity; nesting
+/// triple terms past [`MAX_RDF_NESTING`]; not parsing; or spelling out more than `limit` bytes
+/// of terms. `parser` is the one the load will use (its format, and the graph it puts a
+/// document's default graph in). See the module docs.
+pub(crate) fn check_load(
+    document: &[u8],
+    parser: &oxigraph::io::RdfParser,
+    limit: usize,
+    label: &str,
+    arg: &str,
+) -> Result<()> {
+    use oxigraph::io::RdfFormat;
+
+    let refuse = |detail: String| Error::InvalidArgument {
+        name: arg.to_string(),
+        detail,
+    };
+    if document.len() > limit {
+        return Err(refuse(format!(
+            "this document is {} bytes, and this store loads none over {limit} \
+             (MAX_LOAD_BYTES, or the bound its host set) before parsing it. Split it into \
+             several loads, or ask the host for a larger bound. Nothing was loaded",
+            document.len()
+        )));
+    }
+    let format = parser.format();
+    if format == RdfFormat::RdfXml && declares_an_entity(document) {
+        return Err(refuse(
+            "this RDF/XML document declares an XML entity (`<!ENTITY`), and this store loads \
+             none: the RDF/XML parser expands an entity's value against the entities declared \
+             before it, so a few hundred bytes of declarations can expand to gigabytes. Write \
+             the text out in full, or use another syntax. Nothing was loaded"
+                .to_string(),
+        ));
+    }
+    crate::depth::check_rdf_nesting(document, format, arg)?;
+    let mut produced = 0usize;
+    for quad in parser.clone().for_slice(document) {
+        let quad = quad.map_err(|e| refuse(format!("parsing {label}: {e}")))?;
+        produced = produced
+            .saturating_add(term_bytes(quad.subject.as_ref().into()))
+            .saturating_add(quad.predicate.as_str().len())
+            .saturating_add(term_bytes(quad.object.as_ref()))
+            .saturating_add(match quad.graph_name.as_ref() {
+                oxigraph::model::GraphNameRef::NamedNode(n) => n.as_str().len(),
+                oxigraph::model::GraphNameRef::BlankNode(b) => b.as_str().len(),
+                oxigraph::model::GraphNameRef::DefaultGraph => 0,
+            });
+        if produced > limit {
+            return Err(refuse(format!(
+                "this {} document's statements expand past {limit} bytes of terms (MAX_LOAD_BYTES, \
+                 or the bound its host set), though the document is {} bytes: a prefix, a base \
+                 IRI, a namespace or the `graph` argument is written once and copied into every \
+                 statement that uses it. Use shorter names, or split the document. Nothing was \
+                 loaded",
+                format.name(),
+                document.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether an RDF/XML document declares an XML entity: `<!ENTITY` anywhere, in any case.
+///
+/// ★ Not a reading of the markup, on purpose. oxrdfxml takes a declaration only from text that
+/// follows the bytes `<!ENTITY` inside a DOCTYPE (`parse_doctype` splits the DOCTYPE's text at
+/// `<` and strips the prefix `!ENTITY`), and the depth scan already refuses a document that is
+/// not UTF-8, so a document without those bytes declares nothing whatever a lexer would make
+/// of it. A scan that agreed with quick-xml about where a DOCTYPE starts and ends would be one
+/// more reading to keep in step. The cost is a document that merely MENTIONS `<!ENTITY` in a
+/// comment or a CDATA section, which is refused too.
+fn declares_an_entity(document: &[u8]) -> bool {
+    const DECLARATION: &[u8] = b"<!entity";
+    document
+        .windows(DECLARATION.len())
+        .any(|window| window.eq_ignore_ascii_case(DECLARATION))
+}
+
+/// The bytes of one term's text as the parser produced it: an IRI, a blank node's label, or a
+/// literal's value with its language tag, or with its datatype IRI unless that is `xsd:string`.
+fn term_bytes(term: oxigraph::model::TermRef<'_>) -> usize {
+    use oxigraph::model::vocab::xsd;
+    use oxigraph::model::TermRef;
+    if let TermRef::NamedNode(n) = term {
+        return n.as_str().len();
+    }
+    if let TermRef::BlankNode(b) = term {
+        return b.as_str().len();
+    }
+    if let TermRef::Literal(l) = term {
+        let tag = l.language().map_or(0, str::len);
+        // A simple or language-tagged literal's datatype is a constant, not text it carries.
+        let datatype = if l.language().is_some() || l.datatype() == xsd::STRING {
+            0
+        } else {
+            l.datatype().as_str().len()
+        };
+        return l.value().len() + tag + datatype;
+    }
+    // An RDF 1.2 triple term, a variant that exists only in a build with `rdf-12` (see the gate
+    // in `Cargo.toml`), so it is not named: its N-Triples text, which writing recurses once a
+    // level, bounded by the depth check above.
+    term.to_string().len()
 }
 
 #[cfg(test)]
