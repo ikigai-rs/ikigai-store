@@ -984,8 +984,11 @@ let store = DurableStore::open(&config.path)?
   caller's — instead of, or as well as, setting the base.
 
 The capability is the channel because it is the one thing a host already stamps per door
-that a caller cannot forge, and it follows a request down its sub-requests — a handler that
-queries the store on its caller's behalf runs on its caller's budget. (`ikigai-sparql` puts
+that a caller cannot forge, and it follows a request down its sub-requests — a handler
+querying on its caller's behalf runs on its caller's budget, except an ikigai-script run: its
+capability is narrowed to the script's authority, so a runner's budget grant never follows it
+on its own; a script DECLARES a budget at publish, and its run gets the least of that, its
+publisher's grant at publish, the host's ceiling and the runner's own grant. (`ikigai-sparql` puts
 its ceiling on the space instead; a store cannot, because two spaces over one store forfeit
 caching, so a per-space ceiling could not tell two doors on one kernel apart.) ★ **A caller
 cannot raise its own budget**: attenuating a capability only removes grants, removing a
@@ -1027,8 +1030,8 @@ use ikigai_store::budget::{check_query, EvaluationBudget, TimeBudget};
 let budget = EvaluationBudget::new(TimeBudget::new(Duration::from_secs(2)));
 
 // Per request: the caller's capability chooses the budget as the doors choose it (a
-// `urn:cap:store:budget:<ms>` grant raises it, root gets the ceiling) and `requested` (the
-// consumer's own `budget=`, if it has one) can only lower it.
+// `urn:cap:store:budget:<ms>` grant raises it, root gets the ceiling) and `requested` (an
+// argument of the consumer's own, if it has one) can only lower it.
 let matched = budget.run(&text.clone(), inv.capability, None, move |token| {
     let query = spargebra::SparqlParser::new().parse_query(&text)/* … */;
     check_query(&query, "match")?;               // the algebra bounds still apply
@@ -1051,6 +1054,11 @@ let matched = budget.run(&text.clone(), inv.capability, None, move |token| {
   deadline without a hook inside oxigraph's loops: a burst of such templates can make SPARQL
   (only SPARQL, only through that budget) unavailable until one finishes, rather than let each
   pin another core.
+- **A timeout's advice names only an argument your caller can pass** (0.2.20, ledger #1383).
+  The doors tell their caller that "a request's `budget=` can only lower it", because they
+  take `budget=`; a consumer's sentence leaves that clause out by default, and
+  `EvaluationBudget::with_argument(Some("match_budget"))` names the consumer's own argument
+  instead (the one whose value it hands `run` as `requested`). Clones keep it.
 
 ## ★ Every answer has a size bound, and past it is refused (ledger #970)
 
