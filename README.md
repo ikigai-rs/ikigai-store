@@ -811,6 +811,36 @@ reads as code is skipped. That lesson is `ikigai-shacl`'s (PR 17): a scan that r
 instead of the lexer could be bypassed. The Turtle scan is a copy of that crate's, and ledger
 #976 is where the two fold into one.
 
+## ★ A loaded document is bounded in size and in what it expands to (ledger #1428)
+
+Through 0.2.20 depth was the load door's only bound. It took a document of any length, and
+oxrdfxml resolves an `<!ENTITY>` value against the entities declared before it **at declaration
+time**, so a "billion laughs" chain of eleven entities, four references each, made a 525-byte
+RDF/XML document expand one reference to ~3 MB, and ~16 levels (~680 bytes) to ~3 GB — parsed on
+the store's writer thread, under the write lock. The same review found the same shape in the
+other syntaxes without any entities: a Turtle or TriG `@prefix` or `@base`, an RDF/XML namespace
+or `xml:base`, and the door's own `graph` argument are each written once and copied into every
+statement that uses them. N-Triples and N-Quads write every term out in full, and do not amplify.
+
+So before the store's writer is asked for anything (`limits::check_load`), a document is refused
+as an `InvalidArgument` on `content`, with nothing loaded, when it is
+
+- over **`limits::MAX_LOAD_BYTES` (256 MiB)**, or the bound its host set with
+  `DurableStore::with_max_load_bytes`;
+- RDF/XML that declares an XML entity (`<!ENTITY`, in any case, anywhere: oxrdfxml takes a
+  declaration only from those bytes, so the search needs no reading of the markup); a DOCTYPE
+  that declares none still loads;
+- nested past the depth bound above, or not parseable;
+- or when its statements spell out more than the same bound in bytes of terms: it is parsed
+  once without storing anything, counting what the parser PRODUCES (ledger #1331's rule).
+
+The document is parsed again on the writer to store it: keeping the statements from the first
+pass would hold a document's whole expansion in memory per concurrent caller, where the writer
+parses one at a time. A whole-dataset restore as N-Quads passes on the byte bound alone (gonk's
+was 84 MB on 2026-10-13, a third of the default); a host restoring a larger one sets a larger
+bound. `tests/load_bounds.rs` pins each refusal, and that a refusal is answered while another
+write holds the writer.
+
 **SPARQL `LOAD <url>` is refused** at both update doors, as an `InvalidArgument` on `content`,
 before evaluation. oxigraph fetches and parses the document itself, with nothing between the two
 where a scan could stand: with `oxigraph/http-client` on (it is, in `ikigai-cli`'s graph), a
@@ -933,6 +963,13 @@ two into one shared module):
    step) or `budget::MAX_ALGEBRA_NODES` (**1024** operators in the whole query or update;
    `VALUES` rows, constant `IN` members and `INSERT DATA` quads cost nothing). The largest
    join the ecosystem runs has 11 patterns; the worst plan inside both bounds is ~125 ms.
+   ★ **A join's operands are counted the way the planner sees them** (ledger #1426): it erases
+   every `GRAPH <g> { … }` and `GRAPH ?g { … }` wrapper and flattens nested groups before it
+   orders a join, so their patterns count toward the ENCLOSING join. Through 0.2.20 a `GRAPH`
+   block counted as one operand, and six blocks of 31 patterns planned as one join of 186:
+   3.8 s on an empty store, uncancellable, on the writer thread when it was an update's
+   `WHERE`. `UNION`, `OPTIONAL` and `MINUS` branches are joins of their own
+   (`tests/join_graph_blocks.rs`).
 2. **A deadline, and the caller is answered at it**, with a typed `Error::Timeout` naming
    the budget — never later, never a partial answer. The evaluation is cancelled, and this
    crate's serializers check the token between rows. **An update that runs out of time
@@ -940,10 +977,17 @@ two into one shared module):
    waiting, under the lock the caller takes to give up.
 3. **What still cannot be stopped is counted and capped.** Inside the bounds, an aggregate
    or join over rows already in memory (`COUNT(*)` over a cross product) still ignores the
-   token. Such an evaluation is counted as overdue (`DurableStore::overdue_evaluations`),
-   and while `TimeBudget::max_overdue` are overdue (default: a quarter of the machine's
-   cores, at least one) every new evaluation is refused with a transient
-   `Error::Unavailable`, so one store's callers cannot pin more cores than that.
+   token. Such an evaluation is counted as overdue (`DurableStore::overdue_evaluations`).
+   ★ **The cap is on reads IN FLIGHT** (ledger #1427): a read takes one of
+   `TimeBudget::max_overdue` slots (default: a quarter of the machine's cores, at least one)
+   before its thread starts and gives it back when the thread ends, so at most that many reads
+   evaluate at once, and so at most that many can outlive their callers. A read that finds
+   every slot taken waits for one within its own budget, and is refused with a transient
+   `Error::Unavailable` if none comes free; while the slots are filled by OVERDUE
+   evaluations, a new one is refused at once. Updates run on the store's one writer thread,
+   so they hold at most one more core. Through 0.2.20 the cap was checked against the overdue
+   count alone, which rises only at a timeout, so eight requests arriving together at a cap
+   of 1 all started and left eight cores pinned (`tests/overdue_cap_in_flight.rs`).
 
 `tests/sparql_time_budget.rs` pins all of it, including waiting for an abandoned update's
 worker to end and checking the store is unchanged, at both update doors.

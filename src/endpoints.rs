@@ -1477,11 +1477,6 @@ impl Endpoint for LoadEndpoint {
                             LOAD_FORMATS.join(", ")
                         ),
                     })?;
-                // ★ Bounded in triple-term depth before the parser sees a byte (ledger #992):
-                // with RDF 1.2 on, ~1000 levels of `<<( … )>>` aborted the host from here, on
-                // the caller's thread and under the write lock. Scanned outside the lock, in
-                // the lexing mode of the parser below (strict, by format). See `src/depth.rs`.
-                crate::depth::check_rdf_nesting(bytes, format, "content")?;
                 let mut parser = RdfParser::from_format(format);
                 // ⚠ A `graph` that is present but unreadable is refused: read as absent, it
                 // would load the document into the DEFAULT graph (ledger #751).
@@ -1492,6 +1487,19 @@ impl Endpoint for LoadEndpoint {
                     })?;
                     parser = parser.with_default_graph(GraphNameRef::from(name));
                 }
+                // ★ Bounded before the writer is asked for anything (ledger #1428), so a
+                // refused document neither waits behind another write nor holds one up: its
+                // bytes, an RDF/XML entity declaration (refused: "billion laughs"), triple-term
+                // depth (ledger #992: ~1000 levels of `<<( … )>>` aborted the host, scanned in
+                // the lexing mode of the parser above, see `src/depth.rs`), a parse that fails,
+                // and what its statements expand to. `src/limits.rs` has the reasons.
+                crate::limits::check_load(
+                    bytes,
+                    &parser,
+                    self.store.max_load_bytes(),
+                    media,
+                    "content",
+                )?;
                 // ★ Parsed and committed on the store's writer thread under its write lock
                 // (ledger #1209), as every other write door commits: committed on the
                 // caller's thread, a host loading from a thread per connection drew the same
@@ -1499,7 +1507,9 @@ impl Endpoint for LoadEndpoint {
                 // 4.8x to 14.8x slower reads after 750 loads, against 1.0x through the
                 // update doors), and a `SharedWriter` closure that asked for a load waited
                 // for itself. The second now gets a refusal saying so. The document is copied
-                // to cross the thread, once; parsing it costs far more.
+                // to cross the thread, once; parsing it costs far more. It parses here a second
+                // time, having passed every bound above (see `src/limits.rs` for why the parsed
+                // statements are not kept from the first).
                 let document = bytes.to_vec();
                 let label = media.to_string();
                 let (before, after) = self.store.on_writer(move |store| {
@@ -1536,8 +1546,10 @@ impl Endpoint for LoadEndpoint {
                 "Parse an RDF document and add its statements to the store. The kernel \
                  door that replaces the old `load_turtle` side entrance: this one is \
                  capability-gated and cuts the golden thread `urn:iki:store:load`. A \
-                 document nesting RDF 1.2 triple terms deeper than 64 is refused before \
-                 it is parsed.",
+                 document nesting RDF 1.2 triple terms deeper than 64, an RDF/XML document \
+                 declaring an XML entity, and a document over the store's load bound \
+                 (256 MiB unless the host sets another), or whose statements spell out more \
+                 than that many bytes of terms, are refused before anything is stored.",
             )
             .verb(Verb::Sink)
             .verb(Verb::Meta)
