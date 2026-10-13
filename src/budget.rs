@@ -470,7 +470,11 @@ impl EvaluationBudget {
     ///     }
     /// };
     ///
-    /// let budget = EvaluationBudget::new(TimeBudget::new(Duration::from_millis(50)));
+    /// // Room for both timeouts below to be overdue at once, so the second is not refused
+    /// // while the first one's released worker is still ending.
+    /// let budget = EvaluationBudget::new(
+    ///     TimeBudget::new(Duration::from_millis(50)).with_max_overdue(4),
+    /// );
     /// // By default the sentence names no argument: this consumer takes none.
     /// assert!(timeout(&budget).ends_with(
     ///     "The budget is set by the host. Narrow the query — fewer joins, a bound subject, \

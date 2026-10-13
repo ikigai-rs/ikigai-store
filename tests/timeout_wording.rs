@@ -35,6 +35,16 @@ fn timeout_sentence(budget: &EvaluationBudget) -> String {
         },
     );
     let _ = release.send(());
+    // Wait (bounded) for the released worker to leave the overdue count, so the next call
+    // through the same budget is not refused as Unavailable at a small `max_overdue`.
+    let start = std::time::Instant::now();
+    while budget.overdue_evaluations() != 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "worker never ended"
+        );
+        std::thread::sleep(ms(5));
+    }
     match result {
         Err(Error::Timeout(message)) => message,
         other => panic!("expected a Timeout, got {other:?}"),
