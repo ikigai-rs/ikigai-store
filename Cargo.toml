@@ -275,7 +275,16 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # `EvaluationBudget::with_argument(Option<&str>)` names the consumer's argument; the default leaves the clause out. A
 # patch: additive (one public fn), the doors' sentence is unchanged (pinned by `tests/timeout_wording.rs`), and the only
 # behavior change is that wording in a consumer's timeout.
-version = "0.2.20"
+# ★ 0.2.21 fixes three audit findings (ledger #1426, #1427, #1428). A `GRAPH` block's patterns now count toward the
+# ENCLOSING join for `MAX_JOIN_OPERANDS`, as the planner flattens them (six blocks of 31 had passed as a join of 31 and
+# planned for seconds, uncancellable). The overdue cap reserves a slot when a read STARTS, so at most `max_overdue` reads
+# evaluate at once per store (a read finding every slot taken waits within its budget); through 0.2.20 concurrent
+# arrivals all started and all went overdue. `urn:iki:store:load` refuses a document over `limits::MAX_LOAD_BYTES`
+# (256 MiB, or `DurableStore::with_max_load_bytes`), RDF/XML declaring an XML entity, and a document whose statements
+# spell out more term bytes than that bound (prefix, base, namespace or `graph=` amplification), all before the writer
+# is asked. A patch: the API is additive (one constant, one builder and its accessor); the behavior changes are refusals
+# of inputs that were attacks, and reads on one store running at most `max_overdue` at a time.
+version = "0.2.21"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
