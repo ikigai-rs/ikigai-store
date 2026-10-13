@@ -197,11 +197,12 @@ pub fn cap_budget(millis: u64) -> String {
 /// number, walk and reasoning as `ikigai-sparql`'s.
 ///
 /// A join's operands are its triple patterns (a sequence path `:a/:b/:c` is parsed into one
-/// triple pattern per step), counted THROUGH every nested plain group and every `GRAPH <g>` or
-/// `GRAPH ?g` block, because the planner erases those wrappers and flattens the join before it
-/// orders it (ledger #1426); and one each for a sub-`SELECT`, a path pattern, a filtered group
-/// or anything else joined beside them. An `OPTIONAL`, `UNION` or `MINUS` side is a join of its
-/// own, counted on its own. oxigraph's greedy join
+/// triple pattern per step) and every nested group, sub-`SELECT` and path pattern joined beside
+/// them, counted as the planner will see them AFTER its normalization: a wrapper it can erase
+/// (`GRAPH`, `FILTER`, `BIND`, an `OPTIONAL`'s or `MINUS`'s left side, …) is not one operand,
+/// so its patterns count toward the enclosing join (ledger #1426, #1429; the rule is on
+/// `Cost::join`); a `UNION` branch and an `OPTIONAL` or `MINUS` right side are joins of their
+/// own. oxigraph's greedy join
 /// reordering is about cubic in this number: measured (by the `ikigai-sparql` arc), 32
 /// patterns plan in ~4 ms, 64 in ~70 ms, 100 in ~350 ms, 200 in 7 s, and 1,000 path steps in
 /// 19 s. The largest join the ecosystem runs has 11 patterns (survey, 2026-10-09). 32 rather
@@ -1611,111 +1612,175 @@ impl Cost {
         Ok(())
     }
 
+    // The walk is kept identical to ikigai-sparql's `budget.rs`, which this copies (ledger #970):
+    // change both or neither. The design is the doc comment on `join` below, copied verbatim; the
+    // one difference is the `Service` arm, which records nothing here (ikigai-sparql's records
+    // `first_service` for its egress check).
+
+    /// Walk `pattern` as a join of its own (the root of a query or an update's `WHERE`, a
+    /// `UNION` branch, the right side of an `OPTIONAL` or a `MINUS`, the inside of a
+    /// sub-`SELECT`, a `GROUP`, a `SERVICE` or an `EXISTS`), and record how wide it is.
     fn pattern(&mut self, pattern: &GraphPattern) {
-        match pattern {
-            GraphPattern::Bgp { patterns } => {
-                self.nodes += patterns.len();
-                self.widest_join = self.widest_join.max(patterns.len());
-            }
-            // ★ A `GRAPH` block is NOT one operand (ledger #1426). `sparopt` erases the
-            // wrapper before planning (`GraphPattern::from_sparql_algebra`'s `Graph` arm pushes
-            // the graph name, IRI or variable, down into each quad pattern and returns the
-            // inner pattern), and then flattens nested joins and reorders all their operands
-            // at once. So a block's patterns count toward the ENCLOSING join, as a nested
-            // join's do. Counted as one operand, six blocks of 31 patterns passed as a join of
-            // 31 and planned as one of 186: 3.8 s on an empty store, uncancellable. `UNION`,
-            // `OPTIONAL` and `MINUS` branches stay joins of their own (the `other` arm).
-            GraphPattern::Join { .. } | GraphPattern::Graph { .. } => {
-                let mut operands = 0;
-                let mut todo = vec![pattern];
-                while let Some(next) = todo.pop() {
-                    match next {
-                        GraphPattern::Join { left, right } => {
-                            self.nodes += 1;
-                            todo.push(left);
-                            todo.push(right);
-                        }
-                        GraphPattern::Graph { inner, .. } => {
-                            self.nodes += 1;
-                            todo.push(inner);
-                        }
-                        GraphPattern::Bgp { patterns } => {
-                            self.nodes += patterns.len();
-                            operands += patterns.len();
-                        }
-                        other => {
-                            operands += 1;
-                            self.pattern(other);
-                        }
-                    }
+        let operands = self.join(pattern);
+        self.widest_join = self.widest_join.max(operands);
+    }
+
+    /// How many operands `pattern` can put into the join it sits in, AS THE PLANNER WILL SEE
+    /// THEM: never fewer, and only as many more as the rule below costs.
+    ///
+    /// # What is counted, and why (ledger #964, #1426, #1429)
+    ///
+    /// oxigraph plans a query with sparopt's `Optimizer::optimize_graph_pattern`, which runs
+    /// three passes: `normalize_pattern`, then `reorder_joins`, then `push_filters`.
+    /// `reorder_joins` FLATTENS each tree of `Join`s into one list and orders it greedily, about
+    /// cubic in the list's length, and nothing in it checks a cancellation token. So the number
+    /// that must be bounded is the length of each flattened list AFTER normalization, not the
+    /// width of each group as written. Normalization erases wrappers, and an erased wrapper's
+    /// patterns join the ENCLOSING list:
+    ///
+    /// - `GRAPH <g> { … }` / `GRAPH ?g { … }` always (`from_sparql_algebra` pushes the graph
+    ///   name into each quad pattern; ledger #1426);
+    /// - a `FILTER` whose expression normalizes to a constant true (`FILTER(true)`,
+    ///   `FILTER(1)`, `FILTER(BOUND(?s))` where `?s` is always bound, …);
+    /// - an `OPTIONAL` whose right side is empty or never matches (`OPTIONAL {}`,
+    ///   `OPTIONAL { … FILTER(false) }`), which returns its left side;
+    /// - a `BIND` whose expression has no possible value (`BIND(?unbound AS ?x)`), which
+    ///   returns its inner;
+    /// - a `MINUS` whose right side never matches, which returns its left side;
+    /// - a `LATERAL` with an empty side, which returns the other side;
+    /// - an `ORDER BY` with no keys and an `OFFSET 0` with no `LIMIT`, which return their inner.
+    ///
+    /// Whether most of these erase depends on sparopt's TYPE INFERENCE over the inner pattern,
+    /// and neither `normalize_pattern` nor the type inference is public (sparopt 0.3.7; the
+    /// only public entry, `optimize_graph_pattern`, also runs `reorder_joins`, the very thing
+    /// being bounded). So the walk does not decide: **every wrapper that normalization CAN
+    /// erase is counted as erased.** A `GRAPH`, `FILTER`, `BIND`, `ORDER BY` or `OFFSET`/`LIMIT`
+    /// passes its inner's operands through to the enclosing join; an `OPTIONAL` or a `MINUS`
+    /// passes its LEFT side through, and its right side is a join of its own; a `LATERAL`
+    /// passes through the wider of its two sides. Adding wrappers one at a time did not
+    /// converge (the three in ledger #1429 were found after the fix for `GRAPH`); this rule
+    /// covers every wrapper by construction, including ones nobody has measured.
+    ///
+    /// Counting a wrapper as erased never UNDER-counts. If the wrapper survives, it is one
+    /// operand of the enclosing list and its inner is a list of its own; both are at most what
+    /// this walk adds to the enclosing join, because every pattern counts at least one operand
+    /// here (an empty group counts one, though it may vanish). The cost is an over-count: two
+    /// groups of 20 patterns each closed by a real `FILTER` are counted as one join of 40 and
+    /// refused, where the planner orders two joins of 20. Split such a query, or move a
+    /// pattern into a sub-`SELECT`.
+    ///
+    /// Never erased, so one operand each, with a join of their own inside: a sub-`SELECT`
+    /// (its `Project`), `DISTINCT`, `REDUCED`, `GROUP BY`, `UNION` (a union keeps its wrapper
+    /// even when one branch is empty), `SERVICE`, `VALUES`, and a property path that is not a
+    /// sequence (a sequence path `:a/:b/:c` is parsed into one pattern a step).
+    ///
+    /// Iterative over the join and its erasable wrappers, so a long `OPTIONAL` or `BIND` chain
+    /// is a loop, not a recursion.
+    fn join(&mut self, pattern: &GraphPattern) -> usize {
+        let mut operands = 0;
+        let mut todo = vec![pattern];
+        while let Some(next) = todo.pop() {
+            match next {
+                GraphPattern::Bgp { patterns } => {
+                    self.nodes += patterns.len();
+                    operands += patterns.len().max(1);
                 }
-                self.widest_join = self.widest_join.max(operands);
-            }
-            GraphPattern::Path { path, .. } => {
-                self.widest_join = self.widest_join.max(1);
-                self.path(path);
-            }
-            GraphPattern::LeftJoin {
-                left,
-                right,
-                expression,
-            } => {
-                self.nodes += 1;
-                self.pattern(left);
-                self.pattern(right);
-                if let Some(expression) = expression {
+                GraphPattern::Join { left, right } => {
+                    self.nodes += 1;
+                    todo.push(left);
+                    todo.push(right);
+                }
+                GraphPattern::Graph { inner, .. } | GraphPattern::Slice { inner, .. } => {
+                    self.nodes += 1;
+                    todo.push(inner);
+                }
+                GraphPattern::Filter { expr, inner } => {
+                    self.nodes += 1;
+                    self.expression(expr);
+                    todo.push(inner);
+                }
+                GraphPattern::Extend {
+                    inner, expression, ..
+                } => {
+                    self.nodes += 1;
                     self.expression(expression);
+                    todo.push(inner);
                 }
-            }
-            GraphPattern::Lateral { left, right }
-            | GraphPattern::Union { left, right }
-            | GraphPattern::Minus { left, right } => {
-                self.nodes += 1;
-                self.pattern(left);
-                self.pattern(right);
-            }
-            GraphPattern::Filter { expr, inner } => {
-                self.nodes += 1;
-                self.expression(expr);
-                self.pattern(inner);
-            }
-            GraphPattern::Extend {
-                inner, expression, ..
-            } => {
-                self.nodes += 1;
-                self.expression(expression);
-                self.pattern(inner);
-            }
-            GraphPattern::OrderBy { inner, expression } => {
-                self.nodes += 1;
-                for order in expression {
-                    match order {
-                        OrderExpression::Asc(e) | OrderExpression::Desc(e) => self.expression(e),
+                GraphPattern::OrderBy { inner, expression } => {
+                    self.nodes += 1;
+                    for order in expression {
+                        match order {
+                            OrderExpression::Asc(e) | OrderExpression::Desc(e) => {
+                                self.expression(e)
+                            }
+                        }
+                    }
+                    todo.push(inner);
+                }
+                GraphPattern::LeftJoin {
+                    left,
+                    right,
+                    expression,
+                } => {
+                    self.nodes += 1;
+                    todo.push(left);
+                    self.pattern(right);
+                    if let Some(expression) = expression {
+                        self.expression(expression);
                     }
                 }
-                self.pattern(inner);
-            }
-            GraphPattern::Group {
-                inner, aggregates, ..
-            } => {
-                self.nodes += 1;
-                for (_, aggregate) in aggregates {
-                    if let AggregateExpression::FunctionCall { expr, .. } = aggregate {
-                        self.expression(expr);
-                    }
+                GraphPattern::Minus { left, right } => {
+                    self.nodes += 1;
+                    todo.push(left);
+                    self.pattern(right);
                 }
-                self.pattern(inner);
+                GraphPattern::Lateral { left, right } => {
+                    self.nodes += 1;
+                    let left = self.join(left);
+                    let right = self.join(right);
+                    operands += left.max(right);
+                }
+                GraphPattern::Path { path, .. } => {
+                    operands += 1;
+                    self.path(path);
+                }
+                GraphPattern::Union { left, right } => {
+                    self.nodes += 1;
+                    operands += 1;
+                    self.pattern(left);
+                    self.pattern(right);
+                }
+                GraphPattern::Group {
+                    inner, aggregates, ..
+                } => {
+                    self.nodes += 1;
+                    operands += 1;
+                    for (_, aggregate) in aggregates {
+                        if let AggregateExpression::FunctionCall { expr, .. } = aggregate {
+                            self.expression(expr);
+                        }
+                    }
+                    self.pattern(inner);
+                }
+                GraphPattern::Service { inner, .. } => {
+                    self.nodes += 1;
+                    operands += 1;
+                    self.pattern(inner);
+                }
+                GraphPattern::Project { inner, .. }
+                | GraphPattern::Distinct { inner }
+                | GraphPattern::Reduced { inner } => {
+                    self.nodes += 1;
+                    operands += 1;
+                    self.pattern(inner);
+                }
+                GraphPattern::Values { .. } => {
+                    self.nodes += 1;
+                    operands += 1;
+                }
             }
-            GraphPattern::Service { inner, .. }
-            | GraphPattern::Project { inner, .. }
-            | GraphPattern::Distinct { inner }
-            | GraphPattern::Reduced { inner }
-            | GraphPattern::Slice { inner, .. } => {
-                self.nodes += 1;
-                self.pattern(inner);
-            }
-            GraphPattern::Values { .. } => self.nodes += 1,
         }
+        operands
     }
 
     fn path(&mut self, path: &PropertyPathExpression) {
@@ -2321,6 +2386,101 @@ mod tests {
             patterns(30)
         );
         assert_eq!(cost(&split).0, 30);
+    }
+
+    /// `blocks` groups of `per_block` patterns side by side in one group, each group closed
+    /// by `wrap` (with `{b}` replaced by the block's number). The shapes of ledger #1429.
+    fn wrapped_blocks(blocks: usize, per_block: usize, wrap: &str) -> String {
+        let body: String = (0..blocks)
+            .map(|b| {
+                let inner: String = (0..per_block)
+                    .map(|i| format!("?s <urn:p> ?o{b}_{i} . "))
+                    .collect();
+                format!("{{ {inner} {} }} ", wrap.replace("{b}", &b.to_string()))
+            })
+            .collect();
+        format!("SELECT * WHERE {{ {body} }}")
+    }
+
+    /// Every wrapper sparopt's normalization can ERASE before it reorders joins (ledger #1429),
+    /// each the way it is erased: a constant-true filter is dropped, a filter whose value is
+    /// decided by the inner's variable types becomes constant, an empty or never-matching
+    /// OPTIONAL returns its left side, a BIND of an unbound variable returns its inner, a
+    /// never-matching MINUS returns its left side, an empty LATERAL returns its left side.
+    const ERASED: [&str; 9] = [
+        "FILTER(true)",
+        "FILTER(1)",
+        "FILTER(!false)",
+        "FILTER(BOUND(?s))",
+        "OPTIONAL {}",
+        "OPTIONAL { ?a{b} ?p{b} ?c{b} FILTER(false) }",
+        "BIND(?unbound{b} AS ?x{b})",
+        "MINUS { ?a{b} ?p{b} ?c{b} FILTER(false) }",
+        "LATERAL {}",
+    ];
+
+    #[test]
+    fn a_wrapper_the_planner_can_erase_does_not_reset_the_join_count() {
+        // Measured in ikigai-sparql 0.2.3 (release, empty store): six blocks of 31 under
+        // FILTER(true), OPTIONAL {} or BIND(?unbound AS ?x) passed check_query as joins of 31
+        // and planned as ONE join of 186, ~4.1 s each, uncancellably. The same shapes passed
+        // this store's walk through 0.2.21. They are counted as that join.
+        for wrap in ERASED {
+            let text = wrapped_blocks(6, 31, wrap);
+            assert_eq!(cost(&text).0, 6 * 31, "{wrap}");
+            let err = query(&text).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidArgument { name, detail } if name == "query"
+                    && detail.contains("MAX_JOIN_OPERANDS")),
+                "{wrap}: {err}"
+            );
+        }
+        // Nested erasable wrappers erase all the way down.
+        let nested = format!(
+            "SELECT * WHERE {{ {{ {{ {{ {} FILTER(true) }} OPTIONAL {{}} }} BIND(?u AS ?x) }} {} }}",
+            patterns(20),
+            patterns(13)
+        );
+        assert_eq!(cost(&nested).0, 33);
+        assert!(query(&nested).is_err());
+    }
+
+    #[test]
+    fn wrappers_that_survive_normalization_are_not_over_refused_within_the_bound() {
+        // The controls from ledger #1429: a real filter and a sub-SELECT. Within the bound
+        // both are admitted, wrapped or not.
+        for wrap in [
+            "FILTER(?o{b}_0 != 1)",
+            "BIND(1 AS ?x{b})",
+            "OPTIONAL { ?s <urn:q> ?q{b} }",
+        ] {
+            let text = wrapped_blocks(2, 16, wrap);
+            assert_eq!(cost(&text).0, 32, "{wrap}");
+            query(&text).unwrap();
+        }
+        // A sub-SELECT is a Project, which the planner never erases: one operand, and its own
+        // join inside, so six of 31 are seven joins within the bound.
+        let subselects: String = (0..6)
+            .map(|b| {
+                let inner: String = (0..31)
+                    .map(|i| format!("?s <urn:p> ?o{b}_{i} . "))
+                    .collect();
+                format!("{{ SELECT * {{ {inner} }} OFFSET 0 }} ")
+            })
+            .collect();
+        let text = format!("SELECT * WHERE {{ {subselects} }}");
+        assert_eq!(cost(&text).0, 31);
+        query(&text).unwrap();
+        // UNION branches, an OPTIONAL's right side and a MINUS's right side stay joins of
+        // their own, under every wrapper.
+        let split = format!(
+            "SELECT * WHERE {{ {{ {} FILTER(true) }} OPTIONAL {{ {} FILTER(true) }} MINUS {{ {} }} }}",
+            patterns(30),
+            patterns(30),
+            patterns(30)
+        );
+        assert_eq!(cost(&split).0, 30);
+        query(&split).unwrap();
     }
 
     #[test]

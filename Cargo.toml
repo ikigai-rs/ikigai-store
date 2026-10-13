@@ -283,7 +283,11 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # (256 MiB, or `DurableStore::with_max_load_bytes`), RDF/XML declaring an XML entity, and a document whose statements
 # spell out more term bytes than that bound (prefix, base, namespace or `graph=` amplification), all before the writer
 # is asked. A patch: the API is additive (one constant, one builder and its accessor); the behavior changes are refusals
-# of inputs that were attacks, and reads on one store running at most `max_overdue` at a time.
+# of inputs that were attacks, and reads on one store running at most `max_overdue` at a time. Folded in before publish
+# (ledger #1429): the join count follows the planner's NORMALIZATION, not only `GRAPH`: every wrapper it can erase
+# (`FILTER`, `BIND`, `OPTIONAL`/`MINUS` left sides, `ORDER BY`, `OFFSET`/`LIMIT`, `LATERAL`) passes its patterns through
+# to the enclosing join, the walk ikigai-sparql's fix brought (linkeddata 91cf4f3). The cost is an over-count when such
+# a wrapper survives: two groups of 20 each closed by a real `FILTER` are now refused as a join of 40.
 version = "0.2.21"
 edition = "2021"
 license = "MIT OR Apache-2.0"

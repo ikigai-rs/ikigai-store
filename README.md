@@ -963,13 +963,20 @@ two into one shared module):
    step) or `budget::MAX_ALGEBRA_NODES` (**1024** operators in the whole query or update;
    `VALUES` rows, constant `IN` members and `INSERT DATA` quads cost nothing). The largest
    join the ecosystem runs has 11 patterns; the worst plan inside both bounds is ~125 ms.
-   ★ **A join's operands are counted the way the planner sees them** (ledger #1426): it erases
-   every `GRAPH <g> { … }` and `GRAPH ?g { … }` wrapper and flattens nested groups before it
-   orders a join, so their patterns count toward the ENCLOSING join. Through 0.2.20 a `GRAPH`
-   block counted as one operand, and six blocks of 31 patterns planned as one join of 186:
-   3.8 s on an empty store, uncancellable, on the writer thread when it was an update's
-   `WHERE`. `UNION`, `OPTIONAL` and `MINUS` branches are joins of their own
-   (`tests/join_graph_blocks.rs`).
+   ★ **A join's operands are counted the way the planner sees them after its normalization**
+   (ledger #1426, #1429): every wrapper it CAN erase (`GRAPH`, `FILTER`, `BIND`, `ORDER BY`,
+   `OFFSET`/`LIMIT`, an `OPTIONAL`'s or `MINUS`'s left side, the wider side of a `LATERAL`)
+   passes its patterns through to the ENCLOSING join, whether or not it is erased this time.
+   Through 0.2.20 a `GRAPH` block counted as one operand, and six blocks of 31 patterns planned
+   as one join of 186: 3.8 s on an empty store, uncancellable, on the writer thread when it was
+   an update's `WHERE`. The same six blocks each closed by `FILTER(true)`, `OPTIONAL {}` or
+   `BIND(?unbound AS ?x)` did the same until the rule covered every erasable wrapper. A
+   `UNION` branch, an `OPTIONAL` or `MINUS` right side and a sub-`SELECT` are joins of their
+   own. The rule never under-counts; its cost is an over-count when such a wrapper survives
+   (two groups of 20 each closed by a real `FILTER` count as one join of 40): split such a
+   query, or move a pattern into a sub-`SELECT` (`tests/join_graph_blocks.rs`,
+   `tests/join_normalized_wrappers.rs`; the rule is the doc comment on the walk's
+   `Cost::join`, kept identical to `ikigai-sparql`'s).
 2. **A deadline, and the caller is answered at it**, with a typed `Error::Timeout` naming
    the budget — never later, never a partial answer. The evaluation is cancelled, and this
    crate's serializers check the token between rows. **An update that runs out of time
