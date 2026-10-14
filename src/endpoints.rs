@@ -529,6 +529,16 @@ impl Endpoint for QueryEndpoint {
                         // `src/service.rs`): in a host with `oxigraph/http-client` on, a plain
                         // evaluator turns `SERVICE <http://…>` into an ungated request.
                         crate::service::refuse_service(&parsed, "query")?;
+                        // ★ A constant `GRAPH <iri>` outside the set is refused, not answered
+                        // empty (ledger #388). `confine` already keeps it unreachable; this is
+                        // about telling a caller who mistyped an IRI or left a graph out of
+                        // `graph=`, who otherwise gets silence that looks like an empty graph.
+                        if let Some(target) = &confined {
+                            let outside = crate::scope::graphs_outside(&parsed, target);
+                            if !outside.is_empty() {
+                                return Err(outside_refusal(&outside, target, this.form));
+                            }
+                        }
                         let mut prepared = crate::service::evaluator()
                             .with_cancellation_token(deadline.token())
                             .for_query(parsed);
@@ -640,8 +650,8 @@ impl Endpoint for QueryEndpoint {
                      every one of them. The dataset is theirs alone: `graph=\"G1 G2\"` means \
                      `FROM <G1> FROM <G2> FROM NAMED <G1> FROM NAMED <G2>`, so a bare pattern \
                      reads (and joins across) the merge of the graphs, `GRAPH ?g` binds only \
-                     them, `GRAPH <other>` matches nothing, and the store's own default graph \
-                     is unreachable. Naming a graph the caller holds no grant for is refused \
+                     them, a constant `GRAPH <other>` is refused by name rather than answered \
+                     empty, and the store's own default graph is unreachable. Naming a graph the caller holds no grant for is refused \
                      with the missing grant named, never answered over the rest. Covered — \
                      and so cached — only when every graph named is. A query whose answer is \
                      of the other family (a graph where this form answers with a result set, \
@@ -862,6 +872,40 @@ impl QueryEndpoint {
                 names.join(", "),
             ),
         }
+    }
+}
+
+/// The refusal for a scoped read whose query names constant graphs outside `graph=` (ledger
+/// #388). `InvalidArgument` on `query`, not `Denied`: holding the grant would not change the
+/// answer, because `graph=` is the dataset and the grant is only the authority to name it.
+fn outside_refusal(outside: &[NamedNode], set: &[NamedNode], form: &str) -> Error {
+    let names: Vec<String> = outside
+        .iter()
+        .map(|g| format!("<{}>", g.as_str()))
+        .collect();
+    let members: Vec<&str> = set.iter().map(NamedNode::as_str).collect();
+    Error::InvalidArgument {
+        name: "query".to_string(),
+        detail: format!(
+            "this query names {} in a `GRAPH` block, and {} not in this read's dataset, \
+             `graph={}`. `urn:iki:store:graph-{form}` reads exactly the graphs `graph=` names, \
+             so {} would match nothing; the query is refused rather than answered empty, because \
+             an empty answer to a mistyped or forgotten graph looks exactly like an empty graph. \
+             Nothing was evaluated. Correct the IRI, or add the graph to `graph=` (separated by \
+             whitespace) under a grant for it",
+            names.join(", "),
+            if outside.len() == 1 {
+                "it is"
+            } else {
+                "they are"
+            },
+            members.join(" "),
+            if outside.len() == 1 {
+                "that block"
+            } else {
+                "those blocks"
+            },
+        ),
     }
 }
 

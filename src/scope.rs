@@ -17,7 +17,8 @@
 //! - the **default graph** becomes the merge of the set — so a bare `{ ?s ?p ?o }` reads
 //!   every graph in it, and a join across them is an ordinary basic graph pattern;
 //! - the **available named graphs** become exactly the set — so `GRAPH <G1>` reads `G1`,
-//!   `GRAPH <other>` matches nothing, and `GRAPH ?g` can only bind members of the set.
+//!   `GRAPH <other>` matches nothing (and the endpoint refuses it rather than answer
+//!   empty: [`graphs_outside`]), and `GRAPH ?g` can only bind members of the set.
 //!
 //! For `graph=G` that is precisely `FROM <G> FROM NAMED <G>`, and for `graph=G1 G2` it is
 //! `FROM <G1> FROM <G2> FROM NAMED <G1> FROM NAMED <G2>` — written through the API instead
@@ -59,7 +60,7 @@
 //! | --- | --- | --- |
 //! | `{ ?s ?p ?o }` | reads `G` | the default graph *is* `G` |
 //! | `GRAPH <G> { … }` | reads `G` | `G` is in the available named graphs |
-//! | `GRAPH <other> { … }` | **matches nothing** | not in the available set; the evaluator returns an empty iterator, not an error |
+//! | `GRAPH <other> { … }` | **refused** by the endpoint | not in the available set, so the evaluator would return an empty iterator; [`graphs_outside`] finds it first and the read is refused naming it (ledger #388) |
 //! | `GRAPH ?g { … }` | binds `?g = G` only | the enumeration is the available set |
 //! | a sub-select, `FILTER EXISTS`, `MINUS`, a property path | confined | all of them resolve patterns through the same dataset |
 //! | `DESCRIBE <s>` with no pattern | reads `G` | ⚠ DESCRIBE collects from the **default graph** only — see below |
@@ -88,6 +89,9 @@ use std::collections::BTreeSet;
 use ikigai_core::{Error, Result};
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode};
 use oxigraph::sparql::PreparedSparqlQuery;
+use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
+use spargebra::term::NamedNodePattern;
+use spargebra::Query;
 
 /// The graphs a scoped read names: **non-empty, sorted, and free of duplicates**.
 ///
@@ -216,6 +220,152 @@ pub(crate) fn confine(prepared: &mut PreparedSparqlQuery, graphs: &[NamedNode]) 
 /// exactly when there were none.
 pub(crate) fn names_its_own_dataset(prepared: &PreparedSparqlQuery) -> bool {
     !prepared.dataset().is_default_dataset()
+}
+
+/// The constant `GRAPH <iri>` names in `query` that are not members of `set`, sorted and
+/// each once (ledger #388).
+///
+/// ★ **Confinement does not depend on this; telling the caller does.** [`confine`] already
+/// makes `GRAPH <outside>` unreachable, but the evaluator answers such a block with an EMPTY
+/// iterator, so a caller who mistyped an IRI, or forgot to add a graph to `graph=`, got
+/// silence: a query that looks right and answers wrong. The endpoint refuses a query for which
+/// this is non-empty, naming the graphs.
+///
+/// Only CONSTANT names are checked. `GRAPH ?g` names nothing until evaluation, and the
+/// confined dataset is what keeps it inside the set.
+///
+/// ⚠ **Fails CLOSED by construction: the walk is exhaustive over `spargebra`'s algebra**, so
+/// an algebra variant this walk does not handle is a compile error, never a pattern it
+/// silently skips (which would be the silent empty answer all over again). That is safe for
+/// the reason `budget::Cost` and `service.rs` give, and the trap that broke 0.2.2 (a match
+/// that compiled under one feature set and not another) does not apply: the only
+/// feature-gated variants in spargebra 0.4.7 are in `Function` (never matched: a call is
+/// walked by its arguments) and `GraphPattern::Lateral`, gated on `sep-0006`, which this
+/// crate's manifest enables itself. `EXISTS` is walked too, in every expression position.
+/// Recursive and bounded: it runs after `budget::check_query`, on the sized SPARQL thread.
+pub(crate) fn graphs_outside(query: &Query, set: &[NamedNode]) -> Vec<NamedNode> {
+    let pattern = match query {
+        Query::Select { pattern, .. }
+        | Query::Construct { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Ask { pattern, .. } => pattern,
+    };
+    let mut named = BTreeSet::new();
+    pattern_graphs(pattern, &mut named);
+    named
+        .into_iter()
+        .filter(|graph| !set.contains(graph))
+        .collect()
+}
+
+fn pattern_graphs(pattern: &GraphPattern, out: &mut BTreeSet<NamedNode>) {
+    match pattern {
+        GraphPattern::Graph { name, inner } => {
+            if let NamedNodePattern::NamedNode(graph) = name {
+                out.insert(graph.clone());
+            }
+            pattern_graphs(inner, out);
+        }
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
+        // A SERVICE is refused at the door before this runs; its inner pattern is walked
+        // anyway so the walk stays a statement about the algebra and not about call order.
+        GraphPattern::Service { inner, .. } => pattern_graphs(inner, out),
+        GraphPattern::Join { left, right }
+        | GraphPattern::Lateral { left, right }
+        | GraphPattern::Union { left, right }
+        | GraphPattern::Minus { left, right } => {
+            pattern_graphs(left, out);
+            pattern_graphs(right, out);
+        }
+        GraphPattern::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            pattern_graphs(left, out);
+            pattern_graphs(right, out);
+            if let Some(expression) = expression {
+                expression_graphs(expression, out);
+            }
+        }
+        GraphPattern::Filter { expr, inner } => {
+            expression_graphs(expr, out);
+            pattern_graphs(inner, out);
+        }
+        GraphPattern::Extend {
+            inner, expression, ..
+        } => {
+            expression_graphs(expression, out);
+            pattern_graphs(inner, out);
+        }
+        GraphPattern::OrderBy { inner, expression } => {
+            for order in expression {
+                match order {
+                    OrderExpression::Asc(e) | OrderExpression::Desc(e) => expression_graphs(e, out),
+                }
+            }
+            pattern_graphs(inner, out);
+        }
+        GraphPattern::Group {
+            inner, aggregates, ..
+        } => {
+            for (_, aggregate) in aggregates {
+                match aggregate {
+                    AggregateExpression::FunctionCall { expr, .. } => expression_graphs(expr, out),
+                    AggregateExpression::CountSolutions { .. } => {}
+                }
+            }
+            pattern_graphs(inner, out);
+        }
+        GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. } => pattern_graphs(inner, out),
+    }
+}
+
+fn expression_graphs(expression: &Expression, out: &mut BTreeSet<NamedNode>) {
+    match expression {
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_) => {}
+        Expression::Exists(pattern) => pattern_graphs(pattern, out),
+        Expression::In(e, members) => {
+            expression_graphs(e, out);
+            for member in members {
+                expression_graphs(member, out);
+            }
+        }
+        Expression::Coalesce(args) | Expression::FunctionCall(_, args) => {
+            for arg in args {
+                expression_graphs(arg, out);
+            }
+        }
+        Expression::If(a, b, c) => {
+            expression_graphs(a, out);
+            expression_graphs(b, out);
+            expression_graphs(c, out);
+        }
+        Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
+            expression_graphs(e, out)
+        }
+        Expression::Or(a, b)
+        | Expression::And(a, b)
+        | Expression::Equal(a, b)
+        | Expression::SameTerm(a, b)
+        | Expression::Greater(a, b)
+        | Expression::GreaterOrEqual(a, b)
+        | Expression::Less(a, b)
+        | Expression::LessOrEqual(a, b)
+        | Expression::Add(a, b)
+        | Expression::Subtract(a, b)
+        | Expression::Multiply(a, b)
+        | Expression::Divide(a, b) => {
+            expression_graphs(a, out);
+            expression_graphs(b, out);
+        }
+    }
 }
 
 #[cfg(test)]

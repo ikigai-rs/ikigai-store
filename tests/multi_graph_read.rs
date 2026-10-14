@@ -128,8 +128,14 @@ fn holding_both_grants_joins_across_both_graphs() {
         ["urn:item:1,joined"],
         "GRAPH blocks join across the set"
     );
-    // The control, and the bug as it was: one graph, the same query, nothing.
-    assert!(select(&kernel, LEDGER, &named, &cap).unwrap().is_empty());
+    // The control, and the bug as it was: one graph, the same query. It answered NOTHING
+    // through 0.2.21; since ledger #388 a `GRAPH` block naming a graph outside the set is
+    // refused, naming it, instead of answered empty.
+    let err = select(&kernel, LEDGER, &named, &cap).expect_err("BROWSE is outside the set");
+    assert!(
+        matches!(&err, Error::InvalidArgument { detail, .. } if detail.contains(&format!("<{BROWSE}>"))),
+        "{err:?}"
+    );
 }
 
 /// ★★ The rule most likely to be gotten backwards. One grant held, two graphs named: the
@@ -214,12 +220,21 @@ fn an_empty_graph_list_is_refused_by_name() {
 
 /// Rule 3 through the kernel: a set of two reaches neither the third tenant nor the
 /// store's default graph, by name or by pattern — beside the positive case in one query.
+/// Naming the third tenant outright is refused (ledger #388); a pattern that would match
+/// its data or the default graph's answers empty, because nothing names a graph to refuse.
 #[test]
 fn a_set_reaches_nothing_outside_itself() {
     let kernel = owned();
     let cap = grants(&[LEDGER, BROWSE]);
+    let named = format!("SELECT ?s WHERE {{ GRAPH <{THIRD}> {{ ?s ?p ?o }} }}");
+    assert!(
+        matches!(
+            select(&kernel, &both(), &named, &cap),
+            Err(Error::InvalidArgument { .. })
+        ),
+        "`{named}` was answered instead of refused"
+    );
     for query in [
-        format!("SELECT ?s WHERE {{ GRAPH <{THIRD}> {{ ?s ?p ?o }} }}"),
         "SELECT ?s WHERE { ?s <urn:body> \"third\" }".to_string(),
         "SELECT ?s WHERE { ?s <urn:body> \"host\" }".to_string(),
     ] {
@@ -262,19 +277,34 @@ fn a_set_reaches_nothing_outside_itself() {
 }
 
 /// Naming a graph a caller DOES hold a grant for but did not put in `graph=` is not a way
-/// around the set either: the grant is authority, the argument is the dataset.
+/// around the set either: the grant is authority, the argument is the dataset. Refused as
+/// `InvalidArgument` naming the graph, not `Denied`, since the grant is already held.
 #[test]
 fn a_held_grant_outside_the_named_set_does_not_widen_it() {
     let kernel = owned();
     let cap = grants(&[LEDGER, BROWSE, THIRD]);
-    assert!(select(
+    let err = select(
         &kernel,
         &both(),
         &format!("SELECT ?s WHERE {{ GRAPH <{THIRD}> {{ ?s ?p ?o }} }}"),
-        &cap
+        &cap,
     )
-    .unwrap()
-    .is_empty());
+    .expect_err("THIRD is outside the set");
+    assert!(
+        matches!(&err, Error::InvalidArgument { detail, .. } if detail.contains(&format!("<{THIRD}>"))),
+        "{err:?}"
+    );
+    // And with THIRD in `graph=`, the same grant reads it.
+    assert_eq!(
+        select(
+            &kernel,
+            &format!("{} {THIRD}", both()),
+            &format!("SELECT ?s WHERE {{ GRAPH <{THIRD}> {{ ?s ?p ?o }} }}"),
+            &cap
+        )
+        .unwrap(),
+        ["urn:secret:1"]
+    );
 }
 
 #[test]
