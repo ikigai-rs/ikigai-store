@@ -46,7 +46,10 @@
 //! # Ok::<_, ikigai_core::Error>(())
 //! ```
 
+use std::collections::BTreeSet;
+
 use ikigai_core::{Error, Result};
+use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
 
 /// The term types, re-exported so a consumer names ONE `Term`.
 ///
@@ -156,8 +159,11 @@ pub fn term(value: &Term) -> String {
 ///
 /// ⚠ **Every bound variable must appear in the query's projection.** `SELECT ?s WHERE
 /// { ?s ?p ?o }` cannot bind `o`; `SELECT * WHERE { ?s ?p ?o }` can, and ASK, CONSTRUCT
-/// and DESCRIBE (which have no projection to restrict) can bind any variable in the
-/// pattern. That is oxigraph's rule, it is **enforced by oxigraph**, and a binding the
+/// and DESCRIBE (which have no projection to restrict) can bind any variable in scope in
+/// the pattern. ⚠ A variable that occurs only inside `FILTER (NOT) EXISTS` or a `MINUS`'s
+/// right side is NOT in scope: `SELECT *` does not project it and ASK, CONSTRUCT and DESCRIBE
+/// refuse it, and only a SELECT naming it explicitly binds it (the binding then applies inside
+/// the `EXISTS`; ledger #149). That is oxigraph's rule, it is **enforced by oxigraph**, and a binding the
 /// query does not mention is therefore *refused* rather than silently ignored — see
 /// [`crate::endpoints`] for why refusing is the right half of that choice.
 ///
@@ -384,6 +390,163 @@ fn bad(detail: String) -> Error {
     Error::InvalidArgument {
         name: "bindings".to_string(),
         detail,
+    }
+}
+
+/// The variables of `query` that occur ONLY inside a `FILTER EXISTS` / `FILTER NOT EXISTS`
+/// or the right side of a `MINUS`, and so are not in scope in the query's own pattern (ledger
+/// #149). Only the refusal of a `bindings=` reads this.
+///
+/// Measured against oxigraph (2026-10-13): such a variable is refused as a binding under
+/// `SELECT *`, ASK, CONSTRUCT and DESCRIBE, because none of them projects an out-of-scope
+/// variable, but it is ACCEPTED when a SELECT names it explicitly, and the binding then applies
+/// inside the `EXISTS` or `MINUS`. So "write `SELECT *`" is a dead end for it and "name it in
+/// the SELECT clause" is the one fix; `tests/bindings.rs` pins all three.
+///
+/// ⚠ The walk is exhaustive over `GraphPattern` and `Expression` for the reason `service.rs`
+/// gives (their only feature-gated variant, `Lateral`, is enabled by this manifest), and reads
+/// variables only through spargebra's own `on_in_scope_variable`, never by matching
+/// `TermPattern`, whose `Triple` variant exists only when a build enables `sparql-12`: an
+/// exhaustive match there is the trap that broke 0.2.2.
+pub(crate) fn only_inside_exists_or_minus(query: &spargebra::Query) -> BTreeSet<String> {
+    use spargebra::Query;
+    let pattern = match query {
+        Query::Select { pattern, .. }
+        | Query::Construct { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Ask { pattern, .. } => pattern,
+    };
+    let mut scopes = Scopes::default();
+    scopes.pattern(pattern, false);
+    scopes.hidden.difference(&scopes.visible).cloned().collect()
+}
+
+/// The variables in scope somewhere in the query's own pattern (`visible`), and in scope
+/// somewhere inside an `EXISTS` or a `MINUS`'s right side (`hidden`).
+#[derive(Default)]
+struct Scopes {
+    visible: BTreeSet<String>,
+    hidden: BTreeSet<String>,
+}
+
+impl Scopes {
+    fn pattern(&mut self, pattern: &GraphPattern, hidden: bool) {
+        // Every node's in-scope variables, so a binder anywhere (a BGP, VALUES, BIND, GROUP,
+        // a variable GRAPH name) is seen. Quadratic in the nodes, which `budget::check_query`
+        // has already bounded, and run only on a query that carries `bindings=`.
+        let into = if hidden {
+            &mut self.hidden
+        } else {
+            &mut self.visible
+        };
+        pattern.on_in_scope_variable(|v| {
+            into.insert(v.as_str().to_string());
+        });
+        match pattern {
+            GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
+            GraphPattern::Minus { left, right } => {
+                self.pattern(left, hidden);
+                self.pattern(right, true);
+            }
+            GraphPattern::Join { left, right }
+            | GraphPattern::Lateral { left, right }
+            | GraphPattern::Union { left, right } => {
+                self.pattern(left, hidden);
+                self.pattern(right, hidden);
+            }
+            GraphPattern::LeftJoin {
+                left,
+                right,
+                expression,
+            } => {
+                self.pattern(left, hidden);
+                self.pattern(right, hidden);
+                if let Some(expression) = expression {
+                    self.expression(expression);
+                }
+            }
+            GraphPattern::Filter { expr, inner } => {
+                self.expression(expr);
+                self.pattern(inner, hidden);
+            }
+            GraphPattern::Extend {
+                inner, expression, ..
+            } => {
+                self.expression(expression);
+                self.pattern(inner, hidden);
+            }
+            GraphPattern::OrderBy { inner, expression } => {
+                for order in expression {
+                    match order {
+                        OrderExpression::Asc(e) | OrderExpression::Desc(e) => self.expression(e),
+                    }
+                }
+                self.pattern(inner, hidden);
+            }
+            GraphPattern::Group {
+                inner, aggregates, ..
+            } => {
+                for (_, aggregate) in aggregates {
+                    match aggregate {
+                        AggregateExpression::FunctionCall { expr, .. } => self.expression(expr),
+                        AggregateExpression::CountSolutions { .. } => {}
+                    }
+                }
+                self.pattern(inner, hidden);
+            }
+            GraphPattern::Graph { inner, .. }
+            | GraphPattern::Service { inner, .. }
+            | GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner }
+            | GraphPattern::Slice { inner, .. } => self.pattern(inner, hidden),
+        }
+    }
+
+    /// An expression binds nothing; only an `EXISTS` inside it matters, and that pattern is
+    /// hidden wherever the expression sits.
+    fn expression(&mut self, expression: &Expression) {
+        match expression {
+            Expression::NamedNode(_)
+            | Expression::Literal(_)
+            | Expression::Variable(_)
+            | Expression::Bound(_) => {}
+            Expression::Exists(pattern) => self.pattern(pattern, true),
+            Expression::In(e, members) => {
+                self.expression(e);
+                for member in members {
+                    self.expression(member);
+                }
+            }
+            Expression::Coalesce(args) | Expression::FunctionCall(_, args) => {
+                for arg in args {
+                    self.expression(arg);
+                }
+            }
+            Expression::If(a, b, c) => {
+                self.expression(a);
+                self.expression(b);
+                self.expression(c);
+            }
+            Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
+                self.expression(e)
+            }
+            Expression::Or(a, b)
+            | Expression::And(a, b)
+            | Expression::Equal(a, b)
+            | Expression::SameTerm(a, b)
+            | Expression::Greater(a, b)
+            | Expression::GreaterOrEqual(a, b)
+            | Expression::Less(a, b)
+            | Expression::LessOrEqual(a, b)
+            | Expression::Add(a, b)
+            | Expression::Subtract(a, b)
+            | Expression::Multiply(a, b)
+            | Expression::Divide(a, b) => {
+                self.expression(a);
+                self.expression(b);
+            }
+        }
     }
 }
 

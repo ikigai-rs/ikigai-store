@@ -150,6 +150,13 @@ the query does not mention is refused, not ignored**, so a filter you thought wa
 can never silently not be. The refusal explains the projection rule, because upstream's
 sentence does not.
 
+⚠ **Except a variable that occurs only inside `FILTER (NOT) EXISTS` or a `MINUS`'s right
+side** (ledger #149, measured). It is not in scope in the query's own pattern, so `SELECT *`
+does not project it and ASK, CONSTRUCT and DESCRIBE refuse it too. Name it explicitly
+(`SELECT ?s ?without WHERE { … FILTER NOT EXISTS { ?s :hidden ?without } }`): the binding is
+then accepted and applies inside the `NOT EXISTS`. Since 0.2.22 the refusal says exactly this
+instead of suggesting the `SELECT *` the caller already wrote.
+
 **For an update, build the terms** — `urn:iki:store:update` refuses a `bindings`
 argument rather than pretending:
 
@@ -1338,10 +1345,13 @@ over `oxrdf::Term`, plus the gate that should have caught it; see the Features s
 Nothing in the API changed. **0.2.2 should be treated as broken** wherever `oxrdf/rdf-12`
 is enabled anywhere in the build.
 
-**0.2.1 and 0.2.2 are purely additive.** 0.2.2 adds the four `urn:iki:store:graph-{select,ask,construct,describe}` IRIs and
-`urn:cap:store:read:graph:*`, closing the read half of the tenancy boundary. 0.2.1 added
+**0.2.2 is purely additive, and it carries two arcs' work: 0.2.1 was never published**
+(ledger #154; crates.io goes from 0.2.0 to 0.2.2). The read-scope arc added the four
+`urn:iki:store:graph-{select,ask,construct,describe}` IRIs and `urn:cap:store:read:graph:*`,
+closing the read half of the tenancy boundary. The arc versioned 0.2.1 had added
 `bindings=`, `ikigai_store::sparql`, `urn:iki:store:graph-update` and its capability, and
-a third golden thread. **Nothing existing changed shape in either**, so the two live
+a third golden thread, and also the exhaustive `Term` match that 0.2.3 fixed, so that code
+first shipped in 0.2.2. **Nothing existing changed shape in either**, so the two live
 consumers — `ikigai-ledger` on crates.io and `ikigai-cli` behind a feature — need no
 change at all; one that wants the new API pins `0.2.2`. Both are patches rather than a
 minor bump because in cargo's 0.x rules the second number is the breaking one, and forcing
