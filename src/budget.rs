@@ -258,12 +258,25 @@ pub fn effective_budget(requested: Option<&str>, ceiling: Duration) -> Result<Du
 
 /// How long a store's SPARQL evaluations may run, and how many may still be running after
 /// their callers gave up. See the module docs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Two budgets are equal when they allow the same: whether `max_overdue` was left at its
+/// default or set to the same number is not compared (it changes only a refusal's wording).
+#[derive(Clone, Copy, Debug)]
 pub struct TimeBudget {
     base: Duration,
     ceiling: Duration,
-    max_overdue: usize,
+    max_overdue: OverdueCap,
 }
+
+impl PartialEq for TimeBudget {
+    fn eq(&self, other: &Self) -> bool {
+        self.base == other.base
+            && self.ceiling == other.ceiling
+            && self.max_overdue.max == other.max_overdue.max
+    }
+}
+
+impl Eq for TimeBudget {}
 
 impl Default for TimeBudget {
     /// [`DEFAULT_BUDGET`], [`DEFAULT_CEILING`], and [`default_max_overdue`].
@@ -271,7 +284,10 @@ impl Default for TimeBudget {
         TimeBudget {
             base: DEFAULT_BUDGET,
             ceiling: DEFAULT_CEILING,
-            max_overdue: default_max_overdue(),
+            max_overdue: OverdueCap {
+                max: default_max_overdue(),
+                set_by_host: false,
+            },
         }
     }
 }
@@ -279,11 +295,67 @@ impl Default for TimeBudget {
 /// A quarter of this machine's available parallelism, and at least one: how many reads one
 /// store evaluates at once, and so how many cores its runaway evaluations may hold (ledger
 /// #1427; see the module docs).
+///
+/// ★ **On a small machine that is 1** (anything under 8 cores), so one evaluation oxigraph
+/// cannot stop, still running after its caller was answered, refuses every other evaluation
+/// through the same store or [`EvaluationBudget`] until it ends. A host that wants more sets
+/// it with [`TimeBudget::with_max_overdue`]; the refusal names the cap, whether it is this
+/// default, and the machine's available parallelism (ledger #1500).
 pub fn default_max_overdue() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get() / 4)
-        .unwrap_or(1)
-        .max(1)
+    available_parallelism().map_or(1, |n| (n / 4).max(1))
+}
+
+/// This machine's available parallelism, or `None` when it cannot be read.
+fn available_parallelism() -> Option<usize> {
+    std::thread::available_parallelism().ok().map(|n| n.get())
+}
+
+/// The cap on reads in flight (and so on overdue evaluations), and whether the host set it,
+/// for the refusal at the cap to say where the number came from (ledger #1500).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OverdueCap {
+    max: usize,
+    /// `false` while it is [`default_max_overdue`]'s, `true` once
+    /// [`TimeBudget::with_max_overdue`] set it (even to the same number).
+    set_by_host: bool,
+}
+
+impl OverdueCap {
+    /// A cap the host set, as [`TimeBudget::with_max_overdue`] sets one.
+    #[cfg(test)]
+    pub(crate) fn set(max: usize) -> Self {
+        OverdueCap {
+            max: max.max(1),
+            set_by_host: true,
+        }
+    }
+
+    /// The sentence a refusal at this cap ends with: the cap, where it came from, this
+    /// machine's available parallelism, and how a host raises it.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // nothing is refused on wasm
+    fn origin(&self) -> String {
+        let max = self.max;
+        let parallelism = match available_parallelism() {
+            Some(n) => n.to_string(),
+            None => "unknown".to_string(),
+        };
+        let raise = "A host raises it with `TimeBudget::with_max_overdue`, on the store \
+                     (`DurableStore::with_time_budget`) or on the `EvaluationBudget` the \
+                     evaluation ran through; each `EvaluationBudget::new` keeps a count of its \
+                     own (ledger #1500)";
+        if self.set_by_host {
+            format!(
+                "The cap of {max} was set by the host (`TimeBudget::with_max_overdue`); this \
+                 machine's available parallelism is {parallelism}. {raise}"
+            )
+        } else {
+            format!(
+                "The cap of {max} is the default: a quarter of this machine's available \
+                 parallelism ({parallelism}), and at least 1 (`budget::default_max_overdue`). \
+                 {raise}"
+            )
+        }
+    }
 }
 
 impl TimeBudget {
@@ -307,9 +379,13 @@ impl TimeBudget {
 
     /// How many reads may evaluate at once, and so how many may still be running after their
     /// callers gave up (at least 1); at that many overdue, new evaluations are refused at once.
-    /// See the module docs for what that trades (ledger #1427).
+    /// See the module docs for what that trades (ledger #1427). The default is
+    /// [`default_max_overdue`]; a refusal at the cap says which of the two it is (ledger #1500).
     pub fn with_max_overdue(mut self, n: usize) -> Self {
-        self.max_overdue = n.max(1);
+        self.max_overdue = OverdueCap {
+            max: n.max(1),
+            set_by_host: true,
+        };
         self
     }
 
@@ -325,6 +401,11 @@ impl TimeBudget {
 
     /// The cap on reads in flight, and so on overdue evaluations.
     pub fn max_overdue(&self) -> usize {
+        self.max_overdue.max
+    }
+
+    /// The cap, and whether the host set it, for the refusal at it.
+    pub(crate) fn overdue_cap(&self) -> OverdueCap {
         self.max_overdue
     }
 
@@ -388,6 +469,14 @@ impl TimeBudget {
 ///
 /// ★ **Make ONE per host (or per space) and clone it**: the clones share the overdue count,
 /// which is what caps the cores. One made per request caps nothing.
+///
+/// ★ **And each [`EvaluationBudget::new`] counts on its own, under its own cap**, apart from
+/// the store's doors and from every other consumer's budget (ledger #1500). So a consumer can
+/// state its cap rather than inherit [`default_max_overdue`], which is 1 on any machine under
+/// 8 cores: there, one evaluation oxigraph cannot stop refuses every other one through the
+/// same budget until it ends. `EvaluationBudget::new(TimeBudget::new(base).with_max_overdue(n))`
+/// lets `n` run at once, and so lets `n` cores be held by runaways; the refusal at the cap
+/// names the cap, whether it is the default, and the machine's available parallelism.
 ///
 /// The budget a request gets is chosen as the store's doors choose it: the
 /// [`TimeBudget`]'s base, raised by a `urn:cap:store:budget:<ms>` grant ([`cap_budget`]) the
@@ -552,7 +641,7 @@ impl EvaluationBudget {
         on_its_own_thread(
             text,
             &self.evaluations,
-            self.budget.max_overdue(),
+            self.budget.overdue_cap(),
             None,
             deadline,
             move |deadline| work(&deadline.token),
@@ -672,7 +761,7 @@ pub(crate) fn run<T, F>(
     write: bool,
     budget: Duration,
     evaluations: &Arc<Evaluations>,
-    max_overdue: usize,
+    max_overdue: OverdueCap,
     writer: Option<&Writer>,
     work: F,
 ) -> Result<T>
@@ -865,7 +954,7 @@ impl Writer {
 fn on_its_own_thread<T, F>(
     text: &str,
     evaluations: &Arc<Evaluations>,
-    max_overdue: usize,
+    max_overdue: OverdueCap,
     writer: Option<&Writer>,
     deadline: Deadline,
     work: F,
@@ -881,7 +970,7 @@ where
 fn on_its_own_thread<T, F>(
     text: &str,
     evaluations: &Arc<Evaluations>,
-    max_overdue: usize,
+    max_overdue: OverdueCap,
     writer: Option<&Writer>,
     deadline: Deadline,
     work: F,
@@ -898,10 +987,10 @@ where
     // runs on the store's one writer thread, which bounds updates to one core already, so it
     // takes no slot; it is still refused while the cap is filled by overdue work.
     let slot = if writer.is_none() {
-        evaluations.reserve(max_overdue, budget)?;
+        evaluations.reserve(&max_overdue, budget)?;
         true
     } else {
-        evaluations.refuse_at_the_cap(max_overdue)?;
+        evaluations.refuse_at_the_cap(&max_overdue)?;
         false
     };
     // What is left of the caller's budget after waiting for a slot: the wait counts, as an
@@ -1037,10 +1126,10 @@ impl Evaluations {
 
     /// Refuse at once while `max` evaluations are overdue.
     #[cfg(not(target_family = "wasm"))]
-    fn refuse_at_the_cap(&self, max: usize) -> Result<()> {
+    fn refuse_at_the_cap(&self, cap: &OverdueCap) -> Result<()> {
         let overdue = self.counts().overdue;
-        if overdue >= max {
-            return Err(at_the_cap(overdue, max));
+        if overdue >= cap.max {
+            return Err(at_the_cap(overdue, cap));
         }
         Ok(())
     }
@@ -1048,12 +1137,13 @@ impl Evaluations {
     /// Take a slot for a read, waiting at most `budget` for one. Refused at once while `max`
     /// evaluations are overdue, and when no slot came free within the budget.
     #[cfg(not(target_family = "wasm"))]
-    fn reserve(&self, max: usize, budget: Duration) -> Result<()> {
+    fn reserve(&self, cap: &OverdueCap, budget: Duration) -> Result<()> {
+        let max = cap.max;
         let until = std::time::Instant::now() + budget;
         let mut counts = self.counts();
         loop {
             if counts.overdue >= max {
-                return Err(at_the_cap(counts.overdue, max));
+                return Err(at_the_cap(counts.overdue, cap));
             }
             if counts.running < max {
                 counts.running += 1;
@@ -1065,9 +1155,10 @@ impl Evaluations {
                     "{} SPARQL evaluations are running on this store, and the most it runs at \
                      once is {max}, so that work oxigraph cannot stop partway can hold no more \
                      than that many cores; none ended within this request's time budget of {} \
-                     ms. Retry shortly",
+                     ms. Retry shortly. {}",
                     counts.running,
-                    budget.as_millis()
+                    budget.as_millis(),
+                    cap.origin()
                 )));
             }
             counts = self
@@ -1086,15 +1177,20 @@ impl Evaluations {
     }
 }
 
-/// The refusal while `max` evaluations are overdue. Its wording is a contract consumers test
-/// ("the most it allows is", "still running").
+/// The refusal while `cap.max` evaluations are overdue. Its wording is a contract consumers
+/// test ("the most it allows is", "still running"), and it ends with [`OverdueCap::origin`]:
+/// the cap, whether it is the default, the machine's available parallelism and how a host
+/// raises it, because the same refusal at a default of 1 on a 4-core runner and of 4 on an
+/// 18-core laptop reads like a different failure (ledger #1500).
 #[cfg(not(target_family = "wasm"))]
-fn at_the_cap(overdue: usize, max: usize) -> Error {
+fn at_the_cap(overdue: usize, cap: &OverdueCap) -> Error {
     Error::Unavailable(format!(
         "{overdue} SPARQL evaluations on this store are still running after their callers' \
-         time budgets ran out (the most it allows is {max}); oxigraph cannot always stop one \
+         time budgets ran out (the most it allows is {}); oxigraph cannot always stop one \
          partway, so new ones are refused until one finishes, rather than letting each request \
-         hold another core. Retry shortly"
+         hold another core. Retry shortly. {}",
+        cap.max,
+        cap.origin()
     ))
 }
 
@@ -1986,7 +2082,7 @@ mod tests {
             false,
             Duration::from_secs(5),
             &overdue,
-            1,
+            OverdueCap::set(1),
             None,
             |_| Ok(7),
         )
@@ -2004,7 +2100,7 @@ mod tests {
             false,
             Duration::from_millis(100),
             &overdue,
-            4,
+            OverdueCap::set(4),
             None,
             |deadline| {
                 // Cooperative work: stops when told.
@@ -2041,7 +2137,7 @@ mod tests {
             false,
             Duration::from_millis(50),
             &overdue,
-            1,
+            OverdueCap::set(1),
             None,
             move |_| {
                 let _ = held.recv();
@@ -2056,7 +2152,7 @@ mod tests {
             false,
             Duration::from_secs(5),
             &overdue,
-            1,
+            OverdueCap::set(1),
             None,
             |_| Ok(()),
         )
@@ -2076,7 +2172,7 @@ mod tests {
             false,
             Duration::from_secs(5),
             &overdue,
-            1,
+            OverdueCap::set(1),
             None,
             |_| Ok(()),
         )
@@ -2103,7 +2199,7 @@ mod tests {
                         false,
                         Duration::from_secs(10),
                         &evaluations,
-                        2,
+                        OverdueCap::set(2),
                         None,
                         move |_| {
                             let now = active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2138,7 +2234,7 @@ mod tests {
                     false,
                     Duration::from_secs(30),
                     &evaluations,
-                    1,
+                    OverdueCap::set(1),
                     None,
                     move |_| {
                         let _ = held.recv();
@@ -2160,7 +2256,7 @@ mod tests {
             false,
             Duration::from_millis(50),
             &evaluations,
-            1,
+            OverdueCap::set(1),
             None,
             move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
@@ -2192,7 +2288,7 @@ mod tests {
             true,
             Duration::from_millis(50),
             &overdue,
-            4,
+            OverdueCap::set(4),
             None,
             move |deadline| {
                 // Slow work that does not look at the token, then a commit.
@@ -2221,7 +2317,7 @@ mod tests {
                 false,
                 Duration::from_secs(5),
                 &overdue,
-                1,
+                OverdueCap::set(1),
                 None,
                 |_| -> Result<()> { panic!("boom") },
             );
@@ -2244,7 +2340,7 @@ mod tests {
                 write,
                 Duration::from_secs(5),
                 &overdue,
-                1,
+                OverdueCap::set(1),
                 write.then_some(&writer),
                 |_| Ok(std::thread::current().id()),
             )
@@ -2268,7 +2364,7 @@ mod tests {
                 true,
                 Duration::from_secs(5),
                 &overdue,
-                1,
+                OverdueCap::set(1),
                 Some(&writer),
                 |_| Ok(std::thread::current().id()),
             )
@@ -2301,7 +2397,7 @@ mod tests {
                     true,
                     Duration::from_secs(30),
                     &overdue,
-                    4,
+                    OverdueCap::set(4),
                     Some(&writer),
                     move |_| {
                         hold.recv().unwrap();
@@ -2323,7 +2419,7 @@ mod tests {
             true,
             Duration::from_millis(50),
             &overdue,
-            4,
+            OverdueCap::set(4),
             Some(&writer),
             move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
@@ -2356,7 +2452,7 @@ mod tests {
                 true,
                 Duration::from_secs(5),
                 &overdue,
-                1,
+                OverdueCap::set(1),
                 Some(&writer),
                 |_| -> Result<()> { panic!("boom") },
             );
@@ -2367,7 +2463,7 @@ mod tests {
             true,
             Duration::from_secs(5),
             &overdue,
-            1,
+            OverdueCap::set(1),
             Some(&writer),
             |_| Ok(7),
         )

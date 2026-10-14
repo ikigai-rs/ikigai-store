@@ -1010,7 +1010,11 @@ two into one shared module):
    evaluate at once, and so at most that many can outlive their callers. A read that finds
    every slot taken waits for one within its own budget, and is refused with a transient
    `Error::Unavailable` if none comes free; while the slots are filled by OVERDUE
-   evaluations, a new one is refused at once. Updates run on the store's one writer thread,
+   evaluations, a new one is refused at once. Both refusals end by naming the cap, whether it
+   is the default or the host set it, the machine's available parallelism, and that
+   `TimeBudget::with_max_overdue` raises it (ledger #1500), because the default is 1 on a
+   machine under 8 cores and 4 on an 18-core laptop, and the same refusal reads like two
+   different failures. Updates run on the store's one writer thread,
    so they hold at most one more core. Through 0.2.20 the cap was checked against the overdue
    count alone, which rises only at a timeout, so eight requests arriving together at a cap
    of 1 all started and left eight cores pinned (`tests/overdue_cap_in_flight.rs`).
@@ -1129,6 +1133,18 @@ let matched = budget.run(&text.clone(), inv.capability, None, move |token| {
   take `budget=`; a consumer's sentence leaves that clause out by default, and
   `EvaluationBudget::with_argument(Some("match_budget"))` names the consumer's own argument
   instead (the one whose value it hands `run` as `requested`). Clones keep it.
+- ★ **Each `EvaluationBudget::new` is its own count under its own cap — so state yours**
+  (ledger #1500). Clones share a count; two `new`s never do, and neither shares the store's
+  doors'. The default cap is `budget::default_max_overdue()`, a quarter of the machine's
+  available parallelism and at least one, which is **1 on anything under 8 cores**: on a
+  4-core CI runner one runaway `sh:select` made every later SHACL validation in the process
+  `Unavailable` until it ended (ikigai-rs/ikigai-shacl PR 34). A consumer that would rather
+  hold more cores than refuse says so:
+  `EvaluationBudget::new(TimeBudget::new(base).with_max_overdue(n))`, and a host decides
+  whether consumers share one budget (one cap across them) or each keep their own. The
+  refusal at the cap now says which it hit: the cap, whether it is the default or the host
+  set it, the machine's available parallelism, and that `TimeBudget::with_max_overdue` raises
+  it.
 
 ## ★ Every answer has a size bound, and past it is refused (ledger #970)
 
