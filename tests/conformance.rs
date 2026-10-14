@@ -57,6 +57,16 @@
 //!   fail its module's conformance for holding its user's data. The checks are load-
 //!   bearing for a module that AUTHORS a graph; here they confirm the face parses and is
 //!   labelled correctly, and no more.
+//! - **`REQUIRED` (0.8.0) drops each required by-value input, one at a time, and
+//!   expects a typed `MissingArgument` or `InvalidArgument`.** On the reads that is
+//!   `query` on all eight query forms and `graph` on the four scoped ones. The walk also
+//!   declares [`Suite::required_on_mutating`], so the three Sinks are fired without
+//!   `content` (and `store-graph-update` without `graph`) too. That is safe only because
+//!   the fixture store is in-memory and belongs to this test: each drop is a real
+//!   firing, and a Sink that wrongly accepted one would have written. `budget`,
+//!   `bindings`, `format`, `as` and `store-load`'s `graph` are optional and not dropped.
+//!   `store-info` and `store-graphs` declare nothing required, so REQUIRED has nothing
+//!   to drop there.
 //! - **`SPACE-NAME` (0.6.0) holds [`ikigai_store::space`] to claiming NO name**, because it
 //!   is instance-built: its doors serve whichever [`DurableStore`] it was handed, so two
 //!   calls are two different datasets behind identical-looking doors, and a self-claimed
@@ -182,6 +192,9 @@ fn fixtures() -> Suite {
                 .arg("content", SCOPED_UPDATE)
                 .arg("graph", SCOPED_GRAPH),
         )
+        // REQUIRED on the three Sinks as well as the reads: each drop is a firing, and
+        // this store is in-memory and the test's own (see the module docs).
+        .required_on_mutating()
 }
 
 /// `store-select` → `store-graph-select`: the scoped twin's description id.

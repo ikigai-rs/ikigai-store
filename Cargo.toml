@@ -436,12 +436,16 @@ futures = "0.3"
 # declares it `host_named_space` and holds it to claiming no name. Same ceiling story as
 # above, twice over: `"0.3"` meant `<0.4.0`, so request-memoized firing (0.4), own-name
 # purity (0.5) and SPACE-NAME (0.6) all sat outside it while this suite stayed green.
-# `"0.6.0"` is `<0.7.0`; move it when 0.7 publishes.
-# ⚠ It pulls core 0.1.89 into every TEST build (conformance 0.6.0 requires it). That is
+# ★ 0.8.0 for VALIDATE (0.7) and REQUIRED (0.8): every required by-value input of a
+# Source is dropped one at a time and must be refused typed, and under
+# `required_on_mutating()` the three Sinks too (safe here: the fixture store is
+# in-memory). `"0.6.0"` was `<0.7.0`, so neither arrived on its own (the conformance
+# wave, 2026-10-14). `"0.8.0"` is `<0.9.0`; move it when 0.9 publishes.
+# ⚠ It pulls core 0.1.100 into every TEST build (conformance 0.8.0 requires it). That is
 # NOT a reason to raise `[dependencies] ikigai-core` above: that line states what the
 # LIBRARY needs, which is still 0.1.57 — the test graph's floor comes from here.
-ikigai-conformance = "0.6.0"
+ikigai-conformance = "0.8.0"
 # `TurtleRenderer` for the `Meta` face the kernel routes. ⚠ Resolution consequence worth
-# knowing: conformance 0.6.0 requires vocab and core 0.1.89, so the TEST graph is pulled
-# to that even though the library above genuinely builds on 0.1.57.
+# knowing: conformance 0.8.0 requires core 0.1.100 and vocab 0.1.101, so the TEST graph
+# is pulled to that even though the library above genuinely builds on 0.1.57.
 ikigai-vocab = "0.1"
