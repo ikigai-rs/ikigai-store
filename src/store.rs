@@ -793,7 +793,7 @@ impl DurableStore {
             write,
             budget,
             &self.evaluations,
-            self.budget.max_overdue(),
+            self.budget.overdue_cap(),
             write.then_some(&*self.writer),
             work,
         )
