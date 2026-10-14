@@ -216,3 +216,89 @@ fn a_query_without_bindings_is_unchanged() {
     let out = select(&kernel, BY_TITLE, None).expect("an unbound query");
     assert_eq!(out.lines().count(), 3, "{out}");
 }
+
+/// ★ ledger #149: a variable that occurs ONLY inside `FILTER NOT EXISTS { … }` (or
+/// `FILTER EXISTS`, or a `MINUS`'s right side) is not in scope in the query's own pattern, so
+/// `SELECT *` does not project it. The refusal used to say "name it in the SELECT clause or
+/// write `SELECT *`", and under `SELECT *` the second half was the query already written. It
+/// also said ASK, CONSTRUCT and DESCRIBE "accept any variable in the pattern", and for this
+/// shape they refuse it too (measured). Naming it explicitly IS the fix, and the pair below
+/// proves it works: the binding then applies inside the `NOT EXISTS`.
+#[test]
+fn a_binding_for_a_variable_only_inside_exists_or_minus_gets_the_one_working_fix() {
+    let kernel = kernel();
+    for (iri, query) in [
+        (
+            "urn:iki:store:select",
+            "SELECT * WHERE { ?s <http://purl.org/dc/terms/title> ?title \
+             FILTER NOT EXISTS { ?s <urn:example:hidden> ?without } }",
+        ),
+        (
+            "urn:iki:store:select",
+            "SELECT * WHERE { ?s <http://purl.org/dc/terms/title> ?title \
+             FILTER EXISTS { ?s <urn:example:hidden> ?without } }",
+        ),
+        (
+            "urn:iki:store:select",
+            "SELECT * WHERE { ?s <http://purl.org/dc/terms/title> ?title \
+             MINUS { ?s <urn:example:hidden> ?without } }",
+        ),
+        (
+            "urn:iki:store:ask",
+            "ASK { ?s <http://purl.org/dc/terms/title> ?title \
+             FILTER NOT EXISTS { ?s <urn:example:hidden> ?without } }",
+        ),
+    ] {
+        let request = Request::new(Verb::Source, Iri::parse(iri).unwrap())
+            .with_arg("query", ArgRef::Inline(query.as_bytes().to_vec()))
+            .with_arg("as", ArgRef::Inline(b"text/csv".to_vec()))
+            .with_arg("bindings", ArgRef::Inline(br#"{"without": "x"}"#.to_vec()));
+        let err = block_on(kernel.issue(request, &Capability::root()))
+            .expect_err("a binding for a variable only inside EXISTS or MINUS");
+        let Error::InvalidArgument { name, detail } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(name, "bindings");
+        assert!(
+            detail.contains("?without occurs only inside `FILTER EXISTS`"),
+            "the refusal does not say where ?without lives: {detail}"
+        );
+        assert!(
+            detail.contains("`SELECT *` does not project it")
+                && detail.contains("Name it explicitly in a SELECT clause"),
+            "the refusal does not give the working fix: {detail}"
+        );
+        assert!(
+            !detail.contains("or write `SELECT *`"),
+            "the refusal still gives the dead-end advice: {detail}"
+        );
+    }
+
+    // ★ The other half: the advice works. Named explicitly, the binding is accepted and
+    // applied INSIDE the NOT EXISTS: only the ordinary item has a hidden "x", so only the
+    // hostile one survives — where without the binding, neither would.
+    let mark = ikigai_store::sparql::literal("x");
+    block_on(
+        kernel.issue(
+            Request::new(Verb::Sink, Iri::parse("urn:iki:store:update").unwrap()).with_arg(
+                "content",
+                ArgRef::Inline(
+                    format!(
+                        "INSERT DATA {{ <urn:example:ordinary> <urn:example:hidden> {mark} . \
+                     <urn:example:hostile> <urn:example:hidden> \"y\" }}"
+                    )
+                    .into_bytes(),
+                ),
+            ),
+            &Capability::root(),
+        ),
+    )
+    .expect("marking");
+    let named = "SELECT ?s ?without WHERE { ?s <http://purl.org/dc/terms/title> ?title \
+                 FILTER NOT EXISTS { ?s <urn:example:hidden> ?without } }";
+    let out = select(&kernel, named, Some(r#"{"without": "x"}"#)).expect("named explicitly");
+    assert!(out.contains("urn:example:hostile"), "{out}");
+    assert!(!out.contains("urn:example:ordinary"), "{out}");
+    let unbound = select(&kernel, named, None).expect("unbound");
+    assert_eq!(unbound.lines().count(), 1, "header only: {unbound}");
+}

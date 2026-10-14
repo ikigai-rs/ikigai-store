@@ -103,6 +103,7 @@
 //! the manifold would see two query actions it cannot tell apart, and the one declaring
 //! no capability is the one that answers an unrestricted query.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -161,8 +162,9 @@ pub const CAP_WRITE_GRAPH: &str = "urn:cap:store:write:graph:*";
 /// [`CAP_WRITE_GRAPH`], meaning "holds SOME grant under this prefix". A held grant names
 /// one graph: [`cap_read_graph`].
 ///
-/// ★ **Without this, the write boundary has a documented bypass.** 0.2.1 segmented writes
-/// and left [`CAP_READ`] as the whole dataset, so a module enforcing its own read
+/// ★ **Without this, the write boundary has a documented bypass.** The 0.2.1 arc (never
+/// published: its code first shipped in 0.2.2, beside this one) segmented writes and left
+/// [`CAP_READ`] as the whole dataset, so a module enforcing its own read
 /// capability over a graph it owns could be gone around entirely by querying the store
 /// directly under the broad grant. A boundary that holds in one direction is not a
 /// boundary.
@@ -244,6 +246,19 @@ pub fn cap_read_graph(graph: &str) -> String {
 ///
 /// The kernel cuts the thread named after a mutating request's target, so this needs no
 /// code — it is the target IRI. A cacheable read declares both this and [`LOAD_THREAD`].
+///
+/// ⚠ **A consumer does not need to depend on these threads itself, and doing so changes
+/// nothing** (ledger #150). Every cacheable read this crate answers already declares all
+/// three ([`UPDATE_THREAD`], [`LOAD_THREAD`], [`GRAPH_UPDATE_THREAD`]), and the kernel carries
+/// a sub-request's threads up to whatever issued it, so a consumer endpoint that reads through
+/// the store and answers `.cacheable()` is invalidated by every store write with no
+/// `depends_on` of its own. `ikigai-ledger` found its own such calls decorative by ablation,
+/// and `tests/consumer_threads.rs` pins it here: a composite naming no thread is cached, then
+/// recomputed after a write through each door. The trap is in the reading: a `depends_on`
+/// list looks like the mechanism, and a module is NOT threaded because it says so. What does
+/// make a consumer fresh is that the store answered its read cacheable; on a shared store
+/// whose read is not covered, the answer is `Expiry::Always`, the consumer's composite is
+/// uncacheable with it, and no `depends_on` of the consumer's makes it cacheable again.
 pub const UPDATE_THREAD: &str = "urn:iki:store:update";
 
 /// The golden thread `urn:iki:store:load` cuts on success.
@@ -429,7 +444,7 @@ fn covered_by(rep: Representation, store: &DurableStore, covered: bool) -> Repre
 /// pre-check runs *before* `invoke` can see an argument — so one IRI taking an optional
 /// `graph=` would have to declare the weaker of the two and let the endpoint decide,
 /// which is exactly the over-offer the module recipe forbids. Same argument the write
-/// door made in 0.2.1.
+/// door made in the 0.2.1 arc (unpublished; shipped in 0.2.2).
 const FORMS: [(&str, &str, &str, bool); 4] = [
     ("select", "store-select", "store-graph-select", false),
     ("ask", "store-ask", "store-graph-ask", false),
@@ -539,6 +554,13 @@ impl Endpoint for QueryEndpoint {
                                 return Err(outside_refusal(&outside, target, this.form));
                             }
                         }
+                        // Read only by the refusal of a binding, so only measured when there
+                        // is one (ledger #149).
+                        let hidden = if bound.is_empty() {
+                            Default::default()
+                        } else {
+                            crate::sparql::only_inside_exists_or_minus(&parsed)
+                        };
                         let mut prepared = crate::service::evaluator()
                             .with_cancellation_token(deadline.token())
                             .for_query(parsed);
@@ -588,7 +610,7 @@ impl Endpoint for QueryEndpoint {
                         let results = prepared
                             .on_store(this.store.dataset())
                             .execute()
-                            .map_err(|e| this.query_error(e, &bound))?;
+                            .map_err(|e| this.query_error(e, &bound, &hidden))?;
 
                         // ★ Refuse a query of the wrong shape rather than serving it here. The
                         // IRI is a promise about what comes back — it is what fixes this
@@ -853,10 +875,49 @@ impl QueryEndpoint {
     /// the evaluator reports it as an untyped evaluation error.
     /// `an_unprojected_binding_is_refused_with_the_fix` pins it against a real query, so
     /// an upstream rewording fails a test rather than quietly degrading the message.
-    fn query_error(&self, e: impl std::fmt::Display, bound: &[(String, Term)]) -> Error {
+    ///
+    /// ★ **A variable that occurs only inside `FILTER (NOT) EXISTS` or a `MINUS`'s right side
+    /// gets different advice** (ledger #149): it is out of scope in the query's own pattern,
+    /// so `SELECT *` does not project it and ASK, CONSTRUCT and DESCRIBE cannot bind it, but a
+    /// SELECT that names it explicitly does accept it. `hidden` is those variables
+    /// ([`crate::sparql::only_inside_exists_or_minus`]).
+    fn query_error(
+        &self,
+        e: impl std::fmt::Display,
+        bound: &[(String, Term)],
+        hidden: &BTreeSet<String>,
+    ) -> Error {
         let text = e.to_string();
         if bound.is_empty() || !text.contains("projection") {
             return Error::Endpoint(format!("query: {text}"));
+        }
+        let scoped_out: Vec<String> = bound
+            .iter()
+            .filter(|(n, _)| hidden.contains(n))
+            .map(|(n, _)| format!("?{n}"))
+            .collect();
+        if !scoped_out.is_empty() {
+            let (them, occur) = if scoped_out.len() == 1 {
+                ("it", "occurs")
+            } else {
+                ("them", "occur")
+            };
+            return Error::InvalidArgument {
+                name: "bindings".to_string(),
+                detail: format!(
+                    "{text}. {} {occur} only inside `FILTER EXISTS` / `FILTER NOT EXISTS` or the \
+                     right side of a `MINUS`, where a variable is not in scope in the query's own \
+                     pattern, so `SELECT *` does not project {them} and ASK, CONSTRUCT and \
+                     DESCRIBE cannot bind {them}. Name {them} explicitly in a SELECT clause \
+                     (`SELECT ?s {}`): the binding is then accepted and applies inside the \
+                     `EXISTS` or `MINUS`, and the column carries the bound value. An ASK, \
+                     CONSTRUCT or DESCRIBE has to become such a SELECT. A binding is refused \
+                     rather than ignored, so that a filter you thought was applied can never \
+                     silently not be",
+                    scoped_out.join(", "),
+                    scoped_out.join(" "),
+                ),
+            };
         }
         let names: Vec<String> = bound.iter().map(|(n, _)| format!("?{n}")).collect();
         Error::InvalidArgument {
@@ -865,7 +926,7 @@ impl QueryEndpoint {
                 "{text}. Every bound variable must appear in the query's projection, and this \
                  query projects fewer than the {} bound here ({}). Either name it in the \
                  SELECT clause or write `SELECT *`; ASK, CONSTRUCT and DESCRIBE have no \
-                 projection to widen and accept any variable in the pattern. A binding the \
+                 projection to widen and accept any variable in scope in the pattern. A binding the \
                  query does not mention is refused rather than ignored, so that a filter you \
                  thought was applied can never silently not be",
                 names.len(),

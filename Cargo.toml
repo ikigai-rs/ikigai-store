@@ -65,6 +65,11 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # nothing, which is exactly the ceiling trap constitution 5 warns about from the other
 # direction. A consumer that wants the new API pins `0.2.1`; one that does not, does
 # nothing.
+# ⚠ AMENDED (ledger #154): **0.2.1 was NEVER PUBLISHED.** crates.io lists 0.2.0 and then
+# 0.2.2; the 0.2.1 code (ikigai-store PR 3) shipped inside 0.2.2, and so did the exhaustive
+# `Term` match in `term_to_json` that PR introduced, which 0.2.3 fixed. So nobody could pin
+# `0.2.1`: the floor for its API is `0.2.2`, and every "0.2.1 and 0.2.2" below and in the
+# README means one published release, 0.2.2.
 #
 # ★ 0.2.2 is a PATCH by the same argument, and closes the half 0.2.1 left open. It adds
 # `urn:iki:store:graph-{select,ask,construct,describe}`, `urn:cap:store:read:graph:*` and
