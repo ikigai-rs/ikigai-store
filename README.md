@@ -304,7 +304,7 @@ that defeat a syntactic check:
 | --- | --- |
 | `{ ?s ?p ?o }` (no `GRAPH` block) | reads `G` — it *is* the default graph |
 | `GRAPH <G> { … }` | reads `G` |
-| `GRAPH <other> { … }` | matches nothing — an empty result, not an error |
+| `GRAPH <other> { … }` | **refused**, naming `<other>` (since 0.2.22, ledger #388); through 0.2.21 it matched nothing, an empty result |
 | `GRAPH ?g { … }` | binds `?g` to `G` and to nothing else |
 | a sub-select, `FILTER EXISTS`/`NOT EXISTS`, a property path over another graph | confined the same way |
 | `DESCRIBE <s>` with no pattern | reads `G` |
@@ -313,6 +313,14 @@ that defeat a syntactic check:
 
 Four decisions worth stating:
 
+- **A constant `GRAPH <other>` is refused rather than answered empty** (0.2.22, ledger
+  #388). The confinement already kept it unreachable, but an empty answer to a mistyped
+  or forgotten graph looks exactly like an empty graph. The endpoint walks the whole parsed
+  algebra (sub-selects, `OPTIONAL`, `MINUS`, `UNION`, `LATERAL` and every `EXISTS`) for
+  constant graph names outside `graph=` and refuses with `InvalidArgument` on `query`,
+  naming each. The walk is exhaustive over `spargebra`'s algebra, so a variant it does not
+  handle is a compile error rather than a silently skipped pattern. `GRAPH ?g` names no
+  graph and is unaffected: the dataset keeps it inside the set.
 - **`FROM` / `FROM NAMED` is refused rather than overridden.** It is a second way to name
   a dataset, and it cannot widen the scope — the confinement overwrites whatever the
   parser built from it. But answering `FROM <other>` with `G`'s rows would label one
@@ -367,8 +375,8 @@ source urn:iki:store:graph-select \
 
 - **The dataset is the set, both halves.** `graph="G1 G2"` is exactly `FROM <G1> FROM <G2>
   FROM NAMED <G1> FROM NAMED <G2>`: a bare pattern reads — and joins across — the merge,
-  `GRAPH ?g` binds only members, `GRAPH <other>` matches nothing, and the store's default
-  graph stays unreachable. One graph is the degenerate case of the same rule, so every
+  `GRAPH ?g` binds only members, `GRAPH <other>` is refused by name (0.2.22; it matched
+  nothing before), and the store's default graph stays unreachable. One graph is the degenerate case of the same rule, so every
   existing single-graph caller is unchanged. (Why not named graphs alone: `src/scope.rs`.)
 - ★ **Every graph must be granted, and one missing grant REFUSES the read** with a typed
   `Denied` naming each missing `urn:cap:store:read:graph:<iri>`. It is never answered over

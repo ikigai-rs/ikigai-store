@@ -240,6 +240,10 @@ fn a_graph_grant_is_refused_for_another_graph() {
 /// ★ The confinement ablation, one case per shape that a syntactic check would miss.
 /// Each is paired with the same query through the broad door, so the assertion is that
 /// the scoped read saw LESS — not merely that it saw nothing.
+///
+/// Since ledger #388 a scoped read that NAMES another graph is refused rather than answered
+/// empty (`tests/graph_outside_set.rs` has every shape), so "saw less" is either an empty
+/// answer or a refusal. Neither may carry the other tenant's rows.
 #[test]
 fn a_scoped_read_cannot_reach_another_graph_by_any_shape() {
     let kernel = kernel();
@@ -265,9 +269,14 @@ fn a_scoped_read_cannot_reach_another_graph_by_any_shape() {
             "SELECT ?s WHERE { ?s ?p \"host\" }".to_string(),
         ),
     ] {
-        let scoped = scoped_select(&kernel, &query, &one_graph())
-            .unwrap_or_else(|e| panic!("{name}: the query is well-formed and in scope: {e}"));
-        assert!(scoped.is_empty(), "{name}: leaked {scoped:?}");
+        match scoped_select(&kernel, &query, &one_graph()) {
+            Ok(scoped) => assert!(scoped.is_empty(), "{name}: leaked {scoped:?}"),
+            Err(Error::InvalidArgument { detail, .. }) => assert!(
+                detail.contains(&format!("<{OTHER}>")) && !detail.contains("zenith:1"),
+                "{name}: {detail}"
+            ),
+            Err(e) => panic!("{name}: neither an answer nor the outside-graph refusal: {e}"),
+        }
         assert!(
             !broad_select(&kernel, &query).is_empty(),
             "{name}: the control found nothing either, so this test proves nothing"
