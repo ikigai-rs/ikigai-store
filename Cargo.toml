@@ -293,7 +293,16 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # (`FILTER`, `BIND`, `OPTIONAL`/`MINUS` left sides, `ORDER BY`, `OFFSET`/`LIMIT`, `LATERAL`) passes its patterns through
 # to the enclosing join, the walk ikigai-sparql's fix brought (linkeddata 91cf4f3). The cost is an over-count when such
 # a wrapper survives: two groups of 20 each closed by a real `FILTER` are now refused as a join of 40.
-version = "0.2.21"
+# ★ 0.2.22 is the 2026-10-13 backlog batch (ledger #388, #1479, #1464, #149, #150, #154). A scoped read whose query
+# names a constant `GRAPH <iri>` outside `graph=` is REFUSED naming it, where it answered empty (confinement was already
+# exact; the empty answer looked like an empty graph). `SharedWriter::narrowed_away()` names the graphs a join with an
+# earlier, narrower writer dropped, and the refusal of a write to one says so and names the declaration that won
+# (`UndeclaredGraph::narrowed_by_join()`). `budget::measure_query`/`measure_update` return an `AlgebraCost` whose
+# `widest_join()` and `nodes()` are exactly what the algebra check compares against its bounds. The `bindings=`
+# refusal for a variable only inside `FILTER (NOT) EXISTS` or a `MINUS` gives the one fix that works (name it in a
+# SELECT). A patch: the API is additive (one type, two functions, two methods); the one behavior change is the
+# outside-graph refusal, which turns an always-empty answer into an error naming the graph.
+version = "0.2.22"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
