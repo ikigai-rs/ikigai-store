@@ -423,6 +423,7 @@ impl DurableStore {
             writes: Arc::downgrade(&self.writes),
             writer: Arc::downgrade(&self.writer),
             declared,
+            ceiling: CeilingSource::Store,
         });
         (self, handle)
     }
@@ -835,6 +836,7 @@ impl DurableStore {
             writes: Arc::clone(&self.writes),
             writer: Arc::clone(&self.writer),
             declared,
+            narrowed: None,
         })
     }
 
@@ -1050,12 +1052,49 @@ pub struct SharedWriter {
     writer: Arc<crate::budget::Writer>,
     /// The graphs this writer may write, or `None` when nothing was declared.
     declared: Option<Arc<SharerWrites>>,
+    /// What joining an existing writer took away from the declaration `over` was given, or
+    /// `None` when it took nothing (ledger #1479).
+    narrowed: Option<Arc<Narrowed>>,
+}
+
+/// Where the ceiling a joining [`SharedWriter::over`] is narrowed to came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CeilingSource {
+    /// The declaration of the store whose shared constructor gave the handle out.
+    Store,
+    /// The declaration of the first `over` on a handle the host opened itself.
+    FirstOver,
+}
+
+impl CeilingSource {
+    fn describe(self) -> &'static str {
+        match self {
+            CeilingSource::Store => {
+                "the store's own `SharerWrites` declaration (the shared constructor that gave \
+                 this handle out)"
+            }
+            CeilingSource::FirstOver => {
+                "the first `SharedWriter::over` on this handle, whose writer every later `over` \
+                 joins"
+            }
+        }
+    }
+}
+
+/// The named graphs a join dropped from a writer's declaration, and the declaration that won
+/// (ledger #1479).
+#[derive(Debug)]
+struct Narrowed {
+    dropped: BTreeSet<String>,
+    ceiling: String,
+    source: CeilingSource,
 }
 
 impl std::fmt::Debug for SharedWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedWriter")
             .field("declared", &self.declared)
+            .field("narrowed", &self.narrowed)
             .finish_non_exhaustive()
     }
 }
@@ -1077,6 +1116,16 @@ impl SharedWriter {
     ///   every writer on the handle is gone, the next `over` starts afresh.
     ///
     /// It is infallible either way: a join never fails, it narrows.
+    ///
+    /// ★ **Construction order decides what a writer may write** (ledger #1479). A narrow
+    /// writer made first narrows every later one: `ikigai-browse` built a default-graph-only
+    /// archive writer before its mount's writer, and every write to the mount's named graph
+    /// was refused. So make the WIDEST writer on a handle first (the host's, before it hands
+    /// the handle to a module), or give each the same declaration. A narrowing is not silent:
+    /// [`narrowed_away`](Self::narrowed_away) names the graphs a join dropped, and the
+    /// [`UndeclaredGraph`] refusal of a write to one of them says the join dropped it and
+    /// names the declaration that won. A host can assert `narrowed_away().count() == 0` right
+    /// after construction to make the order a test failure instead of a refused write.
     ///
     /// See the type docs for how it differs from [`DurableStore::shared_writer`].
     ///
@@ -1105,19 +1154,52 @@ impl SharedWriter {
     /// );
     /// let declared = module.declared().unwrap().named_graphs().collect::<Vec<_>>();
     /// assert_eq!(declared, ["urn:example:notes"]);
+    /// // …and it says what the join took away (ledger #1479).
+    /// assert_eq!(module.narrowed_away().collect::<Vec<_>>(), ["urn:example:elsewhere"]);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn over(store: Arc<Store>, writes: SharerWrites) -> SharedWriter {
         let joined = given_out::join_or_start(&store, &writes);
+        let (declared, narrowed) = match &joined.declared {
+            Some(ceiling) => {
+                let within = writes.within(ceiling);
+                let dropped: BTreeSet<String> =
+                    writes.named.difference(&within.named).cloned().collect();
+                let narrowed = (!dropped.is_empty()).then(|| {
+                    Arc::new(Narrowed {
+                        dropped,
+                        ceiling: describe(ceiling),
+                        source: joined.source,
+                    })
+                });
+                (within, narrowed)
+            }
+            None => (writes, None),
+        };
         SharedWriter {
             store,
             writes: joined.writes,
             writer: joined.writer,
-            declared: Some(Arc::new(match &joined.declared {
-                Some(ceiling) => writes.within(ceiling),
-                None => writes,
-            })),
+            declared: Some(Arc::new(declared)),
+            narrowed,
         }
+    }
+
+    /// The named graphs the declaration given to [`over`](Self::over) asked for and joining
+    /// an existing writer took away, sorted (ledger #1479). Empty for a writer nothing
+    /// narrowed, and always for one from [`DurableStore::shared_writer`].
+    ///
+    /// A write to one of these is refused, and the refusal names the declaration that won.
+    /// Empty right after construction is the check that construction order was right.
+    pub fn narrowed_away(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.narrowed
+            .as_deref()
+            .map(|n| &n.dropped)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     /// The raw handle, for reads: the same `Arc<Store>` the shared constructor returned (or
@@ -1145,11 +1227,16 @@ impl SharedWriter {
         T: Send + 'static,
         E: From<StorageError> + Send + 'static,
     {
-        let (store, declared) = (Arc::clone(&self.store), self.declared.clone());
+        let (store, declared, narrowed) = (
+            Arc::clone(&self.store),
+            self.declared.clone(),
+            self.narrowed.clone(),
+        );
         self.on_writer(move || {
             let mut transaction = DeclaredTransaction {
                 inner: store.start_transaction()?,
                 declared,
+                narrowed,
                 refused: None,
             };
             let value = record(&mut transaction)?;
@@ -1241,7 +1328,7 @@ impl SharedWriter {
 /// and a clone re-wrapped in a new `Arc` is a handle nobody recorded.
 /// `tests/provenance.rs` pins that limit.
 mod given_out {
-    use super::{SharerWrites, Store};
+    use super::{CeilingSource, SharerWrites, Store};
     use std::sync::{Arc, Mutex, Weak};
 
     /// One recorded handle: one a shared constructor returned, or one `over` was first
@@ -1254,6 +1341,8 @@ mod given_out {
         /// `None` when it declared nothing (`open_shared`); for a handle `over` recorded, the
         /// first `over`'s declaration.
         pub(super) declared: Option<SharerWrites>,
+        /// Which of those two `declared` is, for a refusal to name (ledger #1479).
+        pub(super) ceiling: CeilingSource,
     }
 
     /// The writer a handle belongs to.
@@ -1261,6 +1350,7 @@ mod given_out {
         pub(super) writes: Arc<Mutex<()>>,
         pub(super) writer: Arc<crate::budget::Writer>,
         pub(super) declared: Option<SharerWrites>,
+        pub(super) source: CeilingSource,
     }
 
     static GIVEN_OUT: Mutex<Vec<GivenOut>> = Mutex::new(Vec::new());
@@ -1299,6 +1389,7 @@ mod given_out {
                         writes,
                         writer,
                         declared: entry.declared.clone(),
+                        source: entry.ceiling,
                     }
                 }
                 // The last writer went between the prune and here: nothing is left to join.
@@ -1307,16 +1398,20 @@ mod given_out {
                 }
             }
         }
+        // The writer this `over` starts. Its `declared` is its own declaration, so `over`
+        // narrows it by nothing; `source` is what a LATER `over` will be told won.
         let joined = Joined {
             writes: Arc::new(Mutex::new(())),
             writer: Arc::default(),
             declared: Some(writes.clone()),
+            source: CeilingSource::FirstOver,
         };
         given.push(GivenOut {
             handle: Arc::downgrade(handle),
             writes: Arc::downgrade(&joined.writes),
             writer: Arc::downgrade(&joined.writer),
             declared: joined.declared.clone(),
+            ceiling: CeilingSource::FirstOver,
         });
         joined
     }
@@ -1348,6 +1443,7 @@ fn describe(declared: &SharerWrites) -> String {
 pub struct DeclaredTransaction<'a> {
     inner: Transaction<'a>,
     declared: Option<Arc<SharerWrites>>,
+    narrowed: Option<Arc<Narrowed>>,
     refused: Option<UndeclaredGraph>,
 }
 
@@ -1437,9 +1533,24 @@ impl DeclaredTransaction<'_> {
         if permitted {
             return Ok(());
         }
+        // ★ A graph this writer ASKED for and a join took away gets a refusal that says so,
+        // not one naming only the declaration it inherited (ledger #1479).
+        let joined = match (graph, self.narrowed.as_deref()) {
+            (GraphNameRef::NamedNode(iri), Some(narrowed))
+                if narrowed.dropped.contains(iri.as_str()) =>
+            {
+                Some(format!(
+                    "{}, which names {}",
+                    narrowed.source.describe(),
+                    narrowed.ceiling
+                ))
+            }
+            _ => None,
+        };
         let refused = UndeclaredGraph {
             graph: graph.to_string(),
             declared: describe(declared),
+            joined,
         };
         self.refused.get_or_insert_with(|| refused.clone());
         Err(refused.into_storage_error())
@@ -1454,12 +1565,22 @@ impl DeclaredTransaction<'_> {
 pub struct UndeclaredGraph {
     graph: String,
     declared: String,
+    /// The declaration that won, when the writer asked for this graph and a join with an
+    /// earlier writer took it away (ledger #1479).
+    joined: Option<String>,
 }
 
 impl UndeclaredGraph {
     /// The graph the refused write named, in N-Quads graph-name form (`<urn:…>`, or `_:b0`).
     pub fn graph(&self) -> &str {
         &self.graph
+    }
+
+    /// Whether the writer's own declaration named this graph and joining an earlier writer
+    /// took it away (ledger #1479): the case where the fix is construction order, not the
+    /// declaration. See [`SharedWriter::narrowed_away`].
+    pub fn narrowed_by_join(&self) -> bool {
+        self.joined.is_some()
     }
 
     /// The refusal inside `error`, if that is what it is: a [`StorageError`], or any error
@@ -1501,6 +1622,18 @@ impl UndeclaredGraph {
 
 impl std::fmt::Display for UndeclaredGraph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(won) = &self.joined {
+            return write!(
+                f,
+                "a write to graph {} was refused: this writer's own `SharerWrites` declaration \
+                 named it, but `SharedWriter::over` joined the writer already on this handle and \
+                 was narrowed to {won}, so the join narrowed {} away. A join never widens the \
+                 declaration it joins, because cached reads rest on it. Make the widest writer \
+                 first, before any narrower `over` on the same handle, or give both the same \
+                 declaration. The whole transaction was rolled back (ledger #1479, #1209)",
+                self.graph, self.graph
+            );
+        }
         write!(
             f,
             "a write to graph {} was refused: this writer's `SharerWrites` declaration names {}, \

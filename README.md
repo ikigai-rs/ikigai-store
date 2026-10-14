@@ -977,6 +977,10 @@ two into one shared module):
    query, or move a pattern into a sub-`SELECT` (`tests/join_graph_blocks.rs`,
    `tests/join_normalized_wrappers.rs`; the rule is the doc comment on the walk's
    `Cost::join`, kept identical to `ikigai-sparql`'s).
+   ★ **To state your own number** (0.2.22, ledger #1464): `budget::measure_query(&parsed)`
+   and `budget::measure_update(&parsed)` return an `AlgebraCost` whose `widest_join()` and
+   `nodes()` are exactly what the check compares against the two bounds, so a consumer can
+   pin how far under them its widest query sits in its own test instead of copying the walk.
 2. **A deadline, and the caller is answered at it**, with a typed `Error::Timeout` naming
    the budget — never later, never a partial answer. The evaluation is cancelled, and this
    crate's serializers check the token between rows. **An update that runs out of time
@@ -1269,6 +1273,13 @@ one could lose half of a record rewritten through the other (`tests/provenance.r
   before it hands the handle to a module. A module can then take
   `SharedWriter::over(Arc::clone(writer.store()), <its graph>)` and be both ordered with the
   host's writes and fenced to its own graph.
+- ★ **Construction order is the trap, and since 0.2.22 it is not silent** (ledger #1479).
+  `ikigai-browse` built a default-graph-only archive writer before its mount's writer, and
+  every write to the mount's named graph was refused under a declaration the mount never
+  wrote. `SharedWriter::narrowed_away()` names the graphs a join dropped (assert it is empty
+  right after construction), and the refusal of a write to one of them says the join dropped
+  it, names the declaration that won (the store's, or the first `over`'s), and is recognized
+  by `UndeclaredGraph::narrowed_by_join()`.
 - Once every writer on a handle is dropped, the next `over` starts a fresh writer, and its
   declaration is the new ceiling.
 - ⚠ The record is of the `Arc`, not the dataset: `Arc::new(store.clone())` is a handle nobody

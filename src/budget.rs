@@ -1546,6 +1546,86 @@ impl AnswerBudget {
 /// Refuse a parsed query whose algebra exceeds [`MAX_JOIN_OPERANDS`] or [`MAX_ALGEBRA_NODES`],
 /// naming the argument `arg` and the bound. Called after parsing and before planning.
 pub fn check_query(query: &Query, arg: &str) -> Result<()> {
+    query_cost(query).verdict(arg)
+}
+
+/// [`check_query`] for an update: the `WHERE` of every `DELETE`/`INSERT` operation counts
+/// toward one total, and each join is bounded on its own.
+pub fn check_update(update: &Update, arg: &str) -> Result<()> {
+    update_cost(update).verdict(arg)
+}
+
+/// What [`check_query`] and [`check_update`] measure, as numbers: the widest join and the
+/// algebra node count (ledger #1464).
+///
+/// ★ **For a consumer stating its own number.** A crate whose queries reach this store (or
+/// that bounds its own with the same rule) can say how far under [`MAX_JOIN_OPERANDS`] and
+/// [`MAX_ALGEBRA_NODES`] its widest query sits, in a test, instead of copying this module's
+/// private walk to find out. The numbers are the walk's exactly, so they are what the check
+/// compares against the bounds: a query passes [`check_query`] exactly when
+/// `widest_join() <= MAX_JOIN_OPERANDS && nodes() <= MAX_ALGEBRA_NODES`.
+///
+/// ⚠ The join count is an OVER-count by design (the rule is on [`MAX_JOIN_OPERANDS`]): every
+/// wrapper the planner can erase is counted as erased, so `GRAPH`, `FILTER`, `BIND` and an
+/// `OPTIONAL`'s left side add their patterns to the enclosing join.
+///
+/// ```
+/// use ikigai_store::budget::{measure_query, measure_update, MAX_JOIN_OPERANDS};
+///
+/// let parse = |text: &str| spargebra::SparqlParser::new().parse_query(text).unwrap();
+///
+/// // Three patterns in one group: a join of three, and four nodes (one per pattern, and the
+/// // SELECT's projection).
+/// let cost = measure_query(&parse(
+///     "SELECT * WHERE { ?s <urn:a> ?a . ?s <urn:b> ?b . ?s <urn:c> ?c }",
+/// ));
+/// assert_eq!(cost.widest_join(), 3);
+/// assert_eq!(cost.nodes(), 4);
+///
+/// // A `GRAPH` block is erased by the planner, so its patterns join the enclosing group,
+/// // and an OPTIONAL's right side is a join of its own.
+/// let cost = measure_query(&parse(
+///     "SELECT * WHERE { ?s <urn:a> ?a GRAPH ?g { ?s <urn:b> ?b . ?s <urn:c> ?c } \
+///      OPTIONAL { ?s <urn:d> ?d } }",
+/// ));
+/// assert_eq!(cost.widest_join(), 3);
+/// assert!(cost.widest_join() <= MAX_JOIN_OPERANDS);
+///
+/// // An update's DELETE/INSERT WHERE clauses, each join bounded on its own.
+/// let update = spargebra::SparqlParser::new()
+///     .parse_update("DELETE { ?s ?p ?o } WHERE { ?s ?p ?o . ?o ?q ?r }")
+///     .unwrap();
+/// assert_eq!(measure_update(&update).widest_join(), 2);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AlgebraCost {
+    widest_join: usize,
+    nodes: usize,
+}
+
+impl AlgebraCost {
+    /// The most operands in any one join, as [`MAX_JOIN_OPERANDS`] counts them.
+    pub fn widest_join(&self) -> usize {
+        self.widest_join
+    }
+
+    /// The algebra nodes, as [`MAX_ALGEBRA_NODES`] counts them.
+    pub fn nodes(&self) -> usize {
+        self.nodes
+    }
+}
+
+/// [`AlgebraCost`] of a parsed query: what [`check_query`] compares against the bounds.
+pub fn measure_query(query: &Query) -> AlgebraCost {
+    query_cost(query).measured()
+}
+
+/// [`AlgebraCost`] of a parsed update: what [`check_update`] compares against the bounds.
+pub fn measure_update(update: &Update) -> AlgebraCost {
+    update_cost(update).measured()
+}
+
+fn query_cost(query: &Query) -> Cost {
     let mut cost = Cost::default();
     match query {
         Query::Select { pattern, .. }
@@ -1553,19 +1633,17 @@ pub fn check_query(query: &Query, arg: &str) -> Result<()> {
         | Query::Describe { pattern, .. }
         | Query::Construct { pattern, .. } => cost.pattern(pattern),
     }
-    cost.verdict(arg)
+    cost
 }
 
-/// [`check_query`] for an update: the `WHERE` of every `DELETE`/`INSERT` operation counts
-/// toward one total, and each join is bounded on its own.
-pub fn check_update(update: &Update, arg: &str) -> Result<()> {
+fn update_cost(update: &Update) -> Cost {
     let mut cost = Cost::default();
     for operation in &update.operations {
         if let GraphUpdateOperation::DeleteInsert { pattern, .. } = operation {
             cost.pattern(pattern);
         }
     }
-    cost.verdict(arg)
+    cost
 }
 
 /// The algebra walk. ★ Kept identical to `ikigai-sparql`'s `budget::Cost` (ledger #964) so
@@ -1582,6 +1660,13 @@ struct Cost {
 }
 
 impl Cost {
+    fn measured(&self) -> AlgebraCost {
+        AlgebraCost {
+            widest_join: self.widest_join,
+            nodes: self.nodes,
+        }
+    }
+
     fn verdict(&self, arg: &str) -> Result<()> {
         if self.widest_join > MAX_JOIN_OPERANDS {
             return Err(Error::InvalidArgument {
@@ -2495,6 +2580,50 @@ mod tests {
             vec!["<urn:x>"; 5_000].join(", ")
         );
         assert!(cost(&list).1 < 10);
+    }
+
+    /// ★ The public measure IS the check's walk (ledger #1464): at the bound and one past it,
+    /// for both bounds, `measure_query` reports the number the check refuses on, and a query
+    /// passes exactly when both numbers are within their bounds.
+    #[test]
+    fn the_public_measure_agrees_with_the_check_at_both_bounds() {
+        let parse = |text: &str| spargebra::SparqlParser::new().parse_query(text).unwrap();
+        let chain = |terms: usize| format!("SELECT * WHERE {{ FILTER(1{}) }}", "||1".repeat(terms));
+        let over_nodes = (0..)
+            .map(chain)
+            .find(|text| cost(text).1 > MAX_ALGEBRA_NODES)
+            .unwrap();
+        for text in [
+            format!("SELECT * WHERE {{ {} }}", patterns(MAX_JOIN_OPERANDS)),
+            format!("SELECT * WHERE {{ {} }}", patterns(MAX_JOIN_OPERANDS + 1)),
+            format!(
+                "SELECT * WHERE {{ GRAPH ?g {{ {} }} FILTER(true) }}",
+                patterns(MAX_JOIN_OPERANDS + 1)
+            ),
+            over_nodes,
+        ] {
+            let parsed = parse(&text);
+            let measured = measure_query(&parsed);
+            assert_eq!(
+                (measured.widest_join(), measured.nodes()),
+                cost(&text),
+                "{text}"
+            );
+            assert_eq!(
+                check_query(&parsed, "query").is_ok(),
+                measured.widest_join() <= MAX_JOIN_OPERANDS
+                    && measured.nodes() <= MAX_ALGEBRA_NODES,
+                "{text}"
+            );
+        }
+        let update = spargebra::SparqlParser::new()
+            .parse_update(&format!(
+                "DELETE {{ ?s ?p ?o }} WHERE {{ {} }}",
+                patterns(MAX_JOIN_OPERANDS + 1)
+            ))
+            .unwrap();
+        assert_eq!(measure_update(&update).widest_join(), MAX_JOIN_OPERANDS + 1);
+        assert!(check_update(&update, "content").is_err());
     }
 
     #[test]
