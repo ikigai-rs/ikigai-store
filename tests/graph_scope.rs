@@ -181,8 +181,13 @@ fn an_update_that_reaches_outside_the_graph_is_refused_in_full() {
             "INSERT DATA { <urn:example:x> <urn:p> \"no\" }".to_string(),
         ),
         (
+            // `USING <G>` keeps the `WHERE` on G, so `WITH` reaches only the template: without
+            // it, `WITH <other>` is refused before evaluation as a graph the update READS
+            // (ledger #1606, `tests/update_outside_graph.rs`).
             "WITH, which names the graph outside the block",
-            format!("WITH <{OTHER}> INSERT {{ <urn:example:x> <urn:p> \"no\" }} WHERE {{}}"),
+            format!(
+                "WITH <{OTHER}> INSERT {{ <urn:example:x> <urn:p> \"no\" }} USING <{G}> WHERE {{}}"
+            ),
         ),
         (
             "COPY, whose destination is the escape",
@@ -243,13 +248,15 @@ fn a_variable_graph_and_drop_all_are_confined_rather_than_refused() {
     }
 }
 
-/// ⚠ The read half of the boundary, stated as a test because it is a behaviour
+/// ⚠ The read half of the boundary, stated as a test because it is a behavior
 /// difference and not only a security property: the scoped door sees `G` and nothing
-/// else, so a WHERE clause reading another graph matches nothing.
+/// else, so a WHERE clause reading another graph would match nothing. Until ledger #1606 it
+/// was applied as `+0 -0`; it is refused by name now, before evaluation, the way a scoped
+/// read refuses `GRAPH <other>` (ledger #388). `tests/update_outside_graph.rs` has every shape.
 #[test]
 fn a_scoped_update_cannot_read_another_graph() {
     let kernel = kernel();
-    scoped(
+    let err = scoped(
         &kernel,
         &format!(
             "INSERT {{ GRAPH <{G}> {{ ?s <urn:copied> \"leak\" }} }} \
@@ -257,9 +264,13 @@ fn a_scoped_update_cannot_read_another_graph() {
         ),
         &one_graph(),
     )
-    .expect("the update itself is well-formed and in scope");
-    // It matched nothing, so nothing was copied: the other tenant's subjects never
-    // reached this graph.
+    .expect_err("a WHERE naming another graph is refused, not applied as a no-op");
+    assert!(
+        matches!(&err, Error::InvalidArgument { name, detail }
+            if name == "content" && detail.contains(&format!("<{OTHER}>"))),
+        "{err:?}"
+    );
+    // Nothing was copied: the other tenant's subjects never reached this graph.
     assert_eq!(quads(&kernel, G), 1);
 }
 
@@ -278,6 +289,10 @@ fn holds_subject(kernel: &Kernel, graph: &str, subject: &str) -> bool {
 /// #1132). Each update names its predicate, so its footprint is narrow; each must read
 /// nothing outside `G`, write nothing outside `G`, or be refused — and the default graph
 /// and the other tenant's graph both hold a quad it would match if it could see them.
+///
+/// The four rows that name another graph to READ (`GRAPH <other>`, `USING`, `USING NAMED`,
+/// `WITH`) applied as no-ops until ledger #1606 and are refused by name before evaluation
+/// now; the assertions after the outcome hold either way.
 #[test]
 fn a_narrow_footprint_reads_and_writes_nothing_outside_the_graph() {
     let copied = |from: &str| {
@@ -292,12 +307,12 @@ fn a_narrow_footprint_reads_and_writes_nothing_outside_the_graph() {
                 "INSERT {{ GRAPH <{G}> {{ ?s <urn:copied> ?o }} }} \
                  WHERE {{ GRAPH <{OTHER}> {{ ?s <urn:p> ?o }} }}"
             ),
-            "applied",
+            "refused",
         ),
         (
             "USING <other>",
             copied(&format!("USING <{OTHER}>")),
-            "applied",
+            "refused",
         ),
         ("the default graph, named by nothing", copied(""), "applied"),
         (
@@ -306,7 +321,7 @@ fn a_narrow_footprint_reads_and_writes_nothing_outside_the_graph() {
                 "INSERT {{ GRAPH <{G}> {{ ?s <urn:copied> ?o }} }} USING NAMED <{OTHER}> \
                  WHERE {{ GRAPH ?g {{ ?s <urn:p> ?o }} }}"
             ),
-            "applied",
+            "refused",
         ),
         (
             "a variable graph, which binds G and nothing else",
@@ -319,7 +334,7 @@ fn a_narrow_footprint_reads_and_writes_nothing_outside_the_graph() {
         (
             "WITH <other>, deleting what it can match there",
             format!("WITH <{OTHER}> DELETE {{ ?s <urn:p> ?o }} WHERE {{ ?s <urn:p> ?o }}"),
-            "applied",
+            "refused",
         ),
         (
             "WITH <other>, inserting",
