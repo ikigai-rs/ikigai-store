@@ -83,6 +83,35 @@ pub fn literal(text: &str) -> String {
 /// );
 /// # Ok::<_, ikigai_core::Error>(())
 /// ```
+///
+/// **There is no `datetime` constructor, on purpose** (ledger #151). The lexical form of a
+/// timestamp is the consumer's domain choice (`ikigai-ledger` pins its own against
+/// `ikigai-log`'s), and this crate's part, that the term serializes correctly, is exactly
+/// `typed_literal` with `xsd:dateTime`. ⚠ What a consumer does need to know is the other
+/// direction: the store keeps an `xsd:dateTime` as a VALUE and gives it back in the engine's
+/// canonical lexical form, so fractional zero seconds written are not what is read.
+///
+/// ```
+/// use ikigai_store::sparql::{Literal, NamedNode, Term};
+/// use ikigai_store::Store;
+/// use oxigraph::model::{GraphName, Quad};
+///
+/// let xsd_date_time = NamedNode::new("http://www.w3.org/2001/XMLSchema#dateTime").unwrap();
+/// let written = Literal::new_typed_literal("2026-09-13T00:00:00.000Z", xsd_date_time);
+/// let store = Store::new().unwrap();
+/// store
+///     .insert(&Quad::new(
+///         NamedNode::new("urn:example:item").unwrap(),
+///         NamedNode::new("urn:example:filed").unwrap(),
+///         written,
+///         GraphName::DefaultGraph,
+///     ))
+///     .unwrap();
+/// let read = store.iter().next().unwrap().unwrap().object;
+/// let Term::Literal(read) = read else { unreachable!() };
+/// // Compare parsed values, or compare in SPARQL, where `xsd:dateTime` equality is by value.
+/// assert_eq!(read.value(), "2026-09-13T00:00:00Z");
+/// ```
 pub fn typed_literal(text: &str, datatype: &str, arg: &str) -> Result<String> {
     let dt = NamedNode::new(datatype).map_err(|e| Error::InvalidArgument {
         name: arg.to_string(),

@@ -131,6 +131,28 @@ pub const MAX_SPARQL_BYTES: usize = 1 << 20;
 /// **256 MiB** (ledger #1428).
 pub const MAX_LOAD_BYTES: usize = 256 << 20;
 
+/// The most quads `urn:iki:store:graph-update` copies into its private store for one update,
+/// unless the host sets another bound
+/// ([`DurableStore::with_max_scoped_copy_quads`](crate::DurableStore::with_max_scoped_copy_quads)):
+/// **250,000** (ledger #146).
+///
+/// The scoped door copies what an update can observe into a private store (`src/confine.rs`).
+/// Since ledger #1132 that is a quad or two for an update whose patterns name a constant, but
+/// one that observes the graph as a whole (`CLEAR`, `DROP`, `?s ?p ?o`, `p*`) copies every
+/// quad of it, and holds it three times: in the private store, in the set it diffs against,
+/// and in the set the update leaves. Measured 2026-10-14 in a release build on the in-memory
+/// backing (`tests/scoped_copy_measure.rs`, peak RSS from `/usr/bin/time -l`, other builds
+/// sharing the CPU): a whole-graph scoped write took 0.6 s at 100,000 quads, 3.7 s at 250,000,
+/// 9.3 s at 1,000,000 and 40 s at 3,000,000, 6 to 15 µs a quad, and each copied quad cost
+/// about 2 KB of memory on top of the store's own (+162 MB, +538 MB, +2.2 GB, +4.9 GB).
+///
+/// The time budget stops a copy too (it checks between quads), but root's budget is 120 s,
+/// which is ten million quads and some 20 GB. 250,000 keeps the copy inside the default 5 s
+/// budget at the slowest rate measured, and about half a gigabyte. A host whose tenants
+/// legitimately rewrite larger graphs whole raises it; a tenant that observes less (a constant
+/// in every pattern) is not affected at any graph size.
+pub const MAX_SCOPED_COPY_QUADS: usize = 250_000;
+
 /// The deepest a SPARQL query or update may nest `(`, `{` and `[` — with a run of `!`
 /// counting one level for each — **64**. Triple terms (`<<( … )>>`, `<< … >>`) are counted
 /// apart, against [`MAX_RDF_NESTING`] (ledger #1354).

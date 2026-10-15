@@ -78,6 +78,8 @@ where you can.
 | `urn:iki:store:graph-describe` | `Source` | SPARQL DESCRIBE, named graphs (one or several) | `urn:cap:store:read:graph:<iri>`, every one |
 | `urn:iki:store:info` | `Source` | backing, quad count, coverage | `urn:cap:store:read` |
 | `urn:iki:store:graphs` | `Source` | which named graphs you may read | `urn:cap:store:read*` (either form) |
+| `urn:iki:store:graph-info` | `Source` | one named graph's quad count, and the scoped write's copy bound | `urn:cap:store:read:graph:<iri>` |
+| `urn:iki:store:dump` | `Source` | every quad, every graph, as sorted N-Quads | `urn:cap:store:read`, **and nothing narrower** |
 | `urn:iki:store:update` | `Sink` | SPARQL UPDATE, whole dataset | `urn:cap:store:write` |
 | `urn:iki:store:graph-update` | `Sink` | SPARQL UPDATE, one named graph | `urn:cap:store:write:graph:<iri>` |
 | `urn:iki:store:load` | `Sink` | bulk-load an RDF document | `urn:cap:store:write` |
@@ -278,6 +280,17 @@ Three more things, each of them a decision rather than an omission:
   anything outside the graph — and `src/confine.rs` gives the argument, with a differential
   test, that the update computes the same answer on the part as on the whole. The unscoped
   door copies nothing.
+- **…and the copy is bounded** (ledger #146): at most 250,000 quads per update unless the host
+  sets another bound (`DurableStore::with_max_scoped_copy_quads`). A whole-graph copy is held
+  three times at about 2 KB a quad: measured in release, 3.7 s and +538 MB at 250,000 quads,
+  9.3 s and +2.2 GB at a million, 40 s and +4.9 GB at three million
+  (`tests/scoped_copy_measure.rs`). Past the bound the update is refused with nothing applied,
+  and the refusal names `urn:iki:store:update`, which evaluates in place and copies nothing.
+  `urn:iki:store:graph-info` reports the bound beside the graph's size. ⚠ The bound applies
+  only to a caller who may **read** the graph: for a write-only caller, refused-or-not would
+  say whether the graph holds more than the bound, the one-bit oracle ledger #761 closed. A
+  write-only caller's whole-graph updates are exactly `CLEAR` and `DROP` (anything with a
+  `WHERE` needs the read grant), and the time budget bounds those.
 
 `urn:iki:store:load` keeps the broad scope: a graph-scoped caller has no need of it,
 since `INSERT DATA { GRAPH <G> { … } }` through the narrow door does the same work under
@@ -508,6 +521,56 @@ capability-scoped and for production callers. Two different questions, and the r
 public `named_graphs()` accessor was ever added to `DurableStore`: a raw list on the store
 type bypasses the read boundary entirely.
 
+## ★ One graph's size: `urn:iki:store:graph-info` (ledger #147)
+
+`urn:iki:store:info` counts the whole store under the broad `urn:cap:store:read`, so a tenant
+holding only `urn:cap:store:read:graph:<G>` could not ask how large its own graph is.
+`urn:iki:store:graph-info` answers under exactly that grant:
+
+```text
+source urn:iki:store:graph-info graph=urn:iki:ledger:acme
+
+graph: <urn:iki:ledger:acme>
+exists: true
+quads: 27013
+graph-update copy bound: 250000
+```
+
+The last line is the scoped write door's copy bound, in the same unit as the count, so a tenant
+can see how close a whole-graph rewrite is to being refused before sending one. ⚠ Counting is a
+scan of the graph (oxigraph keeps no per-graph size), run within the caller's time budget and
+cached under the three write threads when the graph is covered. Like the scoped query doors it
+takes the per-graph grant only: a broad reader counts with
+`SELECT (COUNT(*) AS ?n) WHERE { GRAPH <G> { ?s ?p ?o } }`.
+
+## ★ The whole dataset out: `urn:iki:store:dump` (ledger #374)
+
+There was a way in for a whole dataset (`urn:iki:store:load`) and no way out, so the first host
+that needed a backup wrote `SELECT ?g ?s ?p ?o`, held the result set in memory and turned it
+back into N-Quads by hand, owning literal escaping, language tags and datatypes, and knowing in
+advance that CONSTRUCT folds every graph into one and that an unconfined query reads the default
+graph only. `urn:iki:store:dump` reads the store's quads directly, default graph included, and
+writes them with oxigraph's own N-Quads serializer:
+
+```text
+ikigai --quiet -c 'source urn:iki:store:dump' > backup.nq
+ikigai --quiet -c 'sink urn:iki:store:load format=application/n-quads' < backup.nq
+```
+
+- ⚠⚠ **It requires the BROAD `urn:cap:store:read`, and no per-graph grant satisfies it.** A dump
+  reads every graph, which is exactly the authority the per-graph tenancy boundary exists not
+  to hand out. Grant it to a backup job, never to a tenant; a tenant reads its own graph through
+  `urn:iki:store:graph-construct`.
+- **The lines are sorted**, so two dumps of the same dataset are the same bytes on either
+  backing and a backup diffs. N-Quads is one quad per line, so sorting reorders quads and
+  changes none.
+- **Bounded, and refused past the bound, never truncated.** A representation is bytes, so the
+  dump is built before it is answered: what is streamed is the inside, one pass from the store's
+  iterator through the serializer with no result set in between. It takes the query doors'
+  answer budget (quads against `max_rows`, bytes against `max_bytes`: 100,000 quads and 16 MiB
+  by default, up to 10,000,000 and 1 GiB for root or a `urn:cap:store:answer:*` grant) and the
+  caller's time budget. A dataset past either is refused, saying which.
+
 ## Three things a consumer cannot learn any other way
 
 Each of these cost a consumer real time, and none of them is visible from the API.
@@ -693,6 +756,20 @@ build without the feature has no arm for those type bytes, and the decoder's ans
 unknown one is `CorruptionError`, so any quad an `rdf-12` build wrote using such a term
 cannot be read back by a build without it. For a *persistent* store that makes a sibling
 crate's feature a data-format decision, and dropping that sibling later a downgrade.
+
+So a host that persists a store should know which kind of build it is (ledger #153). In the
+host's workspace:
+
+```text
+cargo tree -e features -i oxigraph --prefix none | grep 'oxigraph feature "rdf-12"'
+```
+
+A line means the build writes the RDF 1.2 encodings, and every later build that opens the same
+directory has to keep the feature on (`ikigai-store`'s own `rdf-12`, or the sibling that brought
+it). ⚠ `urn:iki:store:info` does not report this, deliberately: it could only report the build
+that is RUNNING, and the hazard is about the build that WROTE the data, which an older or newer
+binary on the same directory does not know. Making that visible would mean recording the
+writer's encoding in the store itself, which is a data-format decision, not a field.
 
 ### ⚠ `error[E0277]` inside `spareval` after `cargo add`: two `digest` crates (ledger #1148)
 

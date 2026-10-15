@@ -1,4 +1,4 @@
-//! The thirteen resources this crate binds, under the namespace it owns.
+//! The fifteen resources this crate binds, under the namespace it owns.
 //!
 //! ```text
 //! urn:iki:store:select           Source  SPARQL SELECT            urn:cap:store:read
@@ -11,6 +11,8 @@
 //! urn:iki:store:graph-describe   Source  DESCRIBE, graph set      urn:cap:store:read:graph:<iri> each
 //! urn:iki:store:info             Source  backing, size, coverage  urn:cap:store:read
 //! urn:iki:store:graphs           Source  readable graph names     urn:cap:store:read* (either)
+//! urn:iki:store:graph-info       Source  one graph's size         urn:cap:store:read:graph:<iri>
+//! urn:iki:store:dump             Source  every quad, as N-Quads   urn:cap:store:read (broad, ONLY)
 //! urn:iki:store:update           Sink    SPARQL UPDATE, all of it urn:cap:store:write
 //! urn:iki:store:graph-update     Sink    SPARQL UPDATE, one graph urn:cap:store:write:graph:<iri>
 //! urn:iki:store:load             Sink    bulk-load an RDF doc     urn:cap:store:write
@@ -117,6 +119,7 @@ use oxigraph::model::{
 };
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
 use oxigraph::sparql::QueryResults;
+use oxigraph::store::Store;
 
 use crate::budget::{too_large, AnswerBound, AnswerBudget, CappedWriter, Deadline, Measure};
 use crate::scope::GraphSet;
@@ -304,7 +307,7 @@ const LOAD_FORMATS: [&str; 5] = [
     "application/rdf+xml",
 ];
 
-/// Bind this store's thirteen resources into a space.
+/// Bind this store's fifteen resources into a space.
 ///
 /// The store is moved in: this space and the endpoints in it are the only holders of the
 /// dataset unless the caller took a handle at construction (see
@@ -353,6 +356,18 @@ pub fn space(store: DurableStore) -> EndpointSpace {
         .bind(
             Exact::new("urn:iki:store:graphs"),
             GraphsEndpoint {
+                store: Arc::clone(&store),
+            },
+        )
+        .bind(
+            Exact::new("urn:iki:store:graph-info"),
+            GraphInfoEndpoint {
+                store: Arc::clone(&store),
+            },
+        )
+        .bind(
+            Exact::new("urn:iki:store:dump"),
+            DumpEndpoint {
                 store: Arc::clone(&store),
             },
         )
@@ -1255,6 +1270,332 @@ fn granted_graphs(inv: &Invocation<'_>) -> Vec<NamedNode> {
         .collect()
 }
 
+// ----------------------------------------------------------------------- graph-info
+
+/// `urn:iki:store:graph-info` — how large ONE named graph is, under the read grant for that
+/// graph (ledger #147).
+///
+/// ★ **`urn:iki:store:info` answers for the whole store under the broad [`CAP_READ`]**, so a
+/// tenant holding only `urn:cap:store:read:graph:<G>` could not ask how large its own graph
+/// is. That number is also the one the scoped write door's copy bound is measured in (ledger
+/// #146), so the answer carries the bound beside it: a tenant can see how close a whole-graph
+/// rewrite is to being refused before it sends one.
+///
+/// ⚠ **A count is a scan.** oxigraph keeps no per-graph size, so this walks `G`'s quads (as
+/// `Store::len` walks every quad for `info`). It runs within the caller's time budget, and it
+/// is cacheable under the three write threads when the graph is covered, so on an owned store
+/// the scan is paid once per write rather than once per read.
+///
+/// ⚠ **[`CAP_READ`] does not satisfy this door**, for the reason the scoped query doors give:
+/// the declared scope is [`CAP_READ_GRAPH`], and accepting the broad grant as well would make
+/// the enforced scope wider than the declared one. A broad reader counts with
+/// `SELECT (COUNT(*) AS ?n) WHERE { GRAPH <G> { ?s ?p ?o } }`.
+#[derive(Clone)]
+struct GraphInfoEndpoint {
+    store: Arc<DurableStore>,
+}
+
+#[async_trait]
+impl Endpoint for GraphInfoEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.store.serving()?;
+        match inv.request.verb {
+            Verb::Source => {
+                let graph = inv.inline_str("graph")?;
+                let target = NamedNode::new(graph).map_err(|e| Error::InvalidArgument {
+                    name: "graph".to_string(),
+                    detail: format!("`{graph}` is not an IRI: {e}"),
+                })?;
+                // ★ The parameterized half of the declared scope, as on the scoped query
+                // doors: the kernel saw only that the caller holds SOME grant under
+                // `urn:cap:store:read:graph:`, and this is where it must name THIS graph.
+                let scope = cap_read_graph(target.as_str());
+                if !inv.capability.allows(&scope) {
+                    return Err(Error::Denied(format!(
+                        "counting graph <{}> through `urn:iki:store:graph-info` needs the grant \
+                         `{scope}`, which this capability does not hold. A grant names exactly \
+                         one graph; holding `{CAP_READ}` does not imply it, and is instead the \
+                         authority for `urn:iki:store:info` over the whole dataset",
+                        target.as_str()
+                    )));
+                }
+                let requested = crate::budget::inline_bound(inv, "budget")?;
+                let budget = crate::budget::effective_budget(
+                    requested,
+                    self.store.time_budget().for_capability(inv.capability),
+                )?;
+                let store = Arc::clone(&self.store);
+                let counted = target.clone();
+                let (exists, quads) = self
+                    .store
+                    .evaluate(
+                        target.as_str(),
+                        false,
+                        inv.capability,
+                        requested,
+                        move |deadline| {
+                            let dataset = store.dataset();
+                            let exists = dataset
+                                .contains_named_graph(counted.as_ref())
+                                .map_err(|e| Error::Endpoint(format!("store: {e}")))?;
+                            let mut quads: u64 = 0;
+                            for quad in dataset.quads_for_pattern(
+                                None,
+                                None,
+                                None,
+                                Some(counted.as_ref().into()),
+                            ) {
+                                deadline.check()?;
+                                quad.map_err(|e| Error::Endpoint(format!("store: {e}")))?;
+                                quads += 1;
+                            }
+                            Ok((exists, quads))
+                        },
+                    )
+                    .map_err(|e| {
+                        scan_timeout(e, &format!("counting graph <{}>", target.as_str()), budget)
+                    })?;
+                let text = format!(
+                    "graph: <{}>\nexists: {exists}\nquads: {quads}\ngraph-update copy bound: {}\n",
+                    target.as_str(),
+                    self.store.max_scoped_copy_quads(),
+                );
+                Ok(with_freshness(
+                    plain(text),
+                    &self.store,
+                    // Confined to `G` by construction: it reads `G`'s quads and its
+                    // registration and nothing else, so it is exactly as covered as a scoped
+                    // read of `G`.
+                    Some(std::slice::from_ref(&target)),
+                ))
+            }
+            other => Err(unsupported("store-graph-info", other)),
+        }
+    }
+
+    fn name(&self) -> &str {
+        "store-graph-info"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("store-graph-info")
+            .title("One named graph's size")
+            .summary(
+                "How many quads one named graph holds and whether it exists, under the read \
+                 grant for that graph: the per-graph twin of `urn:iki:store:info`, for a caller \
+                 that may read its own graph and nothing else. The answer is four lines: \
+                 `graph: <IRI>`, `exists: true|false`, `quads: N`, and `graph-update copy \
+                 bound: M`, the most quads `urn:iki:store:graph-update` copies for one update, \
+                 so a whole-graph rewrite (`CLEAR`, `DROP`, a pattern with no constant) of a \
+                 graph holding more than M quads is refused there. Counting is a scan of the \
+                 graph, within the caller's time budget.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .requires(CAP_READ_GRAPH)
+            .input(
+                ArgSpec::new("graph")
+                    .summary(
+                        "The named graph to count. The caller must hold \
+                         `urn:cap:store:read:graph:<this IRI>`.",
+                    )
+                    .class(XSD_ANY_URI),
+            )
+            .input(budget_arg())
+            .output("text/plain")
+    }
+}
+
+// ----------------------------------------------------------------------------- dump
+
+/// `urn:iki:store:dump` — the whole dataset as N-Quads, every graph and the default graph,
+/// under the BROAD read grant (ledger #374).
+///
+/// # ★ Why a primitive
+///
+/// There was a way in for a whole dataset (`urn:iki:store:load`) and no way out, so gonk's
+/// backup was a `SELECT ?g ?s ?p ?o`, held in memory as a result set and turned back into
+/// N-Quads by hand. That left two traps for the next host to know in advance: CONSTRUCT
+/// answers TRIPLES and folds every graph into one, and an unconfined query reads the default
+/// graph only. This reads the store's quads directly, default graph included, and writes
+/// them with oxigraph's own N-Quads serializer, so no consumer owns literal escaping, language
+/// tags or datatypes, and nothing goes through a result set.
+///
+/// # ⚠ The capability is the broad one, deliberately and loudly
+///
+/// A dump reads EVERY graph, which is exactly the authority the per-graph tenancy boundary
+/// exists not to hand out. So it requires [`CAP_READ`] and nothing narrower satisfies it: a
+/// tenant reads its own graph through `urn:iki:store:graph-construct`. Grant it to a backup
+/// job, never to a tenant.
+///
+/// # Bounded, refused past the bound, never truncated
+///
+/// ⚠ **It is not streamed to the caller**: a [`Representation`] is bytes, so the whole dump is
+/// built before it is answered. What is streamed is the inside: one pass from the store's quad
+/// iterator through the serializer into a [`CappedWriter`], with no result set in between. So
+/// it takes the query doors' bounds: the caller's answer budget (quads against `max_rows`,
+/// serialized bytes against `max_bytes`; 100,000 quads and 16 MiB by default, up to
+/// 10,000,000 and 1 GiB for root or a `urn:cap:store:answer:*` grant) and its time budget. A
+/// dataset past either is refused with nothing sent, saying which bound it crossed.
+///
+/// ★ **The lines are sorted**, so two dumps of the same dataset are the same bytes on either
+/// backing, and a backup diffs. N-Quads is one quad per line (a newline inside a literal is
+/// escaped), so sorting the lines reorders quads and changes none of them. Blank nodes keep
+/// their stored labels.
+#[derive(Clone)]
+struct DumpEndpoint {
+    store: Arc<DurableStore>,
+}
+
+#[async_trait]
+impl Endpoint for DumpEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.store.serving()?;
+        match inv.request.verb {
+            Verb::Source => {
+                let requested = crate::budget::inline_bound(inv, "budget")?;
+                let budget = crate::budget::effective_budget(
+                    requested,
+                    self.store.time_budget().for_capability(inv.capability),
+                )?;
+                let answer = crate::budget::effective_answer(
+                    crate::budget::inline_bound(inv, "max_rows")?,
+                    crate::budget::inline_bound(inv, "max_bytes")?,
+                    self.store.answer_budget().for_capability(inv.capability),
+                )?;
+                let store = Arc::clone(&self.store);
+                let bytes = self
+                    .store
+                    .evaluate("", false, inv.capability, requested, move |deadline| {
+                        dump_quads(store.dataset(), deadline, answer)
+                    })
+                    .map_err(|e| scan_timeout(e, "this dump", budget))?;
+                Ok(with_freshness(
+                    Representation::new(
+                        ReprType::new(DUMP_MEDIA).with_param("charset", "utf-8"),
+                        bytes,
+                    ),
+                    &self.store,
+                    // Every graph and the default graph: never confined.
+                    None,
+                ))
+            }
+            other => Err(unsupported("store-dump", other)),
+        }
+    }
+
+    fn name(&self) -> &str {
+        "store-dump"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("store-dump")
+            .title("The whole dataset as N-Quads")
+            .summary(
+                "Every quad in the store, every named graph and the default graph, as N-Quads \
+                 written by the engine's own serializer, one quad per line, the lines sorted so \
+                 two dumps of the same dataset are the same bytes. ⚠ It reads EVERY graph, so it \
+                 requires the broad `urn:cap:store:read` and no per-graph grant satisfies it: \
+                 this is the authority the per-graph boundary exists not to hand out, for a \
+                 backup job and never for a tenant. Bounded like a query's answer (quads \
+                 against `max_rows`, bytes against `max_bytes`, under the caller's answer \
+                 budget) and by the caller's time budget; a dataset past either is refused, \
+                 never truncated. `urn:iki:store:load` with `format=application/n-quads` reads \
+                 it back.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .requires(CAP_READ)
+            .input(budget_arg())
+            .input(
+                ArgSpec::new("max_rows")
+                    .summary(format!(
+                        "optional: the most quads the dump may hold. A larger dataset is refused, \
+                         never truncated. It can only LOWER the bound this caller's capability \
+                         gets ({} quads unless it holds a `urn:cap:store:answer:<rows>` grant; \
+                         at most {}), never raise it",
+                        self.store.answer_budget().base().rows(),
+                        self.store.answer_budget().ceiling().rows(),
+                    ))
+                    .class(XSD_POSITIVE_INTEGER)
+                    .optional(),
+            )
+            .input(answer_bytes_arg(self.store.answer_budget()))
+            .output(DUMP_MEDIA)
+    }
+}
+
+/// The one syntax `urn:iki:store:dump` answers in: the quad syntax `urn:iki:store:load` reads.
+const DUMP_MEDIA: &str = "application/n-quads";
+
+/// Every quad of `store`, serialized as N-Quads within `bound` and `deadline`, lines sorted.
+///
+/// ```text
+/// <urn:x:a> <urn:x:p> "in the default graph" .
+/// <urn:x:a> <urn:x:p> "in a named graph" <urn:x:g> .
+/// ```
+///
+/// (That shape, a default-graph quad with no fourth term, is pinned by
+/// `tests/dump.rs::the_dump_is_n_quads_with_every_graph_and_the_default_graph`.)
+fn dump_quads(store: &Store, deadline: &Deadline, bound: AnswerBound) -> Result<Vec<u8>> {
+    let io = |e: std::io::Error| Error::Endpoint(format!("serialize: {e}"));
+    let mut out = CappedWriter::new(bound.bytes());
+    let written = (|| {
+        let mut serializer = RdfSerializer::from_format(RdfFormat::NQuads).for_writer(&mut out);
+        let mut quads: u64 = 0;
+        for quad in store.iter() {
+            deadline.check()?;
+            quads += 1;
+            if quads > bound.rows() {
+                return Err(dump_too_large("quads", "max_rows", bound.rows()));
+            }
+            let quad = quad.map_err(|e| Error::Endpoint(format!("store: {e}")))?;
+            serializer.serialize_quad(&quad).map_err(io)?;
+        }
+        serializer.finish().map_err(io)?;
+        Ok(())
+    })();
+    if out.over() {
+        return Err(dump_too_large("bytes", "max_bytes", bound.bytes()));
+    }
+    written?;
+    let bytes = out.into_bytes();
+    let mut lines: Vec<&[u8]> = bytes.split_inclusive(|b| *b == b'\n').collect();
+    lines.sort_unstable();
+    Ok(lines.concat())
+}
+
+/// The refusal of a dump past the caller's answer bound: the store's other size refusals, in
+/// words that fit a request with no query in it.
+fn dump_too_large(unit: &str, arg: &str, bound: u64) -> Error {
+    Error::InvalidArgument {
+        name: arg.to_string(),
+        detail: format!(
+            "the dataset is larger than {bound} {unit}, the most this capability may dump. It \
+             was refused, not truncated: no part of it was sent (ledger #374). The host raises \
+             the bound with a `urn:cap:store:answer:*` grant (root gets the ceiling); a request's \
+             `{arg}=` can only lower it. A tenant's own graph is \
+             `urn:iki:store:graph-construct`, under the per-graph grant"
+        ),
+    }
+}
+
+/// A timeout from a scan that is not a SPARQL evaluation, told as what it was: the shared
+/// message says "this SPARQL query" and advises fewer joins, which a dump or a count has none
+/// of. Every other error passes through unchanged.
+fn scan_timeout(e: Error, what: &str, budget: std::time::Duration) -> Error {
+    match e {
+        Error::Timeout(_) => Error::Timeout(format!(
+            "{what} ran past its time budget of {} ms and was stopped, with nothing answered \
+             (ledger #964). The budget is set by the host, which raises it with a \
+             `urn:cap:store:budget:<ms>` grant (root gets 120 s by default); a request's \
+             `budget=` can only lower it",
+            budget.as_millis()
+        )),
+        other => other,
+    }
+}
+
 // --------------------------------------------------------------------------- update
 
 #[derive(Clone)]
@@ -1450,6 +1791,9 @@ impl Endpoint for GraphUpdateEndpoint {
                 let store = Arc::clone(&self.store);
                 let text = update.to_string();
                 let scope = target.clone();
+                // ★ The copy bound (ledger #146) only for a caller who may read `G`: for any
+                // other, refused-or-not would say how large `G` is. `confine::scoped_update`.
+                let max_copy = may_read.then(|| self.store.max_scoped_copy_quads());
                 let requested = crate::budget::inline_bound(inv, "budget")?;
                 let applied = self.store.evaluate(
                     update,
@@ -1483,6 +1827,7 @@ impl Endpoint for GraphUpdateEndpoint {
                             &target,
                             parsed.prepared,
                             &parsed.footprint,
+                            max_copy,
                             deadline,
                         )
                     },
@@ -1891,10 +2236,27 @@ fn serialize_solutions(
         // is exactly what we want. A GATED variant appears only in builds we do not
         // control, so the same exhaustiveness is a landmine that detonates downstream.
         // ⚠ Nothing checks that distinction automatically: if spareval ever puts a
-        // variant behind a feature, this match joins the trap silently. Audited
-        // 2026-09-13 against spareval 0.2.7, along with `serde_json::Value` in
-        // `sparql::json_to_term` (no gated variants either) and `GraphName` in
-        // `confine.rs` (ungated, and it has a catch-all regardless).
+        // variant behind a feature, this match joins the trap silently. So it is
+        // re-audited by hand, and the record is here (ledger #152):
+        //
+        // - 2026-09-13, against oxrdf 0.3.4, spareval 0.2.7 and serde_json 1.0: gating
+        //   touched only `Term`/`TermRef`.
+        // - 2026-10-14, against oxigraph 0.5.11, oxrdf 0.3.4, spargebra 0.4.7, spareval
+        //   0.2.7, sparesults 0.3.4 and serde_json 1.0.154, by listing every
+        //   `#[cfg(feature …)]` variant of every public enum in their sources and then
+        //   every match in `src/` over one of those enums. The list has grown, because
+        //   this crate has depended on spargebra directly since ledger #964: besides
+        //   `Term`/`TermRef` (`rdf-12`), spargebra's `TermPattern`, `GroundTerm` and
+        //   `GroundTermPattern` gain `Triple` and its `Function` gains nine variants under
+        //   `sparql-12` (which `oxigraph/rdf-12` reaches), `Function::Adjust` is under
+        //   `sep-0002`, and `GraphPattern::Lateral` under `sep-0006`. Every match here over
+        //   the first four has a catch-all (`sparql::term_to_json`,
+        //   `confine::{term_pattern, ground_term_pattern, ground_term}`, `matches!` in
+        //   `depth.rs`), nothing matches on `Function`'s variants, and the exhaustive
+        //   walks over `GraphPattern` are safe because THIS manifest enables `sep-0006`,
+        //   so `Lateral` exists in every build that contains this crate. `QueryResults`,
+        //   `GraphName`, `GraphUpdateOperation`, `Expression` and `serde_json::Value`
+        //   have no gated variants.
         QueryResults::Graph(_) => {
             return Err(Error::Endpoint(
                 "internal: a graph reached the result-set serializer".to_string(),
