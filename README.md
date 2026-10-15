@@ -1082,19 +1082,43 @@ two into one shared module):
    or join over rows already in memory (`COUNT(*)` over a cross product) still ignores the
    token. Such an evaluation is counted as overdue (`DurableStore::overdue_evaluations`).
    ★ **The cap is on reads IN FLIGHT** (ledger #1427): a read takes one of
-   `TimeBudget::max_overdue` slots (default: a quarter of the machine's cores, at least one)
+   `TimeBudget::max_overdue` slots (default: a quarter of the machine's cores, at least two)
    before its thread starts and gives it back when the thread ends, so at most that many reads
    evaluate at once, and so at most that many can outlive their callers. A read that finds
    every slot taken waits for one within its own budget, and is refused with a transient
    `Error::Unavailable` if none comes free; while the slots are filled by OVERDUE
    evaluations, a new one is refused at once. Both refusals end by naming the cap, whether it
    is the default or the host set it, the machine's available parallelism, and that
-   `TimeBudget::with_max_overdue` raises it (ledger #1500), because the default is 1 on a
-   machine under 8 cores and 4 on an 18-core laptop, and the same refusal reads like two
+   `TimeBudget::with_max_overdue` raises it (ledger #1500), because the default is 2 on a
+   machine under 12 cores and 4 on an 18-core laptop, and the same refusal reads like two
    different failures. Updates run on the store's one writer thread,
    so they hold at most one more core. Through 0.2.20 the cap was checked against the overdue
    count alone, which rises only at a timeout, so eight requests arriving together at a cap
    of 1 all started and left eight cores pinned (`tests/overdue_cap_in_flight.rs`).
+4. ★ **No one caller can fill the cap, and the host always has room** (after 0.2.23,
+   ledger #1002). Through 0.2.23 the cap was one pool for everyone: a caller that could start
+   evaluations oxigraph cannot stop (gonk's anonymous HTTP door could) filled it, and then
+   EVERY evaluation was refused `Unavailable`, the host's own reads and its backup included.
+   Now the cap is divided three ways:
+   - **a reserve for the host** (`TimeBudget::with_reserve`, default 1, at most the cap less
+     1): slots only **root** and a capability holding **`urn:cap:store:reserve`**
+     (`budget::CAP_RESERVE`) may use. ⚠ **A host gives the grant to its own scoped jobs** (a
+     backup, a scheduled read), or they are ordinary callers;
+   - **every other caller together** holds at most the cap less the reserve;
+   - **one caller** holds at most its share (`TimeBudget::with_caller_share`, default half of
+     what the reserve leaves, at least 1). One caller is one PRINCIPAL
+     (`Capability::principal`), and **every capability that names no principal, every
+     anonymous request among them, is ONE caller**. Not a fingerprint of the scopes: a holder
+     can attenuate its own capability to any subset, and a wire peer can carry any subset of
+     its ceiling, so a fingerprint is a key a caller can rotate. A door that wants two
+     unidentified callers counted apart mints them principals.
+
+   A read past its caller's share or the callers' pool waits within its budget like any
+   other, and while what it may use is all OVERDUE it is refused at once, naming whose share
+   (the principal, or "callers that name no principal"), the share, the pool, the reserve,
+   where each number came from and how a host changes it. At the store-wide cap the refusal
+   is the sentence it always was. `tests/overdue_share.rs` pins it, starting from the
+   reproduction: six anonymous runaways on a cap of 3 refused a ROOT read on 0.2.23.
 
 `tests/sparql_time_budget.rs` pins all of it, including waiting for an abandoned update's
 worker to end and checking the store is unchanged, at both update doors.
@@ -1213,9 +1237,11 @@ let matched = budget.run(&text.clone(), inv.capability, None, move |token| {
 - ★ **Each `EvaluationBudget::new` is its own count under its own cap — so state yours**
   (ledger #1500). Clones share a count; two `new`s never do, and neither shares the store's
   doors'. The default cap is `budget::default_max_overdue()`, a quarter of the machine's
-  available parallelism and at least one, which is **1 on anything under 8 cores**: on a
-  4-core CI runner one runaway `sh:select` made every later SHACL validation in the process
-  `Unavailable` until it ended (ikigai-rs/ikigai-shacl PR 34). A consumer that would rather
+  available parallelism and at least two (at least one through 0.2.23, which was **1 on
+  anything under 8 cores**: on a 4-core CI runner one runaway `sh:select` made every later
+  SHACL validation in the process `Unavailable` until it ended, ikigai-rs/ikigai-shacl PR 34).
+  The caller share and host reserve apply here too, keyed by the capability `run` is given
+  (ledger #1002). A consumer that would rather
   hold more cores than refuse says so:
   `EvaluationBudget::new(TimeBudget::new(base).with_max_overdue(n))`, and a host decides
   whether consumers share one budget (one cap across them) or each keep their own. The
