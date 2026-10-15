@@ -223,6 +223,14 @@ enum Coverage {
 /// is taken. [`is_sole_writer`](DurableStore::is_sole_writer) reports whether the handle
 /// stayed; [`read_is_covered`](DurableStore::read_is_covered) answers the per-read
 /// question the endpoints actually ask.
+///
+/// # A handle, not the data
+///
+/// `Clone` is an `Arc` clone: every clone reads and writes the same dataset. So a host that
+/// needs the store after composing a kernel (to fingerprint it, to bind a second space)
+/// clones it BEFORE [`space`](crate::space) takes it by value, and keeps the clone (ledger
+/// #281). [`reserved_graphs_fingerprint`](DurableStore::reserved_graphs_fingerprint) has the
+/// example.
 #[derive(Clone)]
 pub struct DurableStore {
     store: Arc<Store>,
@@ -254,6 +262,9 @@ pub struct DurableStore {
     /// The most bytes a document `urn:iki:store:load` takes may hold, and the most bytes of
     /// terms its statements may spell out — see [`with_max_load_bytes`](Self::with_max_load_bytes).
     max_load_bytes: usize,
+    /// The most quads `urn:iki:store:graph-update` copies into its private store for one
+    /// update — see [`with_max_scoped_copy_quads`](Self::with_max_scoped_copy_quads).
+    max_scoped_copy_quads: usize,
     /// The one thread every update on this store runs on, shared by every clone (ledger
     /// #1127): a write committed on a freshly spawned thread degrades RocksDB's memtable. See
     /// `budget::Writer`.
@@ -304,6 +315,7 @@ impl DurableStore {
             answer: AnswerBudget::default(),
             evaluations: Arc::default(),
             max_load_bytes: crate::limits::MAX_LOAD_BYTES,
+            max_scoped_copy_quads: crate::limits::MAX_SCOPED_COPY_QUADS,
             writer: Arc::default(),
         })
     }
@@ -359,6 +371,7 @@ impl DurableStore {
             answer: AnswerBudget::default(),
             evaluations: Arc::default(),
             max_load_bytes: crate::limits::MAX_LOAD_BYTES,
+            max_scoped_copy_quads: crate::limits::MAX_SCOPED_COPY_QUADS,
             writer: Arc::default(),
         })
     }
@@ -627,6 +640,51 @@ impl DurableStore {
     /// `docs/design/handle-model.md`), so it belongs beside the host's other assertions
     /// about its own composition, not on a read path.
     ///
+    /// ★ **A `DurableStore` is a handle: clone it before you compose** (ledger #281).
+    /// [`space`](crate::space) takes the store by value, so a host that composes a kernel
+    /// first has nothing left to fingerprint. The clone is an `Arc` over the same dataset, not
+    /// a copy, so it sees every write, through the kernel's doors as well as the sharer's:
+    ///
+    /// ```
+    /// use futures::executor::block_on;
+    /// use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
+    /// use ikigai_store::{space, DurableStore, SharerWrites};
+    /// use std::sync::Arc;
+    ///
+    /// # fn demo() -> ikigai_core::Result<()> {
+    /// let (store, handle) =
+    ///     DurableStore::in_memory_shared_declaring(SharerWrites::only_the_default_graph())?;
+    /// let kept = store.clone(); // before `space` takes the store
+    /// let kernel = Kernel::new(Arc::new(space(store)));
+    /// let before = kept.reserved_graphs_fingerprint()?;
+    ///
+    /// // The sharer writes the default graph, as it promised: nothing reserved moved.
+    /// handle
+    ///     .load_from_slice(
+    ///         oxigraph::io::RdfFormat::NTriples,
+    ///         b"<urn:example:a> <urn:example:p> <urn:example:b> .",
+    ///     )
+    ///     .unwrap();
+    /// assert!(kept.reserved_graphs_fingerprint()?.changed_since(&before).is_empty());
+    ///
+    /// // A write through the kernel's own door lands in a reserved graph, and the clone sees
+    /// // it: one dataset, two handles. (Which is also why the two fingerprints belong around
+    /// // the SHARER's writes alone, above.)
+    /// let update = "INSERT DATA { GRAPH <urn:example:g> { <urn:example:a> <urn:example:p> 1 } }";
+    /// block_on(kernel.issue(
+    ///     Request::new(Verb::Sink, Iri::parse("urn:iki:store:graph-update").unwrap())
+    ///         .with_arg("graph", ArgRef::Inline(b"urn:example:g".to_vec()))
+    ///         .with_arg("content", ArgRef::Inline(update.as_bytes().to_vec())),
+    ///     &Capability::root(),
+    /// ))?;
+    /// assert_eq!(
+    ///     kept.reserved_graphs_fingerprint()?.changed_since(&before),
+    ///     ["<urn:example:g>"]
+    /// );
+    /// # Ok(()) }
+    /// # demo().unwrap();
+    /// ```
+    ///
     /// # Errors
     ///
     /// [`Error::Endpoint`] when this store carries no declaration. ★ Deliberately an
@@ -755,6 +813,38 @@ impl DurableStore {
     /// [`with_max_load_bytes`](Self::with_max_load_bytes).
     pub fn max_load_bytes(&self) -> usize {
         self.max_load_bytes
+    }
+
+    /// Set the most quads `urn:iki:store:graph-update` may copy into its private store for
+    /// one update (builder; ledger #146). Every clone made AFTER this carries it, so call it
+    /// before [`space`](crate::space). The default is
+    /// [`MAX_SCOPED_COPY_QUADS`](crate::limits::MAX_SCOPED_COPY_QUADS), where the
+    /// measurement is. At least 1.
+    ///
+    /// The scoped door evaluates an update against a private copy of the part of the graph
+    /// the update can observe (`src/confine.rs`). For most updates that is a quad or two, but
+    /// one that observes the graph as a whole (`CLEAR`, `DROP`, a pattern with no constant)
+    /// copies all of it, held in memory three times over. Past this bound the update is
+    /// refused, never applied in part, and the refusal names the broad door, which copies
+    /// nothing.
+    ///
+    /// ```
+    /// use ikigai_store::DurableStore;
+    ///
+    /// // A host whose tenants hold large graphs and may rewrite them whole.
+    /// let store = DurableStore::in_memory()?.with_max_scoped_copy_quads(5_000_000);
+    /// assert_eq!(store.max_scoped_copy_quads(), 5_000_000);
+    /// # Ok::<(), ikigai_core::Error>(())
+    /// ```
+    pub fn with_max_scoped_copy_quads(mut self, quads: usize) -> Self {
+        self.max_scoped_copy_quads = quads.max(1);
+        self
+    }
+
+    /// The most quads one scoped update may copy. See
+    /// [`with_max_scoped_copy_quads`](Self::with_max_scoped_copy_quads).
+    pub fn max_scoped_copy_quads(&self) -> usize {
+        self.max_scoped_copy_quads
     }
 
     /// How many SPARQL evaluations over this dataset are still running after their callers

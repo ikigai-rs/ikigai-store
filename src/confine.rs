@@ -128,6 +128,19 @@
 //!
 //! The unscoped `urn:iki:store:update` is unchanged and copies nothing.
 //!
+//! ★ **And the copy is bounded** (ledger #146). A copy of the whole graph is held three times
+//! (the private store, the set step 4 diffs against, the set the update leaves) at about 2 KB
+//! a quad, so a host pointing this door at a large graph used to get a silent cliff: 3.7 s and
+//! half a gigabyte at 250,000 quads, 40 s and 5 GB at 3,000,000. Past
+//! [`DurableStore::max_scoped_copy_quads`](crate::DurableStore::max_scoped_copy_quads)
+//! ([`crate::limits::MAX_SCOPED_COPY_QUADS`] unless the host sets another) the copy stops and
+//! the update is refused with nothing applied, naming the broad door, which copies nothing.
+//! ⚠ The bound applies only to a caller who may READ `G`: for any other caller, refused-or-not
+//! would say whether `G` holds more than the bound, which is the one-bit oracle ledger #761
+//! closed for `DROP`/`CLEAR`/`CREATE`. Such a caller's whole-graph updates are exactly `CLEAR`
+//! and `DROP` (anything with a `WHERE` needs the read grant), and the time budget is what
+//! bounds those: the copy checks it between quads.
+//!
 //! Blank-node labels survive the round trip (oxigraph stores them by label), but this
 //! ecosystem skolemizes and a blank node in a scoped graph is outside what these tests
 //! pin.
@@ -626,11 +639,20 @@ pub(crate) fn reads_the_dataset(prepared: &PreparedSparqlUpdate) -> bool {
 /// ★ The real store is written only at `deadline`'s commit point (ledger #964): the scratch
 /// copy is private, so an update that runs out of time before step 4 has written nothing
 /// anywhere, and one that runs out at step 4 is not committed.
+///
+/// ★ **And the copy is bounded in quads** (ledger #146): `max_copy` is the most quads step 1
+/// may copy, and one more refuses the update with nothing applied ([`copy_too_large`]). It is
+/// `None` for a caller who may not READ the graph, because a refusal that depends on how many
+/// quads `G` holds would tell that caller something about `G` (the ledger #761 rule: whether
+/// an update is refused says nothing about what `G` holds). The only updates such a caller can
+/// send that copy the whole graph are `CLEAR` and `DROP` (every other one needs the read
+/// grant), and those are bounded by the time budget alone. See the module docs.
 pub(crate) fn scoped_update(
     store: &Store,
     graph: &NamedNode,
     update: PreparedSparqlUpdate,
     footprint: &Footprint,
+    max_copy: Option<usize>,
     deadline: &Deadline,
 ) -> Result<Applied> {
     let scope = GraphName::from(graph.clone());
@@ -647,7 +669,7 @@ pub(crate) fn scoped_update(
             .insert_named_graph(graph.as_ref())
             .map_err(storage)?;
     }
-    let before = copy(store, graph, footprint, &scratch, deadline)?;
+    let before = copy(store, graph, footprint, max_copy, &scratch, deadline)?;
 
     // 2. The caller's update, against the private dataset.
     update
@@ -718,11 +740,14 @@ pub(crate) fn scoped_update(
 }
 
 /// Step 1 of [`scoped_update`]: copy `footprint`'s quads of `graph` into `scratch`, and
-/// answer the set copied — the "before" that step 4 diffs against.
+/// answer the set copied — the "before" that step 4 diffs against. Refused, with nothing
+/// written anywhere, at the first quad past `max_copy` (ledger #146), so what it holds never
+/// exceeds the bound by more than that one quad.
 fn copy(
     store: &Store,
     graph: &NamedNode,
     footprint: &Footprint,
+    max_copy: Option<usize>,
     scratch: &Store,
     deadline: &Deadline,
 ) -> Result<HashSet<Quad>> {
@@ -733,6 +758,9 @@ fn copy(
             deadline.check()?;
             let quad = quad.map_err(storage)?;
             if !copied.contains(&quad) {
+                if let Some(bound) = max_copy.filter(|bound| copied.len() >= *bound) {
+                    return Err(copy_too_large(graph, bound, footprint));
+                }
                 scratch.insert(&quad).map_err(storage)?;
                 copied.insert(quad);
             }
@@ -753,6 +781,38 @@ fn copy(
         }
     }
     Ok(copied)
+}
+
+/// The refusal of a scoped update whose footprint holds more than `bound` quads of `graph`
+/// (ledger #146).
+///
+/// ★ `InvalidArgument` on `content`, the shape of the store's other size bounds: the update is
+/// well-formed and the caller holds the grant, but this door evaluates against a private copy
+/// and will not make one that large. It names what to do instead: narrow the update, or use the
+/// broad door, which evaluates in place and copies nothing. It is reached only by a caller who
+/// may read `graph` (see [`scoped_update`]), so naming the bound discloses nothing that caller
+/// could not count for itself through `urn:iki:store:graph-info`.
+fn copy_too_large(graph: &NamedNode, bound: usize, footprint: &Footprint) -> Error {
+    let why = if *footprint == Footprint::Whole {
+        "observes the graph as a whole (a `CLEAR` or `DROP`, a pattern with no IRI or literal \
+         in it, or a path that can be zero-length or is negated), so the door copies every quad \
+         of it"
+    } else {
+        "has patterns that match that many of the graph's quads"
+    };
+    Error::InvalidArgument {
+        name: "content".to_string(),
+        detail: format!(
+            "this update {why}, and graph <{g}> holds more than {bound} of them: \
+             `urn:iki:store:graph-update` evaluates an update against a private copy of what it \
+             can observe and copies at most {bound} quads (the host's bound, ledger #146). \
+             Nothing was applied. Name a subject, predicate or object in each pattern so the \
+             update observes less, or, holding `urn:cap:store:write` (and `urn:cap:store:read` \
+             for a `WHERE`), use `urn:iki:store:update`, which evaluates in place and copies \
+             nothing. `urn:iki:store:graph-info graph={g}` says how many quads the graph holds",
+            g = graph.as_str(),
+        ),
+    }
 }
 
 /// ⚠ `Denied`, not `InvalidArgument`: the update is well-formed and the caller simply
@@ -861,6 +921,7 @@ mod tests {
             &graph(),
             parsed.prepared,
             &footprint,
+            None,
             &Deadline::never(),
         ) {
             Ok(applied) => format!("+{} -{}", applied.added, applied.removed),
@@ -1102,7 +1163,15 @@ mod tests {
         let append = CORPUS[5].0;
         let parsed = parse_one(append);
         let scratch = Store::new().unwrap();
-        let copied = copy(&store, &g, &parsed.footprint, &scratch, &Deadline::never()).unwrap();
+        let copied = copy(
+            &store,
+            &g,
+            &parsed.footprint,
+            None,
+            &scratch,
+            &Deadline::never(),
+        )
+        .unwrap();
         assert_eq!(
             copied.len(),
             1,
@@ -1115,6 +1184,7 @@ mod tests {
             &g,
             parsed.prepared,
             &parsed.footprint,
+            None,
             &Deadline::never(),
         )
         .unwrap();

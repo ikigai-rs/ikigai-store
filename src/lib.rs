@@ -23,6 +23,8 @@
 //! urn:iki:store:graph-describe   Source  DESCRIBE, graph set      urn:cap:store:read:graph:<iri> each
 //! urn:iki:store:info             Source  backing, size, coverage  urn:cap:store:read
 //! urn:iki:store:graphs           Source  readable graph names     urn:cap:store:read* (either)
+//! urn:iki:store:graph-info       Source  one graph's size         urn:cap:store:read:graph:<iri>
+//! urn:iki:store:dump             Source  every quad, as N-Quads   urn:cap:store:read (broad, ONLY)
 //! urn:iki:store:update           Sink    SPARQL UPDATE, all of it urn:cap:store:write
 //! urn:iki:store:graph-update     Sink    SPARQL UPDATE, one graph urn:cap:store:write:graph:<iri>
 //! urn:iki:store:load             Sink    bulk-load an RDF doc     urn:cap:store:write

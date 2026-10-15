@@ -1,4 +1,4 @@
-//! The module recipe as one test: `ikigai-conformance` walks the thirteen resources
+//! The module recipe as one test: `ikigai-conformance` walks the fifteen resources
 //! [`ikigai_store::space`] binds and reports every violation at once, and holds that
 //! space to the naming rule for an instance-built constructor.
 //!
@@ -65,8 +65,8 @@
 //!   the fixture store is in-memory and belongs to this test: each drop is a real
 //!   firing, and a Sink that wrongly accepted one would have written. `budget`,
 //!   `bindings`, `format`, `as` and `store-load`'s `graph` are optional and not dropped.
-//!   `store-info` and `store-graphs` declare nothing required, so REQUIRED has nothing
-//!   to drop there.
+//!   `store-graph-info` drops its `graph`. `store-info`, `store-graphs` and `store-dump`
+//!   declare nothing required, so REQUIRED has nothing to drop there.
 //! - **`SPACE-NAME` (0.6.0) holds [`ikigai_store::space`] to claiming NO name**, because it
 //!   is instance-built: its doors serve whichever [`DurableStore`] it was handed, so two
 //!   calls are two different datasets behind identical-looking doors, and a self-claimed
@@ -185,6 +185,9 @@ fn fixtures() -> Suite {
         )
     });
     suite
+        // The per-graph count names the seeded scoped graph, so it answers for a graph that
+        // exists rather than for an empty one.
+        .fixture(Fixture::new("store-graph-info", Verb::Source).arg("graph", SCOPED_GRAPH))
         .fixture(Fixture::new("store-load", Verb::Sink).arg("content", INSERT_TURTLE))
         .fixture(Fixture::new("store-update", Verb::Sink).arg("content", INSERT_UPDATE))
         .fixture(
@@ -206,7 +209,7 @@ fn scoped_id(id: &str) -> String {
 /// read is cacheable exactly like a broad one — it depends on the same three write
 /// threads — and saying so here is what would catch a scoped face that quietly stopped
 /// being cached.
-const READS: [&str; 10] = [
+const READS: [&str; 12] = [
     "store-select",
     "store-ask",
     "store-construct",
@@ -217,6 +220,8 @@ const READS: [&str; 10] = [
     "store-graph-describe",
     "store-info",
     "store-graphs",
+    "store-graph-info",
+    "store-dump",
 ];
 
 /// The reads whose universe is ONE named graph, and therefore the exact set that a
@@ -230,11 +235,14 @@ const READS: [&str; 10] = [
 /// under a root probe is every graph name in the store, so it belongs with the broad
 /// faces here, and any prefix test would have silently declared it cacheable in the one
 /// walk that exists to catch exactly that mistake.
-const SCOPED_READS: [&str; 4] = [
+const SCOPED_READS: [&str; 5] = [
     "store-graph-select",
     "store-graph-ask",
     "store-graph-construct",
     "store-graph-describe",
+    // Counts one named graph, so it is confined to it exactly as a scoped query is (ledger
+    // #147). `store-dump` is NOT here: it reads every graph and the default graph.
+    "store-graph-info",
 ];
 
 #[test]
