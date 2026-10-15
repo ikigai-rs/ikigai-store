@@ -1821,6 +1821,12 @@ impl Endpoint for GraphUpdateEndpoint {
                                 cap_read_graph(target.as_str()),
                             )));
                         }
+                        // ★ A constant graph other than `G` in `WITH`, `USING`, `USING NAMED`
+                        // or a `GRAPH` block of the `WHERE` is refused by name, not applied as
+                        // `+0 -0` (ledger #1606): the private copy holds `G` alone, so it would
+                        // match nothing. On the text, after the read-grant check, so a
+                        // write-only caller is refused on the grant as before.
+                        crate::confine::reads_outside(&parsed.reads, &target)?;
                         let _writes = store.write_lock();
                         crate::confine::scoped_update(
                             store.dataset(),
@@ -1863,7 +1869,9 @@ impl Endpoint for GraphUpdateEndpoint {
                  in full — naming where it escaped to, never the data — if anything would \
                  land in another graph or in the default graph. It therefore cannot READ \
                  another graph either, which is the point: this is a boundary, not a \
-                 filter. An update with a `WHERE` clause (including `DELETE WHERE`, `WITH`, \
+                 filter. An update naming another graph in `WITH`, `USING`, `USING NAMED` \
+                 or a `GRAPH` block of its `WHERE` is refused by name before evaluation, \
+                 rather than applied as a no-op. An update with a `WHERE` clause (including `DELETE WHERE`, `WITH`, \
                  `COPY`, `MOVE`, `ADD`) READS the graph, so it also needs \
                  `urn:cap:store:read:graph:<IRI>` (or `urn:cap:store:read`) and is refused \
                  on the grant, before evaluation, without it; `INSERT DATA`, `DELETE DATA`, \

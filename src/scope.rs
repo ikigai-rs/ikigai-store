@@ -258,7 +258,10 @@ pub(crate) fn graphs_outside(query: &Query, set: &[NamedNode]) -> Vec<NamedNode>
         .collect()
 }
 
-fn pattern_graphs(pattern: &GraphPattern, out: &mut BTreeSet<NamedNode>) {
+/// Add the constant `GRAPH <iri>` names in `pattern` to `out`, `EXISTS` included. The walk
+/// [`graphs_outside`] runs over a query, and `confine::graphs_read` over an update's `WHERE`
+/// (ledger #1606).
+pub(crate) fn pattern_graphs(pattern: &GraphPattern, out: &mut BTreeSet<NamedNode>) {
     match pattern {
         GraphPattern::Graph { name, inner } => {
             if let NamedNodePattern::NamedNode(graph) = name {

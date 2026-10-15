@@ -38,7 +38,9 @@
 //! | `INSERT DATA { GRAPH <G> { … } }` | applied | in scope |
 //! | `INSERT DATA { <s> <p> <o> }` | **refused** | the default graph is not `G` |
 //! | `INSERT DATA { GRAPH <other> { … } }` | **refused** | named another graph |
-//! | `WITH <other> INSERT … WHERE …` | **refused** | same, by another spelling |
+//! | `WITH <other> INSERT … WHERE …` | **refused** | reads another graph (ledger #1606); with `USING <G>`, writes it |
+//! | `USING <other>`, `USING NAMED <other>`, `WITH <other> DELETE …` | **refused** by name, before evaluation | reads another graph, so it would match nothing (ledger #1606, [`reads_outside`]) |
+//! | `… WHERE { GRAPH <other> { … } }`, `COPY`/`ADD <other> TO <G>` | **refused** by name, before evaluation | same: a constant graph other than `G` anywhere in a `WHERE`, `EXISTS` included |
 //! | `COPY`/`MOVE`/`ADD … TO <other>` | **refused** | the destination quads escape |
 //! | `CREATE GRAPH <other>` | **refused** | creates no quad, but registers a graph |
 //! | `DROP ALL`, `CLEAR ALL` | applied to `G` alone | the private store held only `G`, and emptying `G` is within a grant over `G` |
@@ -57,6 +59,15 @@
 //! another client's graph in order to decide what to write in its own would not be a
 //! boundary at all. It is stated on the endpoint, in the README, and here, because a
 //! silent difference in results is worse than a refusal.
+//!
+//! ★ **And an update that NAMES another graph to read is refused** (ledger #1606), the way a
+//! scoped read refuses `GRAPH <other>` (ledger #388). Until then `WITH <other>`, `USING
+//! <other>`, `USING NAMED <other>` and `GRAPH <other>` in a `WHERE` were applied against the
+//! private copy and answered `+0 -0`, or worse: `FILTER NOT EXISTS` over the other graph held
+//! for every row, and `COPY <other> TO <G>` emptied `G`. [`reads_outside`] refuses each by
+//! name, on the text, before anything is evaluated. Only constant names: `GRAPH ?g` still
+//! binds `G` alone, and a pattern outside any `GRAPH` block still reads the private copy's
+//! empty default graph, unrefused.
 //!
 //! # ★ …and a WRITE grant alone cannot read even `G` (ledger #751)
 //!
@@ -145,7 +156,7 @@
 //! ecosystem skolemizes and a blank node in a scoped graph is outside what these tests
 //! pin.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use ikigai_core::{Error, Result};
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -206,21 +217,135 @@ pub(crate) fn parse(
     crate::service::refuse_service_in_update(&parsed, "content")?;
     let footprint = footprint(&parsed);
     let inserts = insert_probes(&parsed);
+    let reads = graphs_read(&parsed);
     Ok(Parsed {
         prepared: crate::service::evaluator()
             .with_cancellation_token(deadline.token())
             .for_update(parsed),
         footprint,
         inserts,
+        reads,
     })
 }
 
-/// A parsed, bounded update, what of a scoped graph it can observe, and where its `INSERT`
-/// templates can put a triple term.
+/// A parsed, bounded update, what of a scoped graph it can observe, where its `INSERT`
+/// templates can put a triple term, and which graphs it names to read.
 pub(crate) struct Parsed {
     pub prepared: PreparedSparqlUpdate,
     pub footprint: Footprint,
     pub inserts: Vec<InsertProbe>,
+    pub reads: GraphsRead,
+}
+
+/// Where an update names a graph it READS (ledger #1606), in the order a refusal lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ReadClause {
+    /// `WITH <g>` or `USING <g>`: the graph a `WHERE` reads as its default graph. The parser
+    /// folds `WITH` into the dataset when there is no `USING`, so the two cannot be told apart.
+    Dataset,
+    /// `USING NAMED <g>`.
+    Named,
+    /// `GRAPH <g> { … }` in a `WHERE` (an `EXISTS` included), or the source of `COPY`, `MOVE`
+    /// or `ADD`, which the parser rewrites into one.
+    Block,
+}
+
+impl ReadClause {
+    fn describe(self) -> &'static str {
+        match self {
+            ReadClause::Dataset => "`WITH` or `USING`",
+            ReadClause::Named => "`USING NAMED`",
+            ReadClause::Block => "a `GRAPH` block, or the source of `COPY`, `MOVE` or `ADD`",
+        }
+    }
+}
+
+/// Every graph an update names by a constant IRI to READ, and where it names it.
+pub(crate) type GraphsRead = BTreeMap<NamedNode, BTreeSet<ReadClause>>;
+
+/// The [`GraphsRead`] of a parsed update: its dataset clauses (`WITH`, `USING`, `USING NAMED`)
+/// and the constant `GRAPH <iri>` names in every `WHERE` (ledger #1606).
+///
+/// ★ Only CONSTANT names. `GRAPH ?g` names nothing until evaluation, and the private copy is
+/// what keeps it inside the scoped graph. A pattern outside any `GRAPH` block reads the
+/// default graph, which has no IRI, so it is not here either.
+///
+/// What an update WRITES is not here: `INSERT` and `DELETE` templates are checked on effects
+/// by [`scoped_update`], and `WITH` reaches a template only as its graph name.
+pub(crate) fn graphs_read(update: &Update) -> GraphsRead {
+    let mut reads = GraphsRead::new();
+    for operation in &update.operations {
+        let GraphUpdateOperation::DeleteInsert { using, pattern, .. } = operation else {
+            continue;
+        };
+        if let Some(dataset) = using {
+            for graph in &dataset.default {
+                reads
+                    .entry(graph.clone())
+                    .or_default()
+                    .insert(ReadClause::Dataset);
+            }
+            for graph in dataset.named.iter().flatten() {
+                reads
+                    .entry(graph.clone())
+                    .or_default()
+                    .insert(ReadClause::Named);
+            }
+        }
+        let mut blocks = BTreeSet::new();
+        crate::scope::pattern_graphs(pattern, &mut blocks);
+        for graph in blocks {
+            reads.entry(graph).or_default().insert(ReadClause::Block);
+        }
+    }
+    reads
+}
+
+/// Refuse a scoped update that names a graph other than `graph` to read (ledger #1606).
+///
+/// ★ **The boundary does not depend on this; telling the caller does.** The private copy
+/// holds only `graph`, so a `WHERE` reading another graph already matched nothing — and the
+/// update answered `+0 -0`, or worse: `FILTER NOT EXISTS` over the other graph held for every
+/// row, and `COPY <other> TO <graph>` emptied `graph`. Each looked like success. This is the
+/// write side of the read doors' refusal (ledger #388, [`crate::scope::graphs_outside`]):
+/// refused by name before anything is evaluated, decided on the update's TEXT and `graph=`,
+/// never on the data.
+///
+/// `InvalidArgument` on `content`, not `Denied`, for the reason ledger #388 gives: a grant
+/// on the other graph would not change the answer, because this door reads `graph=` alone.
+pub(crate) fn reads_outside(reads: &GraphsRead, graph: &NamedNode) -> Result<()> {
+    let outside: Vec<String> = reads
+        .iter()
+        .filter(|(name, _)| *name != graph)
+        .map(|(name, clauses)| {
+            let places: Vec<&str> = clauses.iter().map(|c| c.describe()).collect();
+            format!("<{}> (in {})", name.as_str(), places.join("; in "))
+        })
+        .collect();
+    if outside.is_empty() {
+        return Ok(());
+    }
+    let g = graph.as_str();
+    Err(Error::InvalidArgument {
+        name: "content".to_string(),
+        detail: format!(
+            "this update reads {}, which {} not this write's graph, `graph={g}`. \
+             `urn:iki:store:graph-update` evaluates an update against a private copy of that \
+             one graph and nothing else, so {} would match nothing; the update is refused \
+             rather than applied, because `+0 -0` from a mistyped or forgotten graph looks \
+             exactly like an update with nothing to do. Nothing was applied: the update was \
+             not evaluated. Correct the IRI, or, \
+             holding `urn:cap:store:write` and `urn:cap:store:read`, use \
+             `urn:iki:store:update`, which reads the whole dataset",
+            outside.join(", "),
+            if outside.len() == 1 { "is" } else { "are" },
+            if outside.len() == 1 {
+                "reading it"
+            } else {
+                "reading them"
+            },
+        ),
+    })
 }
 
 /// One `INSERT` template that can put a triple term in the store, by its constants: every quad
