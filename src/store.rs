@@ -855,8 +855,11 @@ impl DurableStore {
     /// partway (see [`crate::budget`]), holding a core each. At most
     /// [`TimeBudget::max_overdue`] reads run at once, so at most that many overdue reads hold
     /// cores; updates count here too (the one on the writer thread, and any whose callers gave
-    /// up while they waited in its queue, which hold no core). At `max_overdue` overdue the
-    /// store refuses new evaluations until one ends (ledger #1427).
+    /// up while they waited in its queue, which hold no core). While every slot is held by an
+    /// overdue read the store refuses new evaluations until one ends (ledger #1427); and one
+    /// caller holds at most its share, every caller but the host at most the cap less the
+    /// host's reserve (ledger #1002, [`TimeBudget::with_caller_share`],
+    /// [`TimeBudget::with_reserve`]).
     pub fn overdue_evaluations(&self) -> usize {
         self.evaluations.overdue()
     }
@@ -883,7 +886,10 @@ impl DurableStore {
             write,
             budget,
             &self.evaluations,
-            self.budget.overdue_cap(),
+            crate::budget::Admission {
+                limits: self.budget.limits(),
+                caller: crate::budget::Caller::of(capability),
+            },
             write.then_some(&*self.writer),
             work,
         )

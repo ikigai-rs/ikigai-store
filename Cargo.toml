@@ -363,16 +363,18 @@ http-client = ["oxigraph/http-client"]
 
 [dependencies]
 async-trait = "0.1"
-# 0.1.57 is the TRUE minimum and it is `data_home` (#87) that sets it: `config.rs`
-# defaults the dataset directory under the data home, and that function exists nowhere
-# earlier. The next floors down, for whoever re-audits: `config_home`/`layered_paths_in`
+# 0.1.93 is the TRUE minimum and it is `Capability::principal` that sets it: the overdue
+# cap counts each caller's share by its principal (`budget::Caller`, ledger #1002), and
+# that method exists nowhere earlier (checked against the 0.1.92 and 0.1.93 sources). Below
+# it, `data_home` (#87) set 0.1.57: `config.rs` defaults the dataset directory under the
+# data home. The next floors down, for whoever re-audits: `config_home`/`layered_paths_in`
 # are 0.1.56 (#86), `Error::Unavailable` — the typed, transient refusal a held lock
 # returns — is 0.1.45 (#70), and everything else named here (`Endpoint`, `Invocation`,
 # `Representation`, `ArgSpec::{class,one_of,default_value}`, `Description::requires`)
 # predates 0.1.0.
-# ⚠ `"0.1.57"` is a CEILING as well as a floor — `>=0.1.57, <0.2.0`. When core reaches
+# ⚠ `"0.1.93"` is a CEILING as well as a floor — `>=0.1.93, <0.2.0`. When core reaches
 # 0.2 this line must move, or this crate silently freezes out of every release after it.
-ikigai-core = "0.1.57"
+ikigai-core = "0.1.93"
 # In-memory store by default; `persistent` turns the RocksDB backend back on. Oxigraph
 # itself gates `oxrocksdb-sys` out of wasm by target, so the feature pulls in nothing
 # there — and this crate's durable constructors are gated off wasm too, so `persistent`
@@ -448,9 +450,9 @@ futures = "0.3"
 # wave, 2026-10-14). `"0.8.0"` is `<0.9.0`; move it when 0.9 publishes.
 # ⚠ It pulls core 0.1.100 into every TEST build (conformance 0.8.0 requires it). That is
 # NOT a reason to raise `[dependencies] ikigai-core` above: that line states what the
-# LIBRARY needs, which is still 0.1.57 — the test graph's floor comes from here.
+# LIBRARY needs, which is 0.1.93 — the test graph's floor comes from here.
 ikigai-conformance = "0.8.0"
 # `TurtleRenderer` for the `Meta` face the kernel routes. ⚠ Resolution consequence worth
 # knowing: conformance 0.8.0 requires core 0.1.100 and vocab 0.1.101, so the TEST graph
-# is pulled to that even though the library above genuinely builds on 0.1.57.
+# is pulled to that even though the library above genuinely builds on 0.1.93.
 ikigai-vocab = "0.1"

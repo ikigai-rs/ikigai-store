@@ -13,6 +13,10 @@
 //! cap left at its default and one the host set. And they pin that a consumer's budget is its
 //! own: an `EvaluationBudget::new` counts apart from every other, so a consumer can state its
 //! own cap rather than share one.
+//!
+//! ★ Since ledger #1002 one CALLER cannot fill the cap (it holds at most its share, and a
+//! slot is reserved for the host), so these fill it as the HOST, which root is: the store-wide
+//! refusal is the one pinned here, and `tests/overdue_share.rs` pins the per-caller ones.
 
 use ikigai_core::{Capability, Error};
 use ikigai_store::budget::{default_max_overdue, EvaluationBudget, TimeBudget};
@@ -47,13 +51,19 @@ fn held_work(
     }
 }
 
-/// Fill `budget`'s cap with overdue evaluations; returns the senders that release them.
+/// Fill `budget`'s cap with overdue evaluations; returns the senders that release them. As
+/// the host (root), which alone may use every slot of the cap (ledger #1002).
 fn fill_with_overdue(budget: &EvaluationBudget, n: usize) -> Vec<mpsc::Sender<()>> {
     (0..n)
         .map(|_| {
             let (release, held) = mpsc::channel::<()>();
             let (started, _seen) = mpsc::channel::<()>();
-            let answer = budget.run("ASK {}", &reader(), None, held_work(started, held));
+            let answer = budget.run(
+                "ASK {}",
+                &Capability::root(),
+                None,
+                held_work(started, held),
+            );
             assert!(matches!(answer, Err(Error::Timeout(_))), "{answer:?}");
             release
         })
@@ -112,7 +122,7 @@ fn at_the_default_cap_the_refusal_says_it_is_the_default_and_names_the_paralleli
     assert!(
         message.contains(&format!(
             "The cap of {cap} is the default: a quarter of this machine's available \
-             parallelism ({}), and at least 1",
+             parallelism ({}), and at least 2",
             parallelism()
         )),
         "{message}"

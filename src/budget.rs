@@ -75,6 +75,17 @@
 //!   timeout: eight requests arriving together at a cap of 1 all started, and all eight
 //!   outlived their callers. Through an [`EvaluationBudget`] the same holds for a consumer's
 //!   evaluations, which are all reads.
+//! - **No one caller can fill it, and the host always has room** (ledger #1002). Through
+//!   0.2.23 the cap was one pool: a caller that could start evaluations oxigraph cannot stop
+//!   (gonk's anonymous HTTP door could) filled it, and every evaluation was then refused, the
+//!   host's own reads and its backup included. Now a [reserve](TimeBudget::with_reserve) of
+//!   the cap's slots is used only by root and by a capability holding [`CAP_RESERVE`], every
+//!   other caller together holds at most the rest, and ONE caller holds at most its
+//!   [share](TimeBudget::with_caller_share) of that. One caller is one principal, and every
+//!   capability that names none, every anonymous request among them, is ONE caller: a
+//!   fingerprint of the scopes would be a key the caller can rotate (see `Caller`). A read
+//!   past its share or the pool waits within its budget and is refused at once while what it
+//!   may use is all overdue, naming whose share it was and how a host raises it.
 //!
 //! The real fix for this layer is upstream: `spareval` checking its token in those loops.
 //!
@@ -147,6 +158,7 @@
 //! `DISTINCT`, `GROUP BY` or the build side of a join materializes its input inside the
 //! evaluator, where this crate cannot count it; that is bounded by time (above), not by this.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -192,6 +204,18 @@ pub const CAP_BUDGET: &str = "urn:cap:store:budget:*";
 pub fn cap_budget(millis: u64) -> String {
     format!("{}{millis}", CAP_BUDGET.trim_end_matches('*'))
 }
+
+/// The grant that lets an evaluation use the slots a store RESERVES for its host (ledger
+/// #1002): `urn:cap:store:reserve`. Root holds it; a host gives it to its own scoped jobs
+/// (a backup, a scheduled read) so they always find room however many evaluations its
+/// callers have left running. Not a requirement of any endpoint, and like [`CAP_BUDGET`] it
+/// only RAISES: a holder that attenuates it away is an ordinary caller again, so no caller
+/// gains anything by shedding it. See [`TimeBudget::with_reserve`].
+pub const CAP_RESERVE: &str = "urn:cap:store:reserve";
+
+/// How many of a store's slots only the host may use, unless the host says otherwise: **1**
+/// (ledger #1002). See [`TimeBudget::with_reserve`].
+pub const DEFAULT_RESERVE: usize = 1;
 
 /// The most operands one join may have after the planner flattens it: **32** — the same
 /// number, walk and reasoning as `ikigai-sparql`'s.
@@ -259,20 +283,28 @@ pub fn effective_budget(requested: Option<&str>, ceiling: Duration) -> Result<Du
 /// How long a store's SPARQL evaluations may run, and how many may still be running after
 /// their callers gave up. See the module docs.
 ///
-/// Two budgets are equal when they allow the same: whether `max_overdue` was left at its
-/// default or set to the same number is not compared (it changes only a refusal's wording).
+/// Two budgets are equal when they allow the same: whether `max_overdue`, the reserve or the
+/// caller share was left at its default or set to the same number is not compared (it
+/// changes only a refusal's wording).
 #[derive(Clone, Copy, Debug)]
 pub struct TimeBudget {
     base: Duration,
     ceiling: Duration,
     max_overdue: OverdueCap,
+    /// The host's reserve as the host set it, or `None` for [`DEFAULT_RESERVE`].
+    reserve: Option<usize>,
+    /// One caller's share as the host set it, or `None` for the default (half the pool).
+    share: Option<usize>,
 }
 
 impl PartialEq for TimeBudget {
     fn eq(&self, other: &Self) -> bool {
+        let (mine, theirs) = (self.limits(), other.limits());
         self.base == other.base
             && self.ceiling == other.ceiling
-            && self.max_overdue.max == other.max_overdue.max
+            && mine.cap.max == theirs.cap.max
+            && mine.reserve == theirs.reserve
+            && mine.share == theirs.share
     }
 }
 
@@ -288,21 +320,25 @@ impl Default for TimeBudget {
                 max: default_max_overdue(),
                 set_by_host: false,
             },
+            reserve: None,
+            share: None,
         }
     }
 }
 
-/// A quarter of this machine's available parallelism, and at least one: how many reads one
+/// A quarter of this machine's available parallelism, and at least TWO: how many reads one
 /// store evaluates at once, and so how many cores its runaway evaluations may hold (ledger
 /// #1427; see the module docs).
 ///
-/// ★ **On a small machine that is 1** (anything under 8 cores), so one evaluation oxigraph
-/// cannot stop, still running after its caller was answered, refuses every other evaluation
-/// through the same store or [`EvaluationBudget`] until it ends. A host that wants more sets
-/// it with [`TimeBudget::with_max_overdue`]; the refusal names the cap, whether it is this
-/// default, and the machine's available parallelism (ledger #1500).
+/// ★ **At least 2 after 0.2.23** (ledger #1002), so that a store on a small machine (anything
+/// under 12 cores) still has room for the host's [reserve](TimeBudget::with_reserve) beside
+/// its callers: one slot for callers, one for the host. Through 0.2.23 it was at least 1, and
+/// there one evaluation oxigraph cannot stop, still running after its caller was answered,
+/// refused every other evaluation, the host's own included, until it ended. A host that wants
+/// a different number sets it with [`TimeBudget::with_max_overdue`]; the refusal names the cap,
+/// whether it is this default, and the machine's available parallelism (ledger #1500).
 pub fn default_max_overdue() -> usize {
-    available_parallelism().map_or(1, |n| (n / 4).max(1))
+    available_parallelism().map_or(2, |n| (n / 4).max(2))
 }
 
 /// This machine's available parallelism, or `None` when it cannot be read.
@@ -321,15 +357,6 @@ pub(crate) struct OverdueCap {
 }
 
 impl OverdueCap {
-    /// A cap the host set, as [`TimeBudget::with_max_overdue`] sets one.
-    #[cfg(test)]
-    pub(crate) fn set(max: usize) -> Self {
-        OverdueCap {
-            max: max.max(1),
-            set_by_host: true,
-        }
-    }
-
     /// The sentence a refusal at this cap ends with: the cap, where it came from, this
     /// machine's available parallelism, and how a host raises it.
     #[cfg_attr(target_family = "wasm", allow(dead_code))] // nothing is refused on wasm
@@ -351,9 +378,131 @@ impl OverdueCap {
         } else {
             format!(
                 "The cap of {max} is the default: a quarter of this machine's available \
-                 parallelism ({parallelism}), and at least 1 (`budget::default_max_overdue`). \
+                 parallelism ({parallelism}), and at least 2 (`budget::default_max_overdue`). \
                  {raise}"
             )
+        }
+    }
+}
+
+/// What a store (or one [`EvaluationBudget`]) lets run at once, as the counts read it: the
+/// store-wide cap, the slots in it only the host may use, and the most one caller may hold
+/// (ledger #1002). Built by [`TimeBudget::limits`], which clamps the three against each other.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Limits {
+    /// The outer bound: reads in flight, all callers and the host together.
+    cap: OverdueCap,
+    /// Slots only the host ([`Caller::Host`]) may use: at most `cap.max - 1`.
+    reserve: usize,
+    reserve_set_by_host: bool,
+    /// The most one caller may hold: at least 1, at most [`pool`](Self::pool).
+    share: usize,
+    share_set_by_host: bool,
+}
+
+impl Limits {
+    /// A cap of `max` the host set, with no reserve and one caller allowed all of it: the
+    /// limits as they were through 0.2.23, for a unit test of the cap alone.
+    #[cfg(test)]
+    pub(crate) fn only_the_cap(max: usize) -> Self {
+        TimeBudget::default()
+            .with_max_overdue(max)
+            .with_reserve(0)
+            .with_caller_share(max)
+            .limits()
+    }
+
+    /// The slots every caller but the host shares: the cap less the reserve, at least 1.
+    fn pool(&self) -> usize {
+        self.cap.max - self.reserve
+    }
+
+    /// The sentence a refusal at the shared pool or at one caller's share ends with: the
+    /// share, the pool, the reserve, where each came from, and how a host changes them.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // nothing is refused on wasm
+    fn shares(&self) -> String {
+        let (max, reserve, share, pool) = (self.cap.max, self.reserve, self.share, self.pool());
+        let share_from = if self.share_set_by_host {
+            "set by the host (`TimeBudget::with_caller_share`)".to_string()
+        } else {
+            format!("the default: half of the {pool} left to callers, and at least 1")
+        };
+        let reserve_from = if self.reserve_set_by_host {
+            "set by the host (`TimeBudget::with_reserve`)".to_string()
+        } else {
+            format!("the default ({DEFAULT_RESERVE}, and at most the cap less 1)")
+        };
+        format!(
+            "One caller is one principal, and every capability that names none (every \
+             anonymous request among them) is ONE caller. One caller's share of {share} is \
+             {share_from}; of this store's cap of {max}, {reserve} is reserved for the host, \
+             {reserve_from}, and is used only by root and by a capability holding \
+             `{CAP_RESERVE}` (ledger #1002). A host raises a caller's share with \
+             `TimeBudget::with_caller_share` and gives its own jobs `{CAP_RESERVE}`. {}",
+            self.cap.origin()
+        )
+    }
+}
+
+/// Who is asking for an evaluation, and the limits it is admitted under (ledger #1002).
+#[derive(Clone, Debug)]
+pub(crate) struct Admission {
+    pub(crate) limits: Limits,
+    pub(crate) caller: Caller,
+}
+
+/// Who an evaluation is counted against (ledger #1002).
+///
+/// ★ **Keyed by the capability's PRINCIPAL, and every capability that names none is ONE
+/// caller.** Not by a fingerprint of its scopes, because a key the caller can vary is a key it
+/// can rotate: any holder may [`attenuate`](Capability::attenuate) its own capability to a
+/// subset, and a peer may carry any subset of its ceiling over a wire (`clamp` keeps it), so
+/// `n` grants are `2^n` fingerprints and as many shares. Even one door's anonymous capability
+/// varies: gonk's HTTP door computes a different scope set for a foreign page's navigation
+/// than for its own, from headers a caller writes. A principal is minted by a door and
+/// survives a clamp, so it cannot be varied; shedding it (attenuation may) only moves the
+/// caller into the one principal-less share.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // nothing is counted on wasm
+pub(crate) enum Caller {
+    /// Root, or a capability holding [`CAP_RESERVE`]: may use the reserve, and is bounded
+    /// only by the store-wide cap.
+    Host,
+    /// One principal's share.
+    Named(Arc<str>),
+    /// The one share every capability without a principal counts against.
+    Unnamed,
+}
+
+impl Caller {
+    /// Who `capability` is, for the counts.
+    pub(crate) fn of(capability: &Capability) -> Caller {
+        if capability.allows(CAP_RESERVE) {
+            return Caller::Host;
+        }
+        match capability.principal() {
+            Some(principal) => Caller::Named(Arc::from(principal)),
+            None => Caller::Unnamed,
+        }
+    }
+
+    /// The key in [`Counts::callers`], or `None` for the host, which has no share.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    fn key(&self) -> Option<Option<Arc<str>>> {
+        match self {
+            Caller::Host => None,
+            Caller::Named(principal) => Some(Some(Arc::clone(principal))),
+            Caller::Unnamed => Some(None),
+        }
+    }
+
+    /// How a refusal names this caller.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    fn describe(&self) -> String {
+        match self {
+            Caller::Host => "the host".to_string(),
+            Caller::Named(principal) => format!("the principal <{principal}>"),
+            Caller::Unnamed => "callers that name no principal (one caller together)".to_string(),
         }
     }
 }
@@ -399,14 +548,93 @@ impl TimeBudget {
         self.ceiling
     }
 
+    /// How many of the [`max_overdue`](Self::max_overdue) slots only the HOST may use: root,
+    /// and a capability holding [`CAP_RESERVE`] (ledger #1002). Every other caller together
+    /// may hold at most `max_overdue - n`, so however many evaluations they leave running, the
+    /// host's own reads and its backup find room. The default is [`DEFAULT_RESERVE`].
+    ///
+    /// It is clamped to `max_overdue - 1`, so callers always keep at least one slot: on a
+    /// store whose cap the host set to 1 there is no reserve at all, and one caller's runaway
+    /// refuses everyone, as it did through 0.2.23.
+    ///
+    /// ```
+    /// use ikigai_store::budget::TimeBudget;
+    /// use std::time::Duration;
+    ///
+    /// let budget = TimeBudget::new(Duration::from_millis(500)).with_max_overdue(4);
+    /// assert_eq!(budget.reserve(), 1);
+    /// assert_eq!(budget.with_reserve(2).reserve(), 2);
+    /// assert_eq!(budget.with_reserve(9).reserve(), 3, "callers keep one slot");
+    /// assert_eq!(budget.with_max_overdue(1).reserve(), 0, "no room for a reserve");
+    /// ```
+    pub fn with_reserve(mut self, n: usize) -> Self {
+        self.reserve = Some(n);
+        self
+    }
+
+    /// The most evaluations ONE caller may have in flight, and so overdue (ledger #1002): at
+    /// that many, its next read waits (within its budget) for one of its own to end, and
+    /// while that many of its own are overdue it is refused at once, naming its share. Other
+    /// callers are not held up by it. One caller is one principal
+    /// ([`Capability::principal`]), and every capability that names none, every anonymous
+    /// request among them, is ONE caller: see the module docs for why not a fingerprint.
+    /// Root and a capability holding [`CAP_RESERVE`] have no share; the cap bounds them.
+    ///
+    /// The default is half of what the cap leaves after the [reserve](Self::with_reserve),
+    /// and at least 1; a share the host sets is clamped to between 1 and that remainder, so
+    /// it is always below the cap whenever there is a reserve.
+    ///
+    /// ```
+    /// use ikigai_store::budget::TimeBudget;
+    /// use std::time::Duration;
+    ///
+    /// let budget = TimeBudget::new(Duration::from_millis(500)).with_max_overdue(8);
+    /// assert_eq!(budget.caller_share(), 3, "half of the 7 the reserve of 1 leaves");
+    /// assert_eq!(budget.with_caller_share(5).caller_share(), 5);
+    /// assert_eq!(budget.with_caller_share(50).caller_share(), 7, "at most what callers share");
+    /// assert_eq!(budget.with_caller_share(0).caller_share(), 1);
+    /// ```
+    pub fn with_caller_share(mut self, n: usize) -> Self {
+        self.share = Some(n);
+        self
+    }
+
     /// The cap on reads in flight, and so on overdue evaluations.
     pub fn max_overdue(&self) -> usize {
         self.max_overdue.max
     }
 
-    /// The cap, and whether the host set it, for the refusal at it.
-    pub(crate) fn overdue_cap(&self) -> OverdueCap {
-        self.max_overdue
+    /// The slots only the host may use, as clamped. See [`with_reserve`](Self::with_reserve).
+    pub fn reserve(&self) -> usize {
+        self.limits().reserve
+    }
+
+    /// The most one caller may have in flight, as clamped. See
+    /// [`with_caller_share`](Self::with_caller_share).
+    pub fn caller_share(&self) -> usize {
+        self.limits().share
+    }
+
+    /// The cap, reserve and share, clamped against each other, and whether the host set
+    /// each, for the counts and the refusals at them.
+    pub(crate) fn limits(&self) -> Limits {
+        let cap = self.max_overdue;
+        let reserve = self
+            .reserve
+            .unwrap_or(DEFAULT_RESERVE)
+            .min(cap.max.saturating_sub(1));
+        let pool = cap.max - reserve;
+        let share = match self.share {
+            Some(n) => n.clamp(1, pool),
+            None => (pool / 2).max(1),
+        };
+        Limits {
+            cap,
+            reserve,
+            reserve_set_by_host: self.reserve.is_some(),
+            share,
+            share_set_by_host: self.share.is_some(),
+        }
     }
 
     /// The budget a caller holding `capability` gets: the ceiling for root; otherwise the
@@ -577,9 +805,12 @@ impl EvaluationBudget {
     /// };
     ///
     /// // Room for both timeouts below to be overdue at once, so the second is not refused
-    /// // while the first one's released worker is still ending.
+    /// // while the first one's released worker is still ending: one caller makes both, so
+    /// // its share is 2 as well (ledger #1002).
     /// let budget = EvaluationBudget::new(
-    ///     TimeBudget::new(Duration::from_millis(50)).with_max_overdue(4),
+    ///     TimeBudget::new(Duration::from_millis(50))
+    ///         .with_max_overdue(4)
+    ///         .with_caller_share(2),
     /// );
     /// // By default the sentence names no argument: this consumer takes none.
     /// assert!(timeout(&budget).ends_with(
@@ -641,7 +872,8 @@ impl EvaluationBudget {
         on_its_own_thread(
             text,
             &self.evaluations,
-            self.budget.overdue_cap(),
+            self.budget.limits(),
+            Caller::of(capability),
             None,
             deadline,
             move |deadline| work(&deadline.token),
@@ -761,7 +993,7 @@ pub(crate) fn run<T, F>(
     write: bool,
     budget: Duration,
     evaluations: &Arc<Evaluations>,
-    max_overdue: OverdueCap,
+    admission: Admission,
     writer: Option<&Writer>,
     work: F,
 ) -> Result<T>
@@ -776,7 +1008,8 @@ where
         write,
         argument: Some(DOOR_ARGUMENT.into()),
     };
-    on_its_own_thread(text, evaluations, max_overdue, writer, deadline, work)
+    let Admission { limits, caller } = admission;
+    on_its_own_thread(text, evaluations, limits, caller, writer, deadline, work)
 }
 
 /// The one long-lived thread a store's UPDATES and LOADS run on (ledger #1127, #1209).
@@ -954,7 +1187,8 @@ impl Writer {
 fn on_its_own_thread<T, F>(
     text: &str,
     evaluations: &Arc<Evaluations>,
-    max_overdue: OverdueCap,
+    limits: Limits,
+    caller: Caller,
     writer: Option<&Writer>,
     deadline: Deadline,
     work: F,
@@ -962,7 +1196,7 @@ fn on_its_own_thread<T, F>(
 where
     F: FnOnce(&Deadline) -> Result<T>,
 {
-    let _ = (text, evaluations, max_overdue, writer);
+    let _ = (text, evaluations, limits, caller, writer);
     work(&deadline)
 }
 
@@ -970,7 +1204,8 @@ where
 fn on_its_own_thread<T, F>(
     text: &str,
     evaluations: &Arc<Evaluations>,
-    max_overdue: OverdueCap,
+    limits: Limits,
+    caller: Caller,
     writer: Option<&Writer>,
     deadline: Deadline,
     work: F,
@@ -987,10 +1222,10 @@ where
     // runs on the store's one writer thread, which bounds updates to one core already, so it
     // takes no slot; it is still refused while the cap is filled by overdue work.
     let slot = if writer.is_none() {
-        evaluations.reserve(&max_overdue, budget)?;
+        evaluations.reserve(&limits, &caller, budget)?;
         true
     } else {
-        evaluations.refuse_at_the_cap(&max_overdue)?;
+        evaluations.refuse_at_the_cap(&limits, &caller)?;
         false
     };
     // What is left of the caller's budget after waiting for a slot: the wait counts, as an
@@ -1006,6 +1241,7 @@ where
         evaluations: Arc::clone(evaluations),
         state: Arc::clone(&deadline.state),
         slot,
+        caller: caller.clone(),
     };
     let body = move || {
         let hold = hold;
@@ -1054,7 +1290,7 @@ where
                     *state = State::Abandoned;
                     // Counted under the state lock, so the worker's `Hold` sees `Abandoned`
                     // only once the count holds it.
-                    evaluations.abandoned();
+                    evaluations.abandoned(&caller, slot);
                     token.cancel();
                     return Err(timeout(budget, write, argument.as_deref()));
                 }
@@ -1071,7 +1307,8 @@ where
 }
 
 /// The evaluations one store (or one [`EvaluationBudget`] and its clones) has running: how
-/// many READS hold a slot, and how many evaluations of any kind are overdue (ledger #1427).
+/// many READS hold a slot, and how many evaluations of any kind are overdue (ledger #1427),
+/// in all and per caller (ledger #1002).
 ///
 /// ★ **Why a slot is reserved at the START.** The cap exists to bound how many cores runaway
 /// evaluations can pin, and any evaluation may turn out to be one: oxigraph cannot always stop
@@ -1083,11 +1320,28 @@ where
 /// keep the promise, since the overdue ones are a subset of it.
 ///
 /// So a read takes a slot before its thread starts and gives it back when the thread ends,
-/// whether it answered, timed out or panicked. A read that finds every slot taken WAITS for
-/// one, within its own budget (the wait counts against it), rather than being refused: slots
-/// held by evaluations still inside their budgets are ordinary concurrency, and refusing it
-/// would refuse the second of two simultaneous fast reads on a store whose cap is 1. While
-/// the cap is filled by OVERDUE evaluations, a new one is refused at once, as it always was.
+/// whether it answered, timed out or panicked. A read that finds every slot it may use taken
+/// WAITS for one, within its own budget (the wait counts against it), rather than being
+/// refused: slots held by evaluations still inside their budgets are ordinary concurrency,
+/// and refusing it would refuse the second of two simultaneous fast reads on a store whose
+/// cap is 1. While the slots it may use are filled by OVERDUE evaluations, a new one is
+/// refused at once, as it always was.
+///
+/// ★ **Which slots a read may use** (ledger #1002). Through 0.2.23 every caller drew on the
+/// whole cap, so one caller's runaways refused everyone, the host included. Now:
+///
+/// - **the host** ([`Caller::Host`]: root, or a holder of [`CAP_RESERVE`]) may use any of
+///   the cap's slots;
+/// - **every other caller together** may hold at most the cap less the host's reserve
+///   ([`Limits::pool`]), so the reserve is always free for the host;
+/// - **one caller** (one principal, or the one share of every capability without a
+///   principal) may hold at most its share ([`Limits::share`]), so one caller leaves the
+///   others room.
+///
+/// Updates hold no slot (they run on the store's one writer thread) but are counted overdue
+/// against their caller and the shared pool like reads, and refused at once on the same
+/// terms. The STORE-WIDE at-once refusal reads only overdue READS, the evaluations that hold
+/// slots: an overdue update holds no core of the cap's, so it never refuses the host's read.
 #[derive(Debug, Default)]
 // On wasm an evaluation runs inline, so nothing waits on `changed` or reads `running`.
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
@@ -1100,11 +1354,98 @@ pub(crate) struct Evaluations {
 #[derive(Debug, Default)]
 #[cfg_attr(target_family = "wasm", allow(dead_code))] // as `Evaluations`
 struct Counts {
-    /// Reads holding a slot: started (or about to), not yet ended.
+    /// Reads holding a slot, everyone's: started (or about to), not yet ended.
     running: usize,
     /// Evaluations (reads or updates) still running after their callers were answered with a
-    /// timeout, or updates still queued after theirs were.
+    /// timeout, or updates still queued after theirs were. What
+    /// [`DurableStore::overdue_evaluations`](crate::DurableStore::overdue_evaluations) reports.
     overdue: usize,
+    /// The reads among `overdue`, each of which holds a slot.
+    overdue_reads: usize,
+    /// Every caller but the host, together: what [`Limits::pool`] bounds.
+    shared: Tally,
+    /// Each caller but the host: what [`Limits::share`] bounds. Keyed by principal, `None`
+    /// for the one share of every capability without one; an entry goes when it is empty.
+    callers: HashMap<Option<Arc<str>>, Tally>,
+}
+
+/// One caller's (or the shared pool's) reads holding a slot, and evaluations overdue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // as `Evaluations`
+struct Tally {
+    running: usize,
+    overdue: usize,
+}
+
+/// Why an evaluation may not start now.
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // as `Evaluations`
+enum Full {
+    /// Every slot of the store's is held by an overdue read.
+    Store,
+    /// Every slot the callers share is taken by evaluations of theirs.
+    Pool,
+    /// This caller's share is taken by evaluations of its own.
+    Share,
+}
+
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // as `Evaluations`
+impl Counts {
+    fn tally(&self, caller: &Caller) -> Tally {
+        caller
+            .key()
+            .and_then(|key| self.callers.get(&key).copied())
+            .unwrap_or_default()
+    }
+
+    /// Apply `change` to `caller`'s tally and to the shared pool's (nothing for the host),
+    /// dropping the caller's entry once it is empty.
+    fn adjust(&mut self, caller: &Caller, change: impl Fn(&mut Tally)) {
+        let Some(key) = caller.key() else {
+            return;
+        };
+        change(&mut self.shared);
+        let tally = self.callers.entry(key.clone()).or_default();
+        change(tally);
+        if *tally == Tally::default() {
+            self.callers.remove(&key);
+        }
+    }
+
+    /// Whether `caller` must be refused AT ONCE: what it may use is all held by overdue
+    /// evaluations, so waiting is unlikely to help within a budget. Store first, then the
+    /// pool, then the caller's own share, so a full store reads as a full store.
+    fn overdue_full(&self, limits: &Limits, caller: &Caller) -> Option<Full> {
+        if self.overdue_reads >= limits.cap.max {
+            return Some(Full::Store);
+        }
+        if *caller == Caller::Host {
+            return None;
+        }
+        if self.shared.overdue >= limits.pool() {
+            return Some(Full::Pool);
+        }
+        if self.tally(caller).overdue >= limits.share {
+            return Some(Full::Share);
+        }
+        None
+    }
+
+    /// Whether every slot `caller` may use is taken, in the same order.
+    fn running_full(&self, limits: &Limits, caller: &Caller) -> Option<Full> {
+        if self.running >= limits.cap.max {
+            return Some(Full::Store);
+        }
+        if *caller == Caller::Host {
+            return None;
+        }
+        if self.shared.running >= limits.pool() {
+            return Some(Full::Pool);
+        }
+        if self.tally(caller).running >= limits.share {
+            return Some(Full::Share);
+        }
+        None
+    }
 }
 
 impl Evaluations {
@@ -1124,42 +1465,35 @@ impl Evaluations {
         self.counts().running
     }
 
-    /// Refuse at once while `max` evaluations are overdue.
+    /// Refuse an update at once while what `caller` may use is filled by overdue work.
     #[cfg(not(target_family = "wasm"))]
-    fn refuse_at_the_cap(&self, cap: &OverdueCap) -> Result<()> {
-        let overdue = self.counts().overdue;
-        if overdue >= cap.max {
-            return Err(at_the_cap(overdue, cap));
+    fn refuse_at_the_cap(&self, limits: &Limits, caller: &Caller) -> Result<()> {
+        let counts = self.counts();
+        match counts.overdue_full(limits, caller) {
+            Some(full) => Err(at_the_cap(&counts, full, limits, caller)),
+            None => Ok(()),
         }
-        Ok(())
     }
 
-    /// Take a slot for a read, waiting at most `budget` for one. Refused at once while `max`
-    /// evaluations are overdue, and when no slot came free within the budget.
+    /// Take a slot for `caller`'s read, waiting at most `budget` for one. Refused at once while
+    /// what it may use is filled by overdue evaluations, and when no slot came free within the
+    /// budget.
     #[cfg(not(target_family = "wasm"))]
-    fn reserve(&self, cap: &OverdueCap, budget: Duration) -> Result<()> {
-        let max = cap.max;
+    fn reserve(&self, limits: &Limits, caller: &Caller, budget: Duration) -> Result<()> {
         let until = std::time::Instant::now() + budget;
         let mut counts = self.counts();
         loop {
-            if counts.overdue >= max {
-                return Err(at_the_cap(counts.overdue, cap));
+            if let Some(full) = counts.overdue_full(limits, caller) {
+                return Err(at_the_cap(&counts, full, limits, caller));
             }
-            if counts.running < max {
+            let Some(full) = counts.running_full(limits, caller) else {
                 counts.running += 1;
+                counts.adjust(caller, |t| t.running += 1);
                 return Ok(());
-            }
+            };
             let now = std::time::Instant::now();
             if now >= until {
-                return Err(Error::Unavailable(format!(
-                    "{} SPARQL evaluations are running on this store, and the most it runs at \
-                     once is {max}, so that work oxigraph cannot stop partway can hold no more \
-                     than that many cores; none ended within this request's time budget of {} \
-                     ms. Retry shortly. {}",
-                    counts.running,
-                    budget.as_millis(),
-                    cap.origin()
-                )));
+                return Err(no_slot(&counts, full, limits, caller, budget));
             }
             counts = self
                 .changed
@@ -1169,39 +1503,115 @@ impl Evaluations {
         }
     }
 
-    /// A caller gave up on its evaluation, which is still running (or queued).
+    /// `caller` gave up on its evaluation (a read when `read`), which is still running (or
+    /// queued).
     #[cfg(not(target_family = "wasm"))]
-    fn abandoned(&self) {
-        self.counts().overdue += 1;
+    fn abandoned(&self, caller: &Caller, read: bool) {
+        {
+            let mut counts = self.counts();
+            counts.overdue += 1;
+            if read {
+                counts.overdue_reads += 1;
+            }
+            counts.adjust(caller, |t| t.overdue += 1);
+        }
         self.changed.notify_all();
     }
 }
 
-/// The refusal while `cap.max` evaluations are overdue. Its wording is a contract consumers
-/// test ("the most it allows is", "still running"), and it ends with [`OverdueCap::origin`]:
-/// the cap, whether it is the default, the machine's available parallelism and how a host
-/// raises it, because the same refusal at a default of 1 on a 4-core runner and of 4 on an
-/// 18-core laptop reads like a different failure (ledger #1500).
+/// The refusal while what `caller` may use is filled by overdue evaluations. Its wording is a
+/// contract consumers test ("the most it allows is", "still running"): at the STORE's cap it
+/// is the sentence it always was, and ends with [`OverdueCap::origin`] (the cap, whether it is
+/// the default, the machine's available parallelism and how a host raises it, ledger #1500).
+/// At the shared pool or one caller's share it says whose, and ends with [`Limits::shares`]
+/// (ledger #1002).
 #[cfg(not(target_family = "wasm"))]
-fn at_the_cap(overdue: usize, cap: &OverdueCap) -> Error {
-    Error::Unavailable(format!(
-        "{overdue} SPARQL evaluations on this store are still running after their callers' \
-         time budgets ran out (the most it allows is {}); oxigraph cannot always stop one \
-         partway, so new ones are refused until one finishes, rather than letting each request \
-         hold another core. Retry shortly. {}",
-        cap.max,
-        cap.origin()
-    ))
+fn at_the_cap(counts: &Counts, full: Full, limits: &Limits, caller: &Caller) -> Error {
+    let partway = "oxigraph cannot always stop one partway, so";
+    Error::Unavailable(match full {
+        Full::Store => format!(
+            "{} SPARQL evaluations on this store are still running after their callers' time \
+             budgets ran out (the most it allows is {}); {partway} new ones are refused until \
+             one finishes, rather than letting each request hold another core. Retry shortly. {}",
+            counts.overdue,
+            limits.cap.max,
+            limits.cap.origin()
+        ),
+        Full::Pool => format!(
+            "{} SPARQL evaluations by this store's callers are still running after their \
+             callers' time budgets ran out (the most its callers may have together is {}, the \
+             cap of {} less {} reserved for the host); {partway} callers' new ones are refused \
+             until one finishes. The host's own are not. Retry shortly. {}",
+            counts.shared.overdue,
+            limits.pool(),
+            limits.cap.max,
+            limits.reserve,
+            limits.shares()
+        ),
+        Full::Share => format!(
+            "{} SPARQL evaluations by {} on this store are still running after their time \
+             budgets ran out (the most one caller may have is {}); {partway} this caller's new \
+             ones are refused until one of its own finishes. Other callers are not held up by \
+             them. Retry shortly. {}",
+            counts.tally(caller).overdue,
+            caller.describe(),
+            limits.share,
+            limits.shares()
+        ),
+    })
+}
+
+/// The refusal when no slot `caller` may use came free within its `budget`.
+#[cfg(not(target_family = "wasm"))]
+fn no_slot(
+    counts: &Counts,
+    full: Full,
+    limits: &Limits,
+    caller: &Caller,
+    budget: Duration,
+) -> Error {
+    let ms = budget.as_millis();
+    Error::Unavailable(match full {
+        Full::Store => format!(
+            "{} SPARQL evaluations are running on this store, and the most it runs at once is \
+             {}, so that work oxigraph cannot stop partway can hold no more than that many \
+             cores; none ended within this request's time budget of {ms} ms. Retry shortly. {}",
+            counts.running,
+            limits.cap.max,
+            limits.cap.origin()
+        ),
+        Full::Pool => format!(
+            "{} SPARQL evaluations by this store's callers are running, and the most its \
+             callers may run together is {} (the cap of {} less {} reserved for the host); none \
+             ended within this request's time budget of {ms} ms. Retry shortly. {}",
+            counts.shared.running,
+            limits.pool(),
+            limits.cap.max,
+            limits.reserve,
+            limits.shares()
+        ),
+        Full::Share => format!(
+            "{} SPARQL evaluations by {} are running on this store, and the most one caller \
+             may run at once is {}; none of them ended within this request's time budget of \
+             {ms} ms. Retry shortly. {}",
+            counts.tally(caller).running,
+            caller.describe(),
+            limits.share,
+            limits.shares()
+        ),
+    })
 }
 
 /// What a worker holds until it ends: its slot (a read's), and its place in the overdue count
-/// if its caller gave up. Released on drop, so a worker that panics, is skipped in the
-/// writer's queue, or is never started (a thread that failed to spawn) gives both back.
+/// if its caller gave up, both against its caller's tally too. Released on drop, so a worker
+/// that panics, is skipped in the writer's queue, or is never started (a thread that failed
+/// to spawn) gives both back.
 #[cfg(not(target_family = "wasm"))]
 struct Hold {
     evaluations: Arc<Evaluations>,
     state: Arc<Mutex<State>>,
     slot: bool,
+    caller: Caller,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1213,12 +1623,24 @@ impl Drop for Hold {
         let abandoned = *lock(&self.state) == State::Abandoned;
         {
             let mut counts = self.evaluations.counts();
-            if self.slot {
+            let slot = self.slot;
+            if slot {
                 counts.running = counts.running.saturating_sub(1);
             }
             if abandoned {
                 counts.overdue = counts.overdue.saturating_sub(1);
+                if slot {
+                    counts.overdue_reads = counts.overdue_reads.saturating_sub(1);
+                }
             }
+            counts.adjust(&self.caller, |t| {
+                if slot {
+                    t.running = t.running.saturating_sub(1);
+                }
+                if abandoned {
+                    t.overdue = t.overdue.saturating_sub(1);
+                }
+            });
         }
         self.evaluations.changed.notify_all();
     }
@@ -2082,7 +2504,10 @@ mod tests {
             false,
             Duration::from_secs(5),
             &overdue,
-            OverdueCap::set(1),
+            Admission {
+                limits: Limits::only_the_cap(1),
+                caller: Caller::Unnamed,
+            },
             None,
             |_| Ok(7),
         )
@@ -2100,7 +2525,10 @@ mod tests {
             false,
             Duration::from_millis(100),
             &overdue,
-            OverdueCap::set(4),
+            Admission {
+                limits: Limits::only_the_cap(4),
+                caller: Caller::Unnamed,
+            },
             None,
             |deadline| {
                 // Cooperative work: stops when told.
@@ -2137,7 +2565,10 @@ mod tests {
             false,
             Duration::from_millis(50),
             &overdue,
-            OverdueCap::set(1),
+            Admission {
+                limits: Limits::only_the_cap(1),
+                caller: Caller::Unnamed,
+            },
             None,
             move |_| {
                 let _ = held.recv();
@@ -2152,7 +2583,10 @@ mod tests {
             false,
             Duration::from_secs(5),
             &overdue,
-            OverdueCap::set(1),
+            Admission {
+                limits: Limits::only_the_cap(1),
+                caller: Caller::Unnamed,
+            },
             None,
             |_| Ok(()),
         )
@@ -2172,7 +2606,10 @@ mod tests {
             false,
             Duration::from_secs(5),
             &overdue,
-            OverdueCap::set(1),
+            Admission {
+                limits: Limits::only_the_cap(1),
+                caller: Caller::Unnamed,
+            },
             None,
             |_| Ok(()),
         )
@@ -2199,7 +2636,10 @@ mod tests {
                         false,
                         Duration::from_secs(10),
                         &evaluations,
-                        OverdueCap::set(2),
+                        Admission {
+                            limits: Limits::only_the_cap(2),
+                            caller: Caller::Unnamed,
+                        },
                         None,
                         move |_| {
                             let now = active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2234,7 +2674,10 @@ mod tests {
                     false,
                     Duration::from_secs(30),
                     &evaluations,
-                    OverdueCap::set(1),
+                    Admission {
+                        limits: Limits::only_the_cap(1),
+                        caller: Caller::Unnamed,
+                    },
                     None,
                     move |_| {
                         let _ = held.recv();
@@ -2256,7 +2699,10 @@ mod tests {
             false,
             Duration::from_millis(50),
             &evaluations,
-            OverdueCap::set(1),
+            Admission {
+                limits: Limits::only_the_cap(1),
+                caller: Caller::Unnamed,
+            },
             None,
             move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
@@ -2288,7 +2734,10 @@ mod tests {
             true,
             Duration::from_millis(50),
             &overdue,
-            OverdueCap::set(4),
+            Admission {
+                limits: Limits::only_the_cap(4),
+                caller: Caller::Unnamed,
+            },
             None,
             move |deadline| {
                 // Slow work that does not look at the token, then a commit.
@@ -2308,6 +2757,134 @@ mod tests {
         assert_eq!(committed.load(Ordering::SeqCst), 0);
     }
 
+    /// ★ Ledger #1002: who an evaluation counts against. Root and a holder of the reserve
+    /// grant are the host; a principal is its own caller; every capability without one is
+    /// ONE caller whatever its scopes, so attenuating to another subset buys no new share.
+    #[test]
+    fn a_caller_is_its_principal_and_every_principal_less_capability_is_one() {
+        assert_eq!(Caller::of(&Capability::root()), Caller::Host);
+        assert_eq!(
+            Caller::of(&Capability::scoped(["urn:cap:store:read", CAP_RESERVE])),
+            Caller::Host
+        );
+        let anonymous = Capability::scoped(["urn:cap:store:read", "urn:x:door"]);
+        assert_eq!(Caller::of(&anonymous), Caller::Unnamed);
+        assert_eq!(
+            Caller::of(&anonymous.attenuate(["urn:cap:store:read"])),
+            Caller::Unnamed
+        );
+        let alice = anonymous
+            .with_principal("urn:example:person:alice")
+            .unwrap();
+        assert_eq!(
+            Caller::of(&alice),
+            Caller::Named(Arc::from("urn:example:person:alice"))
+        );
+        // Attenuating the grant away makes an ordinary caller again: it only ever raises.
+        let job = Capability::scoped(["urn:cap:store:read", CAP_RESERVE]);
+        assert_eq!(
+            Caller::of(&job.attenuate(["urn:cap:store:read"])),
+            Caller::Unnamed
+        );
+    }
+
+    /// An overdue UPDATE holds no slot of the cap's, so it counts against its caller's share
+    /// and the callers' pool (and refuses them) but never refuses the host's read; and every
+    /// caller's entry is gone once its evaluations end.
+    #[test]
+    fn an_overdue_update_counts_against_its_caller_but_never_refuses_the_hosts_read() {
+        let evaluations = counter();
+        let writer = Arc::new(Writer::default());
+        // Cap 2: reserve 1, so callers share 1 and one caller's share is 1.
+        let limits = TimeBudget::default().with_max_overdue(2).limits();
+        assert_eq!((limits.reserve, limits.pool(), limits.share), (1, 1, 1));
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let blocker = {
+            let (evaluations, writer) = (Arc::clone(&evaluations), Arc::clone(&writer));
+            std::thread::spawn(move || {
+                run(
+                    "q",
+                    true,
+                    Duration::from_secs(30),
+                    &evaluations,
+                    Admission {
+                        limits,
+                        caller: Caller::Host,
+                    },
+                    Some(&writer),
+                    move |_| {
+                        hold.recv().unwrap();
+                        Ok(())
+                    },
+                )
+            })
+        };
+        let started = Instant::now();
+        while writer.stack().is_none() {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // An anonymous update queues behind the host's and times out: overdue, no slot.
+        let queued = run(
+            "q",
+            true,
+            Duration::from_millis(50),
+            &evaluations,
+            Admission {
+                limits,
+                caller: Caller::Unnamed,
+            },
+            Some(&writer),
+            |_| Ok(()),
+        );
+        assert!(matches!(queued, Err(Error::Timeout(_))), "{queued:?}");
+        assert_eq!(evaluations.overdue(), 1);
+        // The callers' pool is full of it, so another caller is refused at once …
+        let bob = Caller::Named(Arc::from("urn:example:person:bob"));
+        let refused = run(
+            "q",
+            false,
+            Duration::from_secs(5),
+            &evaluations,
+            Admission {
+                limits,
+                caller: bob,
+            },
+            None,
+            |_| Ok(()),
+        );
+        assert!(
+            matches!(&refused, Err(Error::Unavailable(m))
+                if m.contains("the most its callers may have together is 1")),
+            "{refused:?}"
+        );
+        // … and the host's read is answered: no slot is held.
+        let host = run(
+            "q",
+            false,
+            Duration::from_secs(5),
+            &evaluations,
+            Admission {
+                limits,
+                caller: Caller::Host,
+            },
+            None,
+            |_| Ok(7),
+        );
+        assert_eq!(host, Ok(7));
+        release.send(()).unwrap();
+        blocker.join().unwrap().unwrap();
+        let wait = Instant::now();
+        while evaluations.overdue() != 0 {
+            assert!(wait.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let counts = evaluations.counts();
+        assert!(counts.callers.is_empty(), "{:?}", counts.callers);
+        assert_eq!(counts.shared, Tally::default());
+        assert_eq!((counts.running, counts.overdue_reads), (0, 0));
+    }
+
     #[test]
     fn a_panic_in_the_work_reaches_the_caller() {
         let overdue = counter();
@@ -2317,7 +2894,10 @@ mod tests {
                 false,
                 Duration::from_secs(5),
                 &overdue,
-                OverdueCap::set(1),
+                Admission {
+                    limits: Limits::only_the_cap(1),
+                    caller: Caller::Unnamed,
+                },
                 None,
                 |_| -> Result<()> { panic!("boom") },
             );
@@ -2340,7 +2920,10 @@ mod tests {
                 write,
                 Duration::from_secs(5),
                 &overdue,
-                OverdueCap::set(1),
+                Admission {
+                    limits: Limits::only_the_cap(1),
+                    caller: Caller::Unnamed,
+                },
                 write.then_some(&writer),
                 |_| Ok(std::thread::current().id()),
             )
@@ -2364,7 +2947,10 @@ mod tests {
                 true,
                 Duration::from_secs(5),
                 &overdue,
-                OverdueCap::set(1),
+                Admission {
+                    limits: Limits::only_the_cap(1),
+                    caller: Caller::Unnamed,
+                },
                 Some(&writer),
                 |_| Ok(std::thread::current().id()),
             )
@@ -2397,7 +2983,10 @@ mod tests {
                     true,
                     Duration::from_secs(30),
                     &overdue,
-                    OverdueCap::set(4),
+                    Admission {
+                        limits: Limits::only_the_cap(4),
+                        caller: Caller::Unnamed,
+                    },
                     Some(&writer),
                     move |_| {
                         hold.recv().unwrap();
@@ -2419,7 +3008,10 @@ mod tests {
             true,
             Duration::from_millis(50),
             &overdue,
-            OverdueCap::set(4),
+            Admission {
+                limits: Limits::only_the_cap(4),
+                caller: Caller::Unnamed,
+            },
             Some(&writer),
             move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
@@ -2452,7 +3044,10 @@ mod tests {
                 true,
                 Duration::from_secs(5),
                 &overdue,
-                OverdueCap::set(1),
+                Admission {
+                    limits: Limits::only_the_cap(1),
+                    caller: Caller::Unnamed,
+                },
                 Some(&writer),
                 |_| -> Result<()> { panic!("boom") },
             );
@@ -2463,7 +3058,10 @@ mod tests {
             true,
             Duration::from_secs(5),
             &overdue,
-            OverdueCap::set(1),
+            Admission {
+                limits: Limits::only_the_cap(1),
+                caller: Caller::Unnamed,
+            },
             Some(&writer),
             |_| Ok(7),
         )
