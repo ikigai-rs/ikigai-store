@@ -59,6 +59,10 @@ fn select(kernel: &Kernel, capability: &Capability, query: &str) -> ikigai_core:
     .map(|rep| String::from_utf8_lossy(&rep.bytes).into_owned())
 }
 
+/// A budget a read that waits for a slot would wait out: one refused in a fraction of it was
+/// refused at once, on a machine of any speed and under any load (ledger #1685).
+const WOULD_WAIT: Duration = Duration::from_secs(60);
+
 /// What gonk's anonymous HTTP door hands a caller with no session: read, and no principal.
 fn anonymous() -> Capability {
     Capability::scoped([CAP_READ])
@@ -69,6 +73,20 @@ fn signed_in(who: &str) -> Capability {
     Capability::scoped([CAP_READ])
         .with_principal(&format!("urn:example:person:{who}"))
         .unwrap()
+}
+
+/// [`signed_in`] holding a budget grant of [`WOULD_WAIT`]: the same caller (one caller is one
+/// principal, whatever its grants), for a read that must not meet the clock (ledger #1685).
+/// Under the store's 300 ms base, an ordinary read that a slow machine took longer over was
+/// refused with a `Timeout`, which said nothing about the shares; and a read that WAITED for a
+/// slot instead of being refused at once would now wait a minute, which the test sees.
+fn patient(who: &str) -> Capability {
+    Capability::scoped([
+        CAP_READ.to_string(),
+        ikigai_store::budget::cap_budget(WOULD_WAIT.as_millis() as u64),
+    ])
+    .with_principal(&format!("urn:example:person:{who}"))
+    .unwrap()
 }
 
 /// What gonk's scheduled backup fires under: scoped, not root, with no principal, holding the
@@ -182,15 +200,19 @@ fn a_full_share_refuses_its_own_caller_and_names_it() {
     let (_store, kernel) = store_with_cap(4);
     assert_eq!(timeouts(&runaways(&kernel, &signed_in("alice"), 4)), 1);
 
-    let bob = select(&kernel, &signed_in("bob"), "ASK { ?s ?p ?o }");
+    let bob = select(&kernel, &patient("bob"), "ASK { ?s ?p ?o }");
     assert!(matches!(&bob, Ok(a) if a.contains("true")), "{bob:?}");
 
+    // Alice again, with a budget she would wait out if she waited for a slot rather than
+    // being refused at once (ledger #1685): a stopwatch of 100 ms measured the runner, with
+    // this file's runaways spinning beside it.
     let start = std::time::Instant::now();
-    match select(&kernel, &signed_in("alice"), "ASK { ?s ?p ?o }") {
+    match select(&kernel, &patient("alice"), "ASK { ?s ?p ?o }") {
         Err(Error::Unavailable(message)) => {
             assert!(
-                start.elapsed() < Duration::from_millis(100),
-                "refused at once"
+                start.elapsed() < WOULD_WAIT / 2,
+                "refused at once, not after waiting: {:?}",
+                start.elapsed()
             );
             assert!(
                 message.starts_with(
@@ -241,7 +263,7 @@ fn every_capability_without_a_principal_is_one_caller() {
         other => panic!("expected the one principal-less share to refuse, got {other:?}"),
     }
     // A signed-in caller still has its own share.
-    let signed = select(&kernel, &signed_in("alice"), "ASK { ?s ?p ?o }");
+    let signed = select(&kernel, &patient("alice"), "ASK { ?s ?p ?o }");
     assert!(matches!(&signed, Ok(a) if a.contains("true")), "{signed:?}");
 }
 

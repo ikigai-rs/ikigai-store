@@ -17,6 +17,8 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod common;
+
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
@@ -87,16 +89,12 @@ fn a_consumer_names_its_own_argument() {
 
 #[test]
 fn the_doors_keep_their_sentence() {
-    // 60 nodes, two edges each: a cross product of four patterns is 120^4 rows.
-    let mut triples = String::new();
-    for i in 0..60usize {
-        for j in [i + 1, i * 7 + 3] {
-            triples.push_str(&format!("<urn:n{i}> <urn:p> <urn:n{}> . ", j % 60));
-        }
-    }
+    // 60 nodes, two edges each, and a read only the clock can stop: a cross product of four
+    // patterns is refused for its SIZE first on a fast machine (ledger #1685).
+    let triples = common::seed_triples();
     let store = DurableStore::in_memory()
         .unwrap()
-        .with_time_budget(TimeBudget::new(ms(300)));
+        .with_time_budget(TimeBudget::new(common::slow_budget(300)));
     let kernel = Kernel::new(Arc::new(space(store.clone())));
     block_on(kernel.issue(
         Request::new(Verb::Sink, Iri::parse("urn:iki:store:update").unwrap()).with_arg(
@@ -106,7 +104,7 @@ fn the_doors_keep_their_sentence() {
         &Capability::root(),
     ))
     .expect("seeding");
-    let query = "SELECT * WHERE { ?s0 ?p0 ?o0 . ?s1 ?p1 ?o1 . ?s2 ?p2 ?o2 . ?s3 ?p3 ?o3 . }";
+    let query = common::slow("SELECT ?n");
     let result = block_on(
         kernel.issue(
             Request::new(Verb::Source, Iri::parse("urn:iki:store:select").unwrap())
@@ -121,6 +119,10 @@ fn the_doors_keep_their_sentence() {
              #964). The budget is set by the host, and a request's `budget=` can only lower \
              it. Narrow the query — fewer joins, a bound subject, a LIMIT — or ask the host \
              for a larger budget"
+        ),
+        Ok(rep) => panic!(
+            "expected a Timeout, got {}",
+            common::not_slow_enough(rep.bytes.len())
         ),
         other => panic!("expected a Timeout, got {other:?}"),
     }

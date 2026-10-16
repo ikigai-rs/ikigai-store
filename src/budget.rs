@@ -2740,8 +2740,15 @@ mod tests {
             },
             None,
             move |deadline| {
-                // Slow work that does not look at the token, then a commit.
-                std::thread::sleep(Duration::from_millis(300));
+                // Slow work that does not stop for the token, then a commit. It runs until its
+                // caller HAS given up, which is when the token is cancelled, so the commit is
+                // attempted after that on any machine; a fixed 300 ms sleep raced a caller
+                // stalled past it (ledger #1685). Bounded, so a regression cannot hang the run.
+                let token = deadline.token();
+                let started = Instant::now();
+                while !token.is_cancelled() && started.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 let outcome = deadline.settle(|| {
                     seen.fetch_add(1, Ordering::SeqCst);
                     Ok(())
