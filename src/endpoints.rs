@@ -115,15 +115,15 @@ use ikigai_core::{
 };
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::{
-    GraphName, GraphNameRef, NamedNode, NamedNodeRef, NamedOrBlankNode, Term, Variable,
+    GraphName, GraphNameRef, NamedNode, NamedNodeRef, NamedOrBlankNode, Quad, Term, Variable,
 };
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
 use oxigraph::sparql::QueryResults;
-use oxigraph::store::Store;
+use oxigraph::store::StorageError;
 
 use crate::budget::{too_large, AnswerBound, AnswerBudget, CappedWriter, Deadline, Measure};
 use crate::scope::GraphSet;
-use crate::store::DurableStore;
+use crate::store::{Backing, DurableStore};
 
 /// The capability a read requires. Declared, therefore enforced by the kernel before
 /// `invoke` and before any cache lookup.
@@ -1431,17 +1431,50 @@ impl Endpoint for GraphInfoEndpoint {
 /// # Bounded, refused past the bound, never truncated
 ///
 /// ⚠ **It is not streamed to the caller**: a [`Representation`] is bytes, so the whole dump is
-/// built before it is answered. What is streamed is the inside: one pass from the store's quad
-/// iterator through the serializer into a [`CappedWriter`], with no result set in between. So
-/// it takes the query doors' bounds: the caller's answer budget (quads against `max_rows`,
-/// serialized bytes against `max_bytes`; 100,000 quads and 16 MiB by default, up to
-/// 10,000,000 and 1 GiB for root or a `urn:cap:store:answer:*` grant) and its time budget. A
-/// dataset past either is refused with nothing sent, saying which bound it crossed.
+/// built before it is answered. What is streamed is the inside: one pass from one snapshot of
+/// the store's quads ([`DurableStore::snapshot_iter`]) through the serializer into a
+/// [`CappedWriter`], with no result set in between. So it takes the query doors' bounds: the
+/// caller's answer budget (quads against `max_rows`, serialized bytes against `max_bytes`;
+/// 100,000 quads and 16 MiB by default, up to 10,000,000 and 1 GiB for root or a
+/// `urn:cap:store:answer:*` grant) and its time budget. A dataset past either is refused with
+/// nothing sent, saying which bound it crossed.
 ///
-/// ★ **The lines are sorted**, so two dumps of the same dataset are the same bytes on either
-/// backing, and a backup diffs. N-Quads is one quad per line (a newline inside a literal is
-/// escaped), so sorting the lines reorders quads and changes none of them. Blank nodes keep
-/// their stored labels.
+/// # ★ The order: canonical per backing, and the answer is held once (ledger #1732)
+///
+/// Two dumps of the same dataset on the same backing are the same bytes, and a quad added or
+/// removed adds or removes its one line and moves no other, so a backup diffs. How that holds
+/// differs by backing, because a sort of the finished answer holds it twice. Measured with
+/// `examples/dump-memory.rs` on synthetic RocksDB stores (release, peak RSS; reading the
+/// dataset alone peaks at 109 MB, 183 MB and 187 MB):
+///
+/// | quads | N-Quads | sorted, before | key order, after |
+/// | --- | --- | --- | --- |
+/// | 375,000 | 84 MB | 278 MB | 192 MB |
+/// | 1,500,000 | 339 MB | 856 MB | 509 MB |
+/// | 3,000,000 | 679 MB | 1,531 MB | 838 MB |
+///
+/// - **Durable (RocksDB): the store's key order**, written as read and never copied. A key is
+///   the quad's own encoding (default graph first, then each named graph; within a graph by
+///   subject, so a subject's quads are adjacent), which makes the order a function of each
+///   quad alone, whatever the history. It is NOT text order. ⚠ An oxigraph release that
+///   changes its encoding would reorder a dump, once.
+/// - **In memory: the lines sorted**, because that backing iterates a hash set whose order
+///   depends on history. Sorting costs a second copy, on a backing that holds its whole
+///   dataset in memory already. N-Quads is one quad per line (a newline inside a literal is
+///   escaped), so sorting the lines reorders quads and changes none.
+///
+/// So the same dataset dumps to different bytes on the two backings, and either one loads
+/// into either. Blank nodes keep their stored labels. A consumer that wants text order on any
+/// backing sorts the lines (`LC_ALL=C sort`).
+///
+/// # ★ Never cacheable
+///
+/// A cacheable answer is copied into the kernel's cache before the cache decides whether to
+/// keep it (`ikigai-core` 0.1.103), so a cacheable dump held the dataset twice at the kernel
+/// even when it was far too large to keep (the same key-order dump of 1.5M quads peaked at
+/// 832 MB cacheable against 509 MB bare), and one small enough to keep would evict every other
+/// cached read for an answer a backup asks for once. So a dump is answered bare: it recomputes
+/// every time and holds the answer once.
 #[derive(Clone)]
 struct DumpEndpoint {
     store: Arc<DurableStore>,
@@ -1467,17 +1500,13 @@ impl Endpoint for DumpEndpoint {
                 let bytes = self
                     .store
                     .evaluate("", false, inv.capability, requested, move |deadline| {
-                        dump_quads(store.dataset(), deadline, answer)
+                        dump_quads(&store, deadline, answer)
                     })
                     .map_err(|e| scan_timeout(e, "this dump", budget))?;
-                Ok(with_freshness(
-                    Representation::new(
-                        ReprType::new(DUMP_MEDIA).with_param("charset", "utf-8"),
-                        bytes,
-                    ),
-                    &self.store,
-                    // Every graph and the default graph: never confined.
-                    None,
+                // ★ Never cacheable, on purpose (ledger #1732): see the type docs.
+                Ok(Representation::new(
+                    ReprType::new(DUMP_MEDIA).with_param("charset", "utf-8"),
+                    bytes,
                 ))
             }
             other => Err(unsupported("store-dump", other)),
@@ -1493,8 +1522,10 @@ impl Endpoint for DumpEndpoint {
             .title("The whole dataset as N-Quads")
             .summary(
                 "Every quad in the store, every named graph and the default graph, as N-Quads \
-                 written by the engine's own serializer, one quad per line, the lines sorted so \
-                 two dumps of the same dataset are the same bytes. ⚠ It reads EVERY graph, so it \
+                 written by the engine's own serializer, one quad per line, in an order canonical \
+                 for the store's backing (RocksDB key order on a durable store, sorted lines in \
+                 memory) so two dumps of the same dataset are the same bytes. Never cached. ⚠ It \
+                 reads EVERY graph, so it \
                  requires the broad `urn:cap:store:read` and no per-graph grant satisfies it: \
                  this is the authority the per-graph boundary exists not to hand out, for a \
                  backup job and never for a tenant. Bounded like a query's answer (quads \
@@ -1528,7 +1559,8 @@ impl Endpoint for DumpEndpoint {
 /// The one syntax `urn:iki:store:dump` answers in: the quad syntax `urn:iki:store:load` reads.
 const DUMP_MEDIA: &str = "application/n-quads";
 
-/// Every quad of `store`, serialized as N-Quads within `bound` and `deadline`, lines sorted.
+/// Every quad of `store`, serialized as N-Quads within `bound` and `deadline`, in the order the
+/// type docs give for its backing.
 ///
 /// ```text
 /// <urn:x:a> <urn:x:p> "in the default graph" .
@@ -1537,16 +1569,35 @@ const DUMP_MEDIA: &str = "application/n-quads";
 ///
 /// (That shape, a default-graph quad with no fourth term, is pinned by
 /// `tests/dump.rs::the_dump_is_n_quads_with_every_graph_and_the_default_graph`.)
-fn dump_quads(store: &Store, deadline: &Deadline, bound: AnswerBound) -> Result<Vec<u8>> {
+fn dump_quads(store: &DurableStore, deadline: &Deadline, bound: AnswerBound) -> Result<Vec<u8>> {
+    let written = n_quads(store.snapshot_iter(), deadline, bound)?;
+    Ok(match store.backing() {
+        // RocksDB's key order: a function of each quad alone, so it is already canonical for
+        // this backing, and the answer is written once and never copied (ledger #1732).
+        Backing::Durable(_) => written,
+        // A hash set's order, which depends on the store's history: sorted, at the cost of a
+        // second copy, on a backing that holds its whole dataset in memory anyway.
+        Backing::Memory => sorted_lines(&written),
+    })
+}
+
+/// `quads` as N-Quads in the order they come, within `bound` and `deadline`: one pass from the
+/// iterator through oxigraph's serializer into a [`CappedWriter`], with no result set and no
+/// copy.
+fn n_quads(
+    quads: impl Iterator<Item = std::result::Result<Quad, StorageError>>,
+    deadline: &Deadline,
+    bound: AnswerBound,
+) -> Result<Vec<u8>> {
     let io = |e: std::io::Error| Error::Endpoint(format!("serialize: {e}"));
     let mut out = CappedWriter::new(bound.bytes());
     let written = (|| {
         let mut serializer = RdfSerializer::from_format(RdfFormat::NQuads).for_writer(&mut out);
-        let mut quads: u64 = 0;
-        for quad in store.iter() {
+        let mut count: u64 = 0;
+        for quad in quads {
             deadline.check()?;
-            quads += 1;
-            if quads > bound.rows() {
+            count += 1;
+            if count > bound.rows() {
                 return Err(dump_too_large("quads", "max_rows", bound.rows()));
             }
             let quad = quad.map_err(|e| Error::Endpoint(format!("store: {e}")))?;
@@ -1559,10 +1610,15 @@ fn dump_quads(store: &Store, deadline: &Deadline, bound: AnswerBound) -> Result<
         return Err(dump_too_large("bytes", "max_bytes", bound.bytes()));
     }
     written?;
-    let bytes = out.into_bytes();
-    let mut lines: Vec<&[u8]> = bytes.split_inclusive(|b| *b == b'\n').collect();
+    Ok(out.into_bytes())
+}
+
+/// The lines of `n_quads`, newline included, in byte order. N-Quads is one quad per line (a
+/// newline inside a literal is escaped), so this reorders quads and changes none.
+fn sorted_lines(n_quads: &[u8]) -> Vec<u8> {
+    let mut lines: Vec<&[u8]> = n_quads.split_inclusive(|b| *b == b'\n').collect();
     lines.sort_unstable();
-    Ok(lines.concat())
+    lines.concat()
 }
 
 /// The refusal of a dump past the caller's answer bound: the store's other size refusals, in

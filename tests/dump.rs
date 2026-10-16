@@ -4,9 +4,13 @@
 //! What a backup needs and a hand-rolled `SELECT ?g ?s ?p ?o` got wrong by default: every
 //! named graph AND the default graph, the engine's own escaping, a stable order, and a refusal
 //! rather than a truncated file when the dataset is past the caller's bound.
+//!
+//! The order is canonical PER BACKING (ledger #1732): sorted lines in memory, RocksDB's key
+//! order on a durable store, where the answer is written as read and held once. The durable
+//! half is at the bottom, behind `persistent`.
 
 use futures::executor::block_on;
-use ikigai_core::{ArgRef, Capability, Error, Iri, Kernel, Request, Verb};
+use ikigai_core::{ArgRef, Capability, Error, Expiry, Iri, Kernel, Request, Verb};
 use ikigai_store::{cap_read_graph, space, DurableStore, CAP_READ};
 use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::model::Quad;
@@ -175,4 +179,186 @@ fn a_dataset_past_the_bound_is_refused_not_truncated() {
             .count(),
         5
     );
+}
+
+/// ★ A dump is never cacheable (ledger #1732), even on an owned store whose every other
+/// whole-dataset read is: the kernel copies a cacheable answer into its cache before deciding
+/// whether to keep it, so a cacheable dump held the dataset twice. The pair: a broad SELECT
+/// on the same store IS cacheable, so the bare dump is the dump's own choice.
+#[test]
+fn a_dump_is_never_cacheable_though_the_stores_other_reads_are() {
+    let k = seeded();
+    let root = Capability::root();
+    let rep = issue(&k, &root, Verb::Source, "urn:iki:store:dump", &[]).unwrap();
+    assert!(matches!(rep.expiry, Expiry::Always), "{:?}", rep.expiry);
+    let select = issue(
+        &k,
+        &root,
+        Verb::Source,
+        "urn:iki:store:select",
+        &[("query", "SELECT * WHERE { ?s ?p ?o }")],
+    )
+    .unwrap();
+    assert!(
+        matches!(select.expiry, Expiry::Never),
+        "{:?}",
+        select.expiry
+    );
+}
+
+/// The durable half: RocksDB's key order, written as read.
+#[cfg(feature = "persistent")]
+mod durable {
+    use super::*;
+    use oxigraph::io::RdfSerializer;
+    use std::path::PathBuf;
+
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ikigai-store-dump-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    /// Enough quads, over enough IRIs, that the store's key order (IRIs are keyed by a hash)
+    /// is not the text order by accident.
+    fn many() -> Vec<String> {
+        (0..60)
+            .map(|n| {
+                let graph = match n % 3 {
+                    0 => String::new(),
+                    1 => " <urn:x:g1>".to_string(),
+                    _ => format!(" <urn:x:g{}>", n % 7),
+                };
+                format!("<urn:x:s{n}> <urn:x:p{}> \"value {n}\"{graph} .\n", n % 4)
+            })
+            .collect()
+    }
+
+    fn durable_kernel(path: &PathBuf) -> (Kernel, ikigai_store::SnapshotReader) {
+        let store = DurableStore::open(path).unwrap();
+        let reader = store.reader();
+        let kernel = Kernel::with_meta_renderer(
+            Arc::new(space(store)),
+            Arc::new(ikigai_vocab::TurtleRenderer),
+        );
+        (kernel, reader)
+    }
+
+    fn load(k: &Kernel, lines: &[String]) {
+        issue(
+            k,
+            &Capability::root(),
+            Verb::Sink,
+            "urn:iki:store:load",
+            &[
+                ("content", &lines.concat()),
+                ("format", "application/n-quads"),
+            ],
+        )
+        .unwrap();
+    }
+
+    /// ★ Written as read: the dump IS the store's snapshot serialized in iteration order, which
+    /// on this data is not text order. (Before ledger #1732 the dump sorted, and this failed.)
+    #[test]
+    fn a_durable_dump_is_the_stores_key_order_written_as_read() {
+        let path = scratch("key-order");
+        let (k, reader) = durable_kernel(&path);
+        load(&k, &many());
+        let dumped = dump(&k, &Capability::root(), &[]).unwrap();
+
+        let mut read = Vec::new();
+        let mut serializer = RdfSerializer::from_format(RdfFormat::NQuads).for_writer(&mut read);
+        for quad in reader.snapshot_iter() {
+            serializer.serialize_quad(&quad.unwrap()).unwrap();
+        }
+        serializer.finish().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&dumped),
+            String::from_utf8_lossy(&read)
+        );
+
+        let text = String::from_utf8(dumped).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut sorted = lines.clone();
+        sorted.sort_unstable();
+        assert_ne!(
+            lines, sorted,
+            "the data no longer tells key order from text order"
+        );
+        // The default graph first: its quads have no fourth term.
+        let defaults = lines
+            .iter()
+            .take_while(|l| l.matches('<').count() == 2)
+            .count();
+        assert_eq!(defaults, 20, "{text}");
+        drop(k);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// ★ The order is a function of each quad alone, whatever the history: the same quads loaded
+    /// in the opposite order, beside a quad written and deleted again, dump to the same bytes;
+    /// the dump loaded into a third store dumps to the same bytes again; and the lines are the
+    /// in-memory backing's lines, which are sorted.
+    #[test]
+    fn a_durable_dump_does_not_depend_on_history_and_round_trips() {
+        let quads = many();
+        let (a_path, b_path, c_path) = (scratch("hist-a"), scratch("hist-b"), scratch("hist-c"));
+        let (a, _) = durable_kernel(&a_path);
+        load(&a, &quads);
+        let (b, _) = durable_kernel(&b_path);
+        let mut reversed = quads.clone();
+        reversed.reverse();
+        load(&b, &reversed[..30]);
+        load(
+            &b,
+            &["<urn:x:gone> <urn:x:p> \"briefly\" <urn:x:g1> .\n".to_string()],
+        );
+        issue(
+            &b,
+            &Capability::root(),
+            Verb::Sink,
+            "urn:iki:store:update",
+            &[(
+                "content",
+                "DELETE DATA { GRAPH <urn:x:g1> { <urn:x:gone> <urn:x:p> \"briefly\" } }",
+            )],
+        )
+        .unwrap();
+        load(&b, &reversed[30..]);
+        let root = Capability::root();
+        let first = dump(&a, &root, &[]).unwrap();
+        assert_eq!(dump(&b, &root, &[]).unwrap(), first);
+
+        let (c, _) = durable_kernel(&c_path);
+        issue(
+            &c,
+            &root,
+            Verb::Sink,
+            "urn:iki:store:load",
+            &[
+                ("content", std::str::from_utf8(&first).unwrap()),
+                ("format", "application/n-quads"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(dump(&c, &root, &[]).unwrap(), first);
+
+        let memory = kernel();
+        load(&memory, &quads);
+        let in_memory = String::from_utf8(dump(&memory, &root, &[]).unwrap()).unwrap();
+        let text = String::from_utf8(first).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.sort_unstable();
+        assert_eq!(lines, in_memory.lines().collect::<Vec<_>>());
+
+        drop((a, b, c));
+        for path in [a_path, b_path, c_path] {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }

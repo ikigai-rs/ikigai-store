@@ -218,6 +218,12 @@
 //! owned store into a shared one later. The choice is made at the call site, on the line
 //! where it is paid for.
 //!
+//! ★ **A host that only needs to READ every quad takes a [`SnapshotReader`] instead**
+//! ([`DurableStore::reader`], ledger #1732): a consistent snapshot per call and no way to
+//! write, so an owned store stays owned and keeps its caching. It is the host's authority (it
+//! reads every graph and checks no capability), never a caller's; [`SnapshotReader`] says how
+//! a host gates it.
+//!
 //! ★ **…unless the host can say WHERE the sharer writes.** One bit for the whole store
 //! is expensive in a way nothing catches — expiry propagates, so a module reading through
 //! `urn:iki:store:graph-select` loses its own caching when its host adds a second face
@@ -292,6 +298,6 @@ pub use endpoints::{
     CAP_WRITE_GRAPH, GRAPH_UPDATE_THREAD, LOAD_THREAD, UPDATE_THREAD,
 };
 pub use store::{
-    Backing, DeclaredTransaction, DurableStore, GraphFingerprint, SharedWriter, SharerWrites,
-    StorageError, Store, Transaction, UndeclaredGraph,
+    Backing, DeclaredTransaction, DurableStore, GraphFingerprint, QuadIter, SharedWriter,
+    SharerWrites, SnapshotReader, StorageError, Store, Transaction, UndeclaredGraph,
 };

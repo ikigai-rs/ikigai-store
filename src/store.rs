@@ -17,7 +17,6 @@ use ikigai_core::{Capability, Error, Result};
 use oxigraph::model::{
     GraphNameRef, NamedNodeRef, NamedOrBlankNode, NamedOrBlankNodeRef, QuadRef, TermRef,
 };
-use oxigraph::store::QuadIter;
 
 use crate::budget::{AnswerBudget, Deadline, TimeBudget};
 
@@ -33,6 +32,10 @@ pub use oxigraph::store::Store;
 /// a [`SharedWriter::write`] closure names them, and one `oxigraph` in the build makes
 /// them the types the host already has.
 pub use oxigraph::store::{StorageError, Transaction};
+
+/// Oxigraph's quad iterator, re-exported for the same reason as [`Store`]: a
+/// [`SnapshotReader::snapshot_iter`] returns one.
+pub use oxigraph::store::QuadIter;
 
 /// Where a [`DurableStore`]'s bytes live.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -901,6 +904,28 @@ impl DurableStore {
         &self.store
     }
 
+    /// Every quad of this dataset, every named graph and the default graph, read from ONE
+    /// consistent snapshot taken now (ledger #1732). Shorthand for
+    /// [`reader`](Self::reader)`().`[`snapshot_iter`](SnapshotReader::snapshot_iter)`()`; the
+    /// reader has the rules, and they are short: it reads, it cannot write, so it changes
+    /// nothing about this store's caching, and it is the HOST's authority, not a caller's.
+    pub fn snapshot_iter(&self) -> QuadIter<'static> {
+        self.store.iter()
+    }
+
+    /// A read-only view of this dataset for a host to hand to the code that needs every quad
+    /// (a backup, an export) and nothing else (ledger #1732). See [`SnapshotReader`].
+    ///
+    /// ★ **Unlike the handle the shared constructors give out, this costs no caching**: a
+    /// reader cannot write, so every write to the dataset is still a write some kernel door
+    /// saw, and an owned store stays [sole writer](Self::is_sole_writer) with every read
+    /// [covered](Self::read_is_covered).
+    pub fn reader(&self) -> SnapshotReader {
+        SnapshotReader {
+            store: Arc::clone(&self.store),
+        }
+    }
+
     /// The writer a host that holds the raw handle commits its OWN writes through: on this
     /// store's one long-lived writer thread, one transaction per call (ledger #1207). `None`
     /// for an owned store. Read [`SharedWriter`] for why both halves of that matter.
@@ -975,6 +1000,81 @@ impl DurableStore {
     /// through an oxigraph transaction that either commits or does not.
     pub(crate) fn write_lock(&self) -> MutexGuard<'_, ()> {
         self.writes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// **A read-only view of a [`DurableStore`]'s dataset**: the quads, from a consistent
+/// snapshot, and no way to write them (ledger #1732). From [`DurableStore::reader`].
+///
+/// # Why it exists
+///
+/// A host that needs every quad (`ikigai-gonk`'s backup streams them into a gzipped archive,
+/// gonk PR 178) had one way to get at them: open the store with a shared constructor and read
+/// through the `Arc<Store>` it gives out. That handle can WRITE, so the store has to assume a
+/// writer no kernel can see and stops caching (`open_shared` makes every read bare;
+/// `open_shared_declaring` every read that can see the default graph). A host that took the
+/// handle only to read paid for a writer it never had. A reader holds the same dataset and
+/// offers only [`snapshot_iter`](Self::snapshot_iter), so the store it came from keeps its
+/// coverage: an owned store stays owned.
+///
+/// ```
+/// use ikigai_store::DurableStore;
+///
+/// let store = DurableStore::in_memory()?;
+/// let reader = store.reader(); // e.g. for a backup job
+/// assert!(store.is_sole_writer());
+/// assert!(store.read_is_covered(None)); // still cached, every read
+/// assert_eq!(reader.snapshot_iter().count(), 0);
+/// # Ok::<(), ikigai_core::Error>(())
+/// ```
+///
+/// A reader hands out no handle and no way to write, so this does not compile:
+///
+/// ```compile_fail,E0614
+/// let reader = ikigai_store::DurableStore::in_memory().unwrap().reader();
+/// let _handle: &ikigai_store::Store = &*reader; // no `Deref` to the store
+/// ```
+///
+/// # ⚠ It is the host's authority, never a caller's
+///
+/// A reader reads EVERY graph and the default graph, and it checks no capability: it is a
+/// Rust value, never served, and whoever holds it can read the whole dataset. That is exactly
+/// the authority the per-graph tenancy boundary (`urn:cap:store:read:graph:<iri>`) exists not
+/// to hand out, so hand a reader only to code that acts for the HOST or for a caller holding
+/// the broad [`CAP_READ`](crate::CAP_READ). A host serving a dump to a caller gates it the way
+/// `urn:iki:store:dump` does: `CAP_READ` and nothing narrower (a tenant holding a grant for
+/// every named graph still cannot read the default graph, which has no IRI). A tenant reads
+/// its own graph through `urn:iki:store:graph-construct`. Nothing here bounds the read either:
+/// a host serving one applies the caller's bounds itself, from
+/// [`DurableStore::time_budget`] and [`DurableStore::answer_budget`] (`for_capability`), as
+/// gonk's backup does.
+///
+/// # Live, not frozen
+///
+/// Each [`snapshot_iter`](Self::snapshot_iter) takes a NEW snapshot: it sees every write
+/// committed before the call and none committed while the iterator runs. That is the
+/// difference from `Store::open_read_only`, which this crate does not offer (see the crate
+/// docs): a read-only OPENER is frozen at its open and never says so; a reader is the live
+/// dataset, read consistently one pass at a time.
+#[derive(Clone)]
+pub struct SnapshotReader {
+    store: Arc<Store>,
+}
+
+impl SnapshotReader {
+    /// Every quad of the dataset, every named graph and the default graph, from one consistent
+    /// snapshot taken now. The order is the backing's own: key order on RocksDB, a function of
+    /// each quad alone; none promised in memory, so sort there when a canonical order matters,
+    /// as `urn:iki:store:dump` does.
+    pub fn snapshot_iter(&self) -> QuadIter<'static> {
+        self.store.iter()
+    }
+}
+
+/// Hand-written because `oxigraph::store::Store` has no `Debug`.
+impl std::fmt::Debug for SnapshotReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotReader").finish_non_exhaustive()
     }
 }
 
