@@ -35,7 +35,20 @@ fn seed(kernel: &Kernel, n: usize, literal: usize) {
     .expect("seeding");
 }
 
+/// A kernel over `store`, whose time budget is an HOUR for every caller.
+///
+/// ★ So that every refusal in this file is the size bound's (ledger #1685). A read is stopped
+/// by whichever bound fires first, and these all serialize megabytes, under the store's 5 s
+/// base until 0.2.23: a machine slow enough answered them with a `Timeout`, which says nothing
+/// about the size bound. Measured on plasma at background QoS (`taskpolicy -b`) beside
+/// 36 busy loops and another build, the cross product below took over 5 s, and then over
+/// 120 s, the default ceiling (923 ms in an ordinary debug run). Nothing here should be stopped
+/// by the clock, and nothing here runs long when the bounds work: without the size bound the
+/// largest of these answers in full in seconds, so the hour is never waited out.
 fn kernel_over(store: DurableStore) -> Kernel {
+    let store = store.with_time_budget(ikigai_store::budget::TimeBudget::new(
+        std::time::Duration::from_secs(3600),
+    ));
     Kernel::with_meta_renderer(
         Arc::new(space(store)),
         Arc::new(ikigai_vocab::TurtleRenderer),
@@ -449,6 +462,12 @@ fn a_max_rows_or_max_bytes_that_is_not_a_positive_inline_number_is_refused() {
 /// The one ledger #970 measured: a three-pattern cross product (1.7 million rows over 120
 /// quads, in a 55-byte query) is refused by its SIZE, long before its time budget — so the
 /// rows never pile up in memory waiting for the deadline.
+///
+/// ★ The store's budget is an hour here, as everywhere in this file ([`kernel_over`]), so the
+/// CLOCK cannot answer first however slow the machine (ledger #1685). The refusal being
+/// the size bound's is the proof that the rows never waited for a deadline: without the bound
+/// this answers in full (2.2 s in release when it was measured). The elapsed time is printed,
+/// not asserted against the 5 s base as it was through 0.2.23, because it is a machine's.
 #[test]
 fn the_cross_product_is_refused_by_size_before_time() {
     let kernel = kernel_over(DurableStore::in_memory().unwrap());
@@ -468,9 +487,5 @@ fn the_cross_product_is_refused_by_size_before_time() {
         // Nine columns a row, so the byte bound is reached first (at ~60,000 rows).
         "the answer exceeds 16777216 bytes;",
     );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "refused at {:?}, which is the time budget's job, not the size bound's",
-        started.elapsed()
-    );
+    eprintln!("refused by size after {:?}", started.elapsed());
 }

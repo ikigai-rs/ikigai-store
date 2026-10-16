@@ -21,6 +21,15 @@
 //! These use only the doors' public API plus `DurableStore::{with_time_budget,
 //! overdue_evaluations}`, so against 0.2.7 they do not compile; the reproduction there is
 //! `tests/sparql_time_measure.rs`, which runs oxigraph beneath the doors.
+//!
+//! ★ **Every READ here that must be refused by the clock is `common::slow`** (ledger #1685): a
+//! read is stopped by whichever bound fires first, and the answer's SIZE is bounded too. Through
+//! 0.2.23 these read a four-pattern cross product, which a release build serializes to the
+//! 16 MiB bound in 89 ms (plasma), so four of them failed under `cargo test --release` and
+//! passed in debug only because debug is slower. `common`'s header has the measurement. The
+//! update tests keep the plain cross product: an update's answer is not size-bounded.
+
+mod common;
 
 use futures::executor::block_on;
 use ikigai_core::{ArgRef, Capability, Error, Iri, Kernel, Request, Verb};
@@ -32,14 +41,10 @@ use std::time::{Duration, Instant};
 const G: &str = "urn:example:g";
 
 /// A small dense graph — 60 nodes, two `<urn:p>` edges each — in the default graph and in
-/// `G`, so a cross product of a few unconstrained patterns is |120|^n rows.
+/// `G`, so a cross product of a few unconstrained patterns is |120|^n rows. Two graphs, as
+/// `common::SEED_GRAPHS` allows.
 fn seed() -> String {
-    let mut triples = String::new();
-    for i in 0..60usize {
-        for j in [i + 1, i * 7 + 3] {
-            triples.push_str(&format!("<urn:n{i}> <urn:p> <urn:n{}> . ", j % 60));
-        }
-    }
+    let triples = common::seed_triples();
     format!("INSERT DATA {{ {triples} GRAPH <{G}> {{ {triples} }} }}")
 }
 
@@ -90,7 +95,9 @@ fn select(kernel: &Kernel, cap: &Capability, query: &str) -> ikigai_core::Result
     )
 }
 
-/// `n` unconstrained triple patterns: |data|^n rows, in under 100 bytes.
+/// `n` unconstrained triple patterns: |data|^n rows, in under 100 bytes. Only for an update
+/// or an aggregate: a READ of it is refused by its size as soon as the machine can serialize
+/// 16 MiB, so a read that must meet the clock is `common::slow` (ledger #1685).
 fn cross(n: usize, head: &str) -> String {
     let patterns: String = (0..n).map(|i| format!("?s{i} ?p{i} ?o{i} . ")).collect();
     format!("{head} WHERE {{ {patterns} }}")
@@ -109,6 +116,10 @@ fn assert_timeout(result: ikigai_core::Result<String>, budget_ms: u64) {
         Err(Error::Timeout(message)) => assert!(
             message.contains(&format!("{budget_ms} ms")),
             "the refusal names the budget: {message}"
+        ),
+        Ok(body) => panic!(
+            "expected a Timeout naming {budget_ms} ms, got {}",
+            common::not_slow_enough(body.len())
         ),
         other => panic!("expected a Timeout naming {budget_ms} ms, got {other:?}"),
     }
@@ -140,12 +151,49 @@ fn quads(kernel: &Kernel) -> String {
     out[at..].split('"').next().unwrap().to_string()
 }
 
+/// ★ What makes every read below the clock's to stop: the slow query's whole answer is under
+/// both size bounds. `common` checks that at compile time from `SLOW_ROWS` and
+/// `SLOW_ROW_BYTES`; this checks those numbers against the seed and the doors' serialization.
+#[test]
+fn the_slow_query_cannot_reach_a_size_bound() {
+    let (_store, kernel) = store(TimeBudget::new(Duration::from_secs(60)));
+    // Each of its two patterns matches at most this many triples, whatever graph it reads.
+    let matches = select(
+        &kernel,
+        &Capability::root(),
+        "SELECT (COUNT(*) AS ?n) WHERE { { ?a <urn:p> ?x } UNION { GRAPH ?g { ?a <urn:p> ?x } } }",
+    )
+    .unwrap();
+    let at = matches.find("\"value\":\"").expect("a count") + 9;
+    let matches: u64 = matches[at..].split('"').next().unwrap().parse().unwrap();
+    assert!(
+        matches <= common::SEED_TRIPLES * common::SEED_GRAPHS,
+        "{matches} matches: SLOW_ROWS no longer bounds the slow query's rows"
+    );
+    // And a row is within SLOW_ROW_BYTES as each door serializes it (the two rows' answers
+    // include the head and tail).
+    for (iri, head) in [
+        ("urn:iki:store:select", "SELECT ?a ?n"),
+        ("urn:iki:store:construct", "CONSTRUCT { ?a <urn:n> ?n }"),
+    ] {
+        let two = format!("{} LIMIT 2", common::slow(head));
+        let answer = issue(&kernel, &reader(), Verb::Source, iri, &[("query", &two)]).unwrap();
+        assert!(answer.contains("10000"), "{iri}: {answer}");
+        assert!(
+            (answer.len() as u64) < 3 * common::SLOW_ROW_BYTES,
+            "{iri}: {} bytes for two rows: {answer}",
+            answer.len()
+        );
+    }
+}
+
 #[test]
 fn a_query_that_would_run_for_hours_is_refused_at_the_budget_and_its_core_released() {
-    let (store, kernel) = store(TimeBudget::new(ms(300)));
-    // 120^4 = 207 million rows, 75 bytes of query.
+    let (store, kernel) = store(TimeBudget::new(common::slow_budget(300)));
+    // 14,400 rows, each grown from a million-character string: about 17 s in release and five
+    // minutes in debug (plasma), and under every size bound.
     let start = Instant::now();
-    assert_timeout(select(&kernel, &reader(), &cross(4, "SELECT *")), 300);
+    assert_timeout(select(&kernel, &reader(), &common::slow("SELECT ?n")), 300);
     let waited = start.elapsed();
     assert!(waited >= ms(300), "answered before the budget: {waited:?}");
     assert!(waited < ms(300) + ms(1500), "answered late: {waited:?}");
@@ -161,8 +209,8 @@ fn a_query_that_would_run_for_hours_is_refused_at_the_budget_and_its_core_releas
 
 #[test]
 fn a_construct_is_stopped_between_rows_too() {
-    let (store, kernel) = store(TimeBudget::new(ms(300)));
-    let construct = cross(4, "CONSTRUCT { ?s0 ?p0 ?o3 }");
+    let (store, kernel) = store(TimeBudget::new(common::slow_budget(300)));
+    let construct = common::slow("CONSTRUCT { ?a <urn:n> ?n }");
     assert_timeout(
         issue(
             &kernel,
@@ -178,7 +226,7 @@ fn a_construct_is_stopped_between_rows_too() {
 
 #[test]
 fn the_scoped_doors_are_budgeted_too() {
-    let (store, kernel) = store(TimeBudget::new(ms(300)));
+    let (store, kernel) = store(TimeBudget::new(common::slow_budget(300)));
     let cap = Capability::scoped([ikigai_store::cap_read_graph(G)]);
     assert_timeout(
         issue(
@@ -186,7 +234,7 @@ fn the_scoped_doors_are_budgeted_too() {
             &cap,
             Verb::Source,
             "urn:iki:store:graph-select",
-            &[("query", &cross(4, "SELECT *")), ("graph", G)],
+            &[("query", &common::slow("SELECT ?n")), ("graph", G)],
         ),
         300,
     );
@@ -207,21 +255,20 @@ fn a_legitimate_query_answers_under_the_budget() {
 
 #[test]
 fn a_budget_grant_raises_the_budget_and_root_gets_the_ceiling() {
-    let budget = TimeBudget::new(ms(100)).with_ceiling(ms(700));
+    // At most `common::MAX_BUDGET_MS`, so only the clock stops the slow query.
+    let budget = TimeBudget::new(ms(100)).with_ceiling(common::slow_budget(300));
     let (store, kernel) = store(budget);
-    let granted = Capability::scoped([CAP_READ.to_string(), cap_budget(400)]);
+    let granted = Capability::scoped([CAP_READ.to_string(), cap_budget(200)]);
+    let slow = common::slow("SELECT ?n");
     let start = Instant::now();
-    assert_timeout(select(&kernel, &granted, &cross(4, "SELECT *")), 400);
-    assert!(start.elapsed() >= ms(400));
+    assert_timeout(select(&kernel, &granted, &slow), 200);
+    assert!(start.elapsed() >= ms(200));
     settles(&store, Duration::from_secs(5));
     // Attenuating the grant away cannot raise anything: it falls back to the base.
     let attenuated = granted.attenuate([CAP_READ]);
-    assert_timeout(select(&kernel, &attenuated, &cross(4, "SELECT *")), 100);
+    assert_timeout(select(&kernel, &attenuated, &slow), 100);
     settles(&store, Duration::from_secs(5));
-    assert_timeout(
-        select(&kernel, &Capability::root(), &cross(4, "SELECT *")),
-        700,
-    );
+    assert_timeout(select(&kernel, &Capability::root(), &slow), 300);
     settles(&store, Duration::from_secs(5));
 }
 
@@ -278,8 +325,8 @@ fn the_shapes_oxigraph_plans_too_slowly_are_refused_before_planning() {
 
 #[test]
 fn a_request_budget_can_only_tighten() {
-    let (store, kernel) = store(TimeBudget::new(ms(300)));
-    let query = cross(4, "SELECT *");
+    let (store, kernel) = store(TimeBudget::new(common::slow_budget(300)));
+    let query = common::slow("SELECT ?n");
     let with = |budget: &str| {
         issue(
             &kernel,

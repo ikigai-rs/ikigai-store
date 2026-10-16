@@ -17,9 +17,14 @@
 //! ★ Since ledger #1002 one CALLER cannot fill the cap (it holds at most its share, and a
 //! slot is reserved for the host), so these fill it as the HOST, which root is: the store-wide
 //! refusal is the one pinned here, and `tests/overdue_share.rs` pins the per-caller ones.
+//!
+//! ⚠ Root gets the CEILING, not the base (ledger #1685): through 0.2.23 the root fills below
+//! ran 120 s each before they timed out, and this file took eight minutes of every CI run. They
+//! ask for the base with `requested` now. And "refused at once" is told from "waited for a
+//! slot" by the refused read's budget ([`WOULD_WAIT`]), not by a 50 ms stopwatch.
 
 use ikigai_core::{Capability, Error};
-use ikigai_store::budget::{default_max_overdue, EvaluationBudget, TimeBudget};
+use ikigai_store::budget::{cap_budget, default_max_overdue, EvaluationBudget, TimeBudget};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +34,19 @@ fn ms(n: u64) -> Duration {
 
 fn reader() -> Capability {
     Capability::scoped(["urn:cap:space:read"])
+}
+
+/// The budget the read [`refused_at_once`] makes is given: a read that waits for a slot does
+/// so for its whole budget, so one refused in a fraction of this was refused without waiting,
+/// on a machine of any speed and under any load.
+const WOULD_WAIT: Duration = Duration::from_secs(60);
+
+/// [`reader`], holding a budget grant of [`WOULD_WAIT`] (never above a budget's 120 s ceiling).
+fn patient() -> Capability {
+    Capability::scoped([
+        "urn:cap:space:read".to_string(),
+        cap_budget(WOULD_WAIT.as_millis() as u64),
+    ])
 }
 
 /// This machine's available parallelism, as the refusal states it.
@@ -52,7 +70,8 @@ fn held_work(
 }
 
 /// Fill `budget`'s cap with overdue evaluations; returns the senders that release them. As
-/// the host (root), which alone may use every slot of the cap (ledger #1002).
+/// the host (root), which alone may use every slot of the cap (ledger #1002). Root gets the
+/// budget's CEILING (120 s by default), so each asks for 50 ms, which can only lower it.
 fn fill_with_overdue(budget: &EvaluationBudget, n: usize) -> Vec<mpsc::Sender<()>> {
     (0..n)
         .map(|_| {
@@ -61,7 +80,7 @@ fn fill_with_overdue(budget: &EvaluationBudget, n: usize) -> Vec<mpsc::Sender<()
             let answer = budget.run(
                 "ASK {}",
                 &Capability::root(),
-                None,
+                Some("50"),
                 held_work(started, held),
             );
             assert!(matches!(answer, Err(Error::Timeout(_))), "{answer:?}");
@@ -84,13 +103,19 @@ fn release_all(budget: &EvaluationBudget, releases: Vec<mpsc::Sender<()>>) {
     }
 }
 
+/// A read the cap refuses, and the refusal. It is [`patient`], so a refusal after waiting for
+/// a slot would take a minute, and is told from one at once on a machine of any speed.
 fn refused_at_once(budget: &EvaluationBudget) -> String {
     let start = Instant::now();
     let (_release, held) = mpsc::channel::<()>();
     let (started, _seen) = mpsc::channel::<()>();
-    match budget.run("ASK {}", &reader(), None, held_work(started, held)) {
+    match budget.run("ASK {}", &patient(), None, held_work(started, held)) {
         Err(Error::Unavailable(message)) => {
-            assert!(start.elapsed() < ms(50), "refused at once");
+            assert!(
+                start.elapsed() < WOULD_WAIT / 2,
+                "refused at once, not after waiting: {:?}",
+                start.elapsed()
+            );
             message
         }
         other => panic!("expected Unavailable at the cap, got {other:?}"),
@@ -199,7 +224,8 @@ fn a_consumer_budget_counts_apart_from_every_other_and_states_its_own_cap() {
     let _ = refused_at_once(&full);
 
     assert_eq!(own.overdue_evaluations(), 0, "the count is per budget");
-    assert_eq!(own.run("ASK {}", &reader(), None, |_| Ok(7)), Ok(7));
+    // Given a minute, so a slow machine is not refused by the 50 ms clock instead.
+    assert_eq!(own.run("ASK {}", &patient(), None, |_| Ok(7)), Ok(7));
     // And its own cap holds: two more overdue are allowed before it refuses at three.
     let more = fill_with_overdue(&own, 3);
     let message = refused_at_once(&own);

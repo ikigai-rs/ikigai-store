@@ -52,11 +52,15 @@ fn unstoppable() -> String {
 }
 
 fn select(kernel: &Kernel, query: &str) -> ikigai_core::Result<String> {
+    select_as(kernel, &Capability::scoped([CAP_READ]), query)
+}
+
+fn select_as(kernel: &Kernel, capability: &Capability, query: &str) -> ikigai_core::Result<String> {
     block_on(
         kernel.issue(
             Request::new(Verb::Source, Iri::parse("urn:iki:store:select").unwrap())
                 .with_arg("query", ArgRef::Inline(query.as_bytes().to_vec())),
-            &Capability::scoped([CAP_READ]),
+            capability,
         ),
     )
     .map(|rep| String::from_utf8_lossy(&rep.bytes).into_owned())
@@ -111,17 +115,25 @@ fn concurrent_requests_cannot_overshoot_the_cap() {
     assert!(peak <= 1, "the cap was overshot: {peak} overdue at once");
     assert_eq!(timeouts, 1, "only one evaluation started");
     assert_eq!(unavailable, n - 1);
-    // A request arriving now is refused at once, with the message it always had.
+    // A request arriving now is refused at once, with the message it always had. It holds a
+    // budget it would wait out if it waited for the slot instead, so "at once" is told from a
+    // wait on any machine and under any load, not by a 100 ms stopwatch (ledger #1685).
+    let would_wait = Duration::from_secs(60);
+    let patient = Capability::scoped([
+        CAP_READ.to_string(),
+        ikigai_store::budget::cap_budget(would_wait.as_millis() as u64),
+    ]);
     let start = Instant::now();
-    match select(&kernel, "ASK {}") {
+    match select_as(&kernel, &patient, "ASK {}") {
         Err(Error::Unavailable(message)) => {
             assert!(message.contains("still running"), "{message}")
         }
         other => panic!("expected the cap to refuse, got {other:?}"),
     }
     assert!(
-        start.elapsed() < Duration::from_millis(100),
-        "refused at once"
+        start.elapsed() < would_wait / 2,
+        "refused at once, not after waiting: {:?}",
+        start.elapsed()
     );
 }
 

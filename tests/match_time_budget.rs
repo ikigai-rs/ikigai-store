@@ -20,10 +20,21 @@
 //!
 //! The fix is [`EvaluationBudget`]: the doors' deadline, overdue count and cap, handed to a
 //! consumer for its own evaluations. intray adopting it is ikigai-cli's change, not this one.
+//!
+//! ★ **What here hung on the machine's speed is structural now, or has a stated margin**
+//! (ledger #1685). A consumer's worker that must still be running after its caller was
+//! answered is HELD until the test releases it ([`held_match`]): a real oxigraph evaluation
+//! ends some milliseconds after its token (about 60 ms at k=7 in a release build), so a count
+//! read "right after" the timeout was a race the test thread could lose under load. An
+//! evaluation that must outlast a budget or a token through a door is k=8, about five seconds
+//! in a release build on plasma against a 50 ms budget: a margin, not a proof. A refusal "at
+//! once" is told from a wait by giving the refused read a budget it would have waited out
+//! ([`WOULD_WAIT`]), not by a 50 ms stopwatch. What stays wall clock is the promise itself,
+//! "answered at the budget, never later", with a second of slack.
 
 use futures::executor::block_on;
 use ikigai_core::{ArgRef, Capability, Error, Iri, Kernel, Request, Verb};
-use ikigai_store::budget::{check_query, EvaluationBudget, TimeBudget};
+use ikigai_store::budget::{cap_budget, check_query, EvaluationBudget, TimeBudget};
 use ikigai_store::service::{self, refuse_service};
 use ikigai_store::{space, DurableStore};
 use oxigraph::io::RdfFormat;
@@ -85,31 +96,79 @@ fn budgeted_match(
     requested: Option<&str>,
     text: String,
 ) -> ikigai_core::Result<bool> {
+    run_match(budget, caller, requested, text, None)
+}
+
+/// [`budgeted_match`], whose worker, once its evaluation has ended however it ended, waits
+/// for `release` before it returns: so it is still running when its caller has been answered
+/// with a timeout, on any machine, and leaves the overdue count exactly when the test lets it.
+/// Every caller of this times out, at the latest when the budget runs out while it waits.
+fn held_match(
+    budget: &EvaluationBudget,
+    caller: &Capability,
+    requested: Option<&str>,
+    text: String,
+) -> (ikigai_core::Result<bool>, std::sync::mpsc::Sender<()>) {
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    (
+        run_match(budget, caller, requested, text, Some(held)),
+        release,
+    )
+}
+
+fn run_match(
+    budget: &EvaluationBudget,
+    caller: &Capability,
+    requested: Option<&str>,
+    text: String,
+    held: Option<std::sync::mpsc::Receiver<()>>,
+) -> ikigai_core::Result<bool> {
     budget.run(&text.clone(), caller, requested, move |token| {
-        let query = spargebra::SparqlParser::new()
-            .parse_query(&text)
-            .map_err(|e| Error::InvalidArgument {
-                name: "match".into(),
-                detail: e.to_string(),
-            })?;
-        check_query(&query, "match")?;
-        refuse_service(&query, "match")?;
-        let store = tuple();
-        match service::evaluator()
-            .with_cancellation_token(token.clone())
-            .for_query(query)
-            .on_store(&store)
-            .execute()
-            .map_err(|e| Error::Endpoint(format!("match: {e}")))?
-        {
-            QueryResults::Boolean(b) => Ok(b),
-            _ => Ok(false),
+        let answer = evaluate_match(&text, token);
+        if let Some(held) = held {
+            let _ = held.recv();
         }
+        answer
     })
+}
+
+fn evaluate_match(text: &str, token: &CancellationToken) -> ikigai_core::Result<bool> {
+    let query = spargebra::SparqlParser::new()
+        .parse_query(text)
+        .map_err(|e| Error::InvalidArgument {
+            name: "match".into(),
+            detail: e.to_string(),
+        })?;
+    check_query(&query, "match")?;
+    refuse_service(&query, "match")?;
+    let store = tuple();
+    match service::evaluator()
+        .with_cancellation_token(token.clone())
+        .for_query(query)
+        .on_store(&store)
+        .execute()
+        .map_err(|e| Error::Endpoint(format!("match: {e}")))?
+    {
+        QueryResults::Boolean(b) => Ok(b),
+        _ => Ok(false),
+    }
 }
 
 fn reader() -> Capability {
     Capability::scoped(["urn:cap:space:read"])
+}
+
+/// The budget a read is given when the test must tell "refused at once" from "waited for a
+/// slot": a read that waits does so for its whole budget, so one refused in a fraction of
+/// this was refused without waiting, on a machine of any speed and under any load.
+const WOULD_WAIT: Duration = Duration::from_secs(60);
+
+/// [`reader`], holding a budget grant of [`WOULD_WAIT`].
+fn patient_reader() -> Capability {
+    Capability::scoped([
+        "urn:cap:space:read".to_string(),
+        cap_budget(WOULD_WAIT.as_millis() as u64),
+    ])
 }
 
 fn ms(n: u64) -> Duration {
@@ -144,15 +203,23 @@ fn before_the_bare_evaluator_runs_the_template_to_the_end_whatever_it_costs() {
     let store = tuple();
     let mut times = Vec::new();
     for k in 4..=6 {
-        let (answer, took) = bare_ask(&store, &template(k));
-        // Not refused: no bound of any kind applies to it.
-        assert_eq!(answer, Ok(false), "k={k}");
+        // The BEST of three, so a stall of this thread (a loaded runner) cannot inflate the
+        // smaller one and hide the growth: a stall only ever adds time (ledger #1685).
+        let took = (0..3)
+            .map(|_| {
+                let (answer, took) = bare_ask(&store, &template(k));
+                // Not refused: no bound of any kind applies to it.
+                assert_eq!(answer, Ok(false), "k={k}");
+                took
+            })
+            .min()
+            .unwrap();
         eprintln!("k={k} ({} bytes): {took:?}", template(k).len());
         times.push(took);
     }
-    // Each pattern multiplies the work by about the tuple's size (7). Asserted loosely, to
-    // hold on any machine: the point is that growth is geometric, so a template a few
-    // patterns longer than this runs for minutes.
+    // Each pattern multiplies the work by about the tuple's size (7; 7.7x to 8.3x measured in
+    // release on plasma). Asserted loosely, to hold on any machine: the point is that growth
+    // is geometric, so a template a few patterns longer than this runs for minutes.
     let growth = times[2].as_secs_f64() / times[1].as_secs_f64();
     eprintln!(
         "growth k=5 -> k=6: {growth:.1}x; so k=10 would take about {:.0} s",
@@ -172,16 +239,18 @@ fn a_token_alone_stops_it_late_because_the_cross_product_is_in_memory() {
         std::thread::sleep(cancel_at);
         fire.cancel();
     });
+    // k=8: about five seconds in a release build on plasma, so the token always fires while
+    // it runs (at k=7, about 0.7 s, a machine fourteen times faster would finish first).
     let answer = service::evaluator()
         .with_cancellation_token(token)
-        .for_query(parse(&template(7)))
+        .for_query(parse(&template(8)))
         .on_store(&store)
         .execute()
         .map(|r| matches!(r, QueryResults::Boolean(true)))
         .map_err(|e| e.to_string());
     let took = start.elapsed();
     canceller.join().unwrap();
-    eprintln!("k=7, token fired at {cancel_at:?}: {answer:?} after {took:?}");
+    eprintln!("k=8, token fired at {cancel_at:?}: {answer:?} after {took:?}");
     // It is stopped, eventually, which is why an overdue evaluation does end: …
     assert!(answer.is_err(), "the token did stop it: {answer:?}");
     // … but not at the token (measured ~0.8 s after a 0.2 s token at k=7 and 6.3 s at k=8,
@@ -211,8 +280,11 @@ fn the_store_doors_already_bounded_this_template() {
     let start = Instant::now();
     let answer = block_on(
         kernel.issue(
+            // k=8, so the evaluation outlasts the 50 ms budget on any machine short of a
+            // hundred times plasma's release build (ledger #1685). An ASK has no size bound, so
+            // nothing but the clock can answer it.
             Request::new(Verb::Source, Iri::parse("urn:iki:store:graph-ask").unwrap())
-                .with_arg("query", ArgRef::Inline(template(7).into_bytes()))
+                .with_arg("query", ArgRef::Inline(template(8).into_bytes()))
                 .with_arg("graph", ArgRef::Inline(G.as_bytes().to_vec())),
             &Capability::scoped([ikigai_store::cap_read_graph(G)]),
         ),
@@ -226,33 +298,42 @@ fn the_store_doors_already_bounded_this_template() {
 fn after_a_consumer_is_answered_at_its_budget_and_the_worker_is_counted_until_it_ends() {
     let budget = EvaluationBudget::new(TimeBudget::new(ms(50)));
     let start = Instant::now();
-    assert_timeout(budgeted_match(&budget, &reader(), None, template(7)), 50);
+    let (answer, release) = held_match(&budget, &reader(), None, template(7));
+    assert_timeout(answer, 50);
     let answered = start.elapsed();
     assert!(answered < ms(1_050), "answered after {answered:?}");
-    // The worker outlived its caller (the token reaches it late, above), and is counted.
+    // The worker outlived its caller (as a real one does: the token reaches it late, above;
+    // this one is held, so the count is read while it certainly runs), and is counted.
     assert_eq!(budget.overdue_evaluations(), 1);
     // A clone shares the count: that is what makes one per host cap anything.
     assert_eq!(budget.clone().overdue_evaluations(), 1);
+    // And it leaves the count when it ends.
+    release.send(()).unwrap();
     let ended = settles(|| budget.overdue_evaluations(), Duration::from_secs(120));
-    eprintln!("answered after {answered:?}; the worker ended {ended:?} later");
+    eprintln!("answered after {answered:?}; the worker ended {ended:?} after its release");
 }
 
 #[test]
 fn after_at_the_cap_a_new_evaluation_is_refused_at_once_until_one_ends() {
     let budget = EvaluationBudget::new(TimeBudget::new(ms(50)).with_max_overdue(1));
-    assert_timeout(budgeted_match(&budget, &reader(), None, template(7)), 50);
+    let (answer, release) = held_match(&budget, &reader(), None, template(7));
+    assert_timeout(answer, 50);
     let start = Instant::now();
-    match budgeted_match(&budget, &reader(), None, template(2)) {
+    match budgeted_match(&budget, &patient_reader(), None, template(2)) {
         Err(Error::Unavailable(message)) => assert!(
             message.contains("the most it allows is 1"),
             "the refusal says why: {message}"
         ),
         other => panic!("expected Unavailable at the cap, got {other:?}"),
     }
-    assert!(start.elapsed() < ms(50), "refused at once");
+    // Refused at once: a read that waited for the slot would have waited its whole budget.
+    assert!(start.elapsed() < WOULD_WAIT / 2, "{:?}", start.elapsed());
+    release.send(()).unwrap();
     settles(|| budget.overdue_evaluations(), Duration::from_secs(120));
+    // And answered once it ended: given a minute, so a slow machine is not refused by the
+    // 50 ms clock instead (ledger #1685).
     assert_eq!(
-        budgeted_match(&budget, &reader(), None, template(2)),
+        budgeted_match(&budget, &patient_reader(), None, template(2)),
         Ok(false)
     );
 }
@@ -271,10 +352,9 @@ fn after_a_legitimate_match_answers_and_a_request_can_only_lower_the_budget() {
         Ok(false)
     );
     // `requested` lowers the 5 s base to 50 ms …
-    assert_timeout(
-        budgeted_match(&budget, &reader(), Some("50"), template(7)),
-        50,
-    );
+    let (answer, release) = held_match(&budget, &reader(), Some("50"), template(7));
+    assert_timeout(answer, 50);
+    release.send(()).unwrap();
     // … and is refused, naming the argument, when it is not a positive whole number.
     assert!(matches!(
         budgeted_match(&budget, &reader(), Some("0"), matching),
