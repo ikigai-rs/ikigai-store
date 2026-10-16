@@ -84,7 +84,7 @@ where you can.
 | `urn:iki:store:info` | `Source` | backing, quad count, coverage | `urn:cap:store:read` |
 | `urn:iki:store:graphs` | `Source` | which named graphs you may read | `urn:cap:store:read*` (either form) |
 | `urn:iki:store:graph-info` | `Source` | one named graph's quad count, and the scoped write's copy bound (**unreleased, after 0.2.23**) | `urn:cap:store:read:graph:<iri>` |
-| `urn:iki:store:dump` | `Source` | every quad, every graph, as sorted N-Quads (**unreleased, after 0.2.23**) | `urn:cap:store:read`, **and nothing narrower** |
+| `urn:iki:store:dump` | `Source` | every quad, every graph, as N-Quads in an order canonical for the backing (**unreleased, after 0.2.23**) | `urn:cap:store:read`, **and nothing narrower** |
 | `urn:iki:store:update` | `Sink` | SPARQL UPDATE, whole dataset | `urn:cap:store:write` |
 | `urn:iki:store:graph-update` | `Sink` | SPARQL UPDATE, one named graph | `urn:cap:store:write:graph:<iri>` |
 | `urn:iki:store:load` | `Sink` | bulk-load an RDF document | `urn:cap:store:write` |
@@ -585,15 +585,40 @@ ikigai --quiet -c 'sink urn:iki:store:load format=application/n-quads' < backup.
   reads every graph, which is exactly the authority the per-graph tenancy boundary exists not
   to hand out. Grant it to a backup job, never to a tenant; a tenant reads its own graph through
   `urn:iki:store:graph-construct`.
-- **The lines are sorted**, so two dumps of the same dataset are the same bytes on either
-  backing and a backup diffs. N-Quads is one quad per line, so sorting reorders quads and
-  changes none.
+- **The order is canonical for the backing, and on a durable store the answer is held once**
+  (ledger #1732). Two dumps of the same dataset on the same backing are the same bytes, and a
+  quad added or removed adds or removes its one line and moves no other, so a backup diffs:
+  - **durable (RocksDB): the store's key order**, written as read and never copied. A key is the
+    quad's own encoding (the default graph first, then each named graph, within a graph by
+    subject), so the order depends on each quad alone, never on the store's history. It is
+    **not** text order, and an oxigraph release that changed its encoding would reorder a dump
+    once;
+  - **in memory: the lines sorted**, because that backing iterates a hash set whose order
+    depends on history. N-Quads is one quad per line, so sorting reorders quads and changes
+    none.
+
+  So one dataset dumps to different bytes on the two backings, and either loads into either. A
+  consumer that wants text order everywhere sorts the lines (`LC_ALL=C sort`). Until ledger
+  #1732 every dump was sorted, which held the answer twice; measured with
+  `examples/dump-memory.rs` on synthetic RocksDB stores (release, peak RSS, against 109 to 187
+  MB for reading the dataset alone):
+
+  | quads | N-Quads | sorted (before) | key order (now) |
+  | --- | --- | --- | --- |
+  | 375,000 | 84 MB | 278 MB | 192 MB |
+  | 1,500,000 | 339 MB | 856 MB | 509 MB |
+  | 3,000,000 | 679 MB | 1,531 MB | 838 MB |
+- **Never cached.** The kernel copies a cacheable answer into its cache before deciding
+  whether to keep it, so a cacheable dump held the dataset twice even when it was far too large
+  to keep (1.5M quads: 832 MB cacheable, 509 MB bare), and one small enough to keep would
+  evict every other cached read. A dump recomputes every time.
 - **Bounded, and refused past the bound, never truncated.** A representation is bytes, so the
-  dump is built before it is answered: what is streamed is the inside, one pass from the store's
-  iterator through the serializer with no result set in between. It takes the query doors'
-  answer budget (quads against `max_rows`, bytes against `max_bytes`: 100,000 quads and 16 MiB
-  by default, up to 10,000,000 and 1 GiB for root or a `urn:cap:store:answer:*` grant) and the
-  caller's time budget. A dataset past either is refused, saying which.
+  dump is built before it is answered: what is streamed is the inside, one pass from one
+  snapshot of the store's quads through the serializer with no result set in between. It takes
+  the query doors' answer budget (quads against `max_rows`, bytes against `max_bytes`: 100,000
+  quads and 16 MiB by default, up to 10,000,000 and 1 GiB for root or a
+  `urn:cap:store:answer:*` grant) and the caller's time budget. A dataset past either is
+  refused, saying which.
 
 ## Three things a consumer cannot learn any other way
 
@@ -665,6 +690,37 @@ There is no accessor that turns the first into the second. A host that wants
 `ikigai_sparql::space_with_store` over this dataset asks for the `_shared` constructor
 and pays for it in cacheability, at the call site, on the line where the choice is made.
 `urn:iki:store:info` reports `covered: true|false` so an operator can see which it got.
+
+### A host that only READS every quad: `DurableStore::reader` (**unreleased, after 0.2.23**)
+
+A backup or an export needs every quad and writes none, and until ledger #1732 the only way
+to them was the shared handle, which can write, so the store stopped caching for a writer
+that never existed (`ikigai-gonk` PR 178 opened shared for its backup alone). A
+`SnapshotReader` holds the same dataset and offers one thing:
+
+```rust
+let store = DurableStore::open(&path)?;      // owned: every read cacheable
+let reader = store.reader();                 // hand this to the backup job
+for quad in reader.snapshot_iter() {         // every graph and the default graph,
+    let quad = quad?;                        // from ONE consistent snapshot
+    // …
+}
+assert!(store.is_sole_writer());             // still owned, still cached
+```
+
+`store.snapshot_iter()` is the same thing without the reader. Each call takes a NEW snapshot:
+it sees every write committed before it and none made while it runs, so a reader is the live
+dataset read consistently, not the frozen view `Store::open_read_only` gives. The order is the
+backing's own (key order on RocksDB, none promised in memory).
+
+⚠⚠ **It is the host's authority, never a caller's.** A reader reads every graph, checks no
+capability and is never served, so whoever holds it can read the whole dataset. Hand it only to
+code acting for the host or for a caller holding the broad `urn:cap:store:read`, gated the way
+`urn:iki:store:dump` is (that grant and nothing narrower: a tenant with a grant for every named
+graph still cannot read the default graph, which has no IRI). A tenant reads its own graph
+through `urn:iki:store:graph-construct`. Nothing bounds the read either: a host serving one
+applies the caller's bounds itself from `store.time_budget()` and `store.answer_budget()`
+(`for_capability`), as gonk's backup does.
 
 ### …unless the host can say where the sharer writes (0.2.4)
 

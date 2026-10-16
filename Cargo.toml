@@ -456,3 +456,10 @@ ikigai-conformance = "0.8.0"
 # knowing: conformance 0.8.0 requires core 0.1.100 and vocab 0.1.101, so the TEST graph
 # is pulled to that even though the library above genuinely builds on 0.1.93.
 ikigai-vocab = "0.1"
+
+# The peak-memory harness for `urn:iki:store:dump` (ledger #1732): it measures a RocksDB store, so
+# it needs `persistent`. ⚠ `required-features` hides a target from `--all-targets` unless the
+# feature is on (constitution 9c); `ci.yml`'s `features: "*"` is what keeps it linted and built.
+[[example]]
+name = "dump-memory"
+required-features = ["persistent"]

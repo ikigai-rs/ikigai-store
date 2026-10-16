@@ -43,7 +43,8 @@
 //!   another. `tests/graph_scope.rs` is that ablation, and it is where a regression in
 //!   the boundary would actually show.
 //! - **The reads are cacheable because the store is covered**, which is this crate's
-//!   central claim, and is declared here so `CACHEABLE` holds them to it. None of them
+//!   central claim, and is declared here so `CACHEABLE` holds them to it; all but
+//!   `store-dump`, which is never cached, by choice (ledger #1732). None of them
 //!   is `pure` — they read standing state — so the check also requires a non-empty
 //!   thread set, which is exactly [`UPDATE_THREAD`] and [`LOAD_THREAD`].
 //! - **The RDF faces are probed over a SEEDED store** (see [`kernel`]). Left empty they
@@ -209,7 +210,7 @@ fn scoped_id(id: &str) -> String {
 /// read is cacheable exactly like a broad one — it depends on the same three write
 /// threads — and saying so here is what would catch a scoped face that quietly stopped
 /// being cached.
-const READS: [&str; 12] = [
+const READS: [&str; 11] = [
     "store-select",
     "store-ask",
     "store-construct",
@@ -221,8 +222,13 @@ const READS: [&str; 12] = [
     "store-info",
     "store-graphs",
     "store-graph-info",
-    "store-dump",
 ];
+
+/// ★ The one read that is `live` in EVERY mode, owned stores included: `store-dump` is never
+/// cacheable, by choice (ledger #1732). The kernel copies a cacheable answer before deciding to
+/// keep it, so a cacheable dump held the whole dataset twice. Declaring it `live` in all three
+/// walks is what would catch it drifting back to cacheable.
+const NEVER_CACHED: &str = "store-dump";
 
 /// The reads whose universe is ONE named graph, and therefore the exact set that a
 /// `SharerWrites` declaration can put back in the cache.
@@ -250,7 +256,8 @@ fn conforms() {
     let report = walk(
         READS
             .iter()
-            .fold(fixtures(), |suite, id| suite.cacheable(*id)),
+            .fold(fixtures(), |suite, id| suite.cacheable(*id))
+            .live(NEVER_CACHED),
         DurableStore::in_memory().unwrap(),
     );
     // The declaration was checked, not merely made: a `space: none declared` line here
@@ -272,7 +279,10 @@ fn a_shared_store_conforms_as_a_live_one() {
     let (store, handle) = DurableStore::in_memory_shared().unwrap();
     drop(handle);
     walk(
-        READS.iter().fold(fixtures(), |suite, id| suite.live(*id)),
+        READS
+            .iter()
+            .fold(fixtures(), |suite, id| suite.live(*id))
+            .live(NEVER_CACHED),
         store,
     );
 }
@@ -298,5 +308,5 @@ fn a_declared_shared_store_conforms_as_cacheable_exactly_where_it_promised() {
             suite.live(*id)
         }
     });
-    walk(suite, store);
+    walk(suite.live(NEVER_CACHED), store);
 }
