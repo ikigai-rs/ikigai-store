@@ -45,20 +45,20 @@ const G: &str = "urn:example:g";
 /// `common::SEED_GRAPHS` allows.
 fn seed() -> String {
     let triples = common::seed_triples();
-    format!("INSERT DATA {{ {triples} GRAPH <{G}> {{ {triples} }} }}")
+    format!("{triples}\n<{G}> {{ {triples} }}")
 }
 
+/// A store under `budget`, seeded through its raw handle rather than a door (ledger #1685):
+/// through a door the seed runs under the budget too, root's being the ceiling, and a loaded CI
+/// runner timed out a 240-quad `INSERT DATA` under a 300 ms one. Reads of a store whose handle
+/// was given out are never cached, which every test here wants anyway: each read evaluates.
 fn store(budget: TimeBudget) -> (DurableStore, Kernel) {
-    let store = DurableStore::in_memory().unwrap().with_time_budget(budget);
+    let (store, handle) = DurableStore::in_memory_shared().unwrap();
+    handle
+        .load_from_slice(oxigraph::io::RdfFormat::TriG, seed().as_bytes())
+        .expect("seeding");
+    let store = store.with_time_budget(budget);
     let kernel = Kernel::new(Arc::new(space(store.clone())));
-    block_on(
-        kernel.issue(
-            Request::new(Verb::Sink, Iri::parse("urn:iki:store:update").unwrap())
-                .with_arg("content", ArgRef::Inline(seed().into_bytes())),
-            &Capability::root(),
-        ),
-    )
-    .expect("seeding");
     (store, kernel)
 }
 
@@ -200,11 +200,22 @@ fn a_query_that_would_run_for_hours_is_refused_at_the_budget_and_its_core_releas
     // The worker is told to stop and does: nothing is still running a moment later.
     let stopped = settles(&store, Duration::from_secs(5));
     assert!(stopped < Duration::from_secs(2), "{stopped:?}");
-    // And the store answers the next query promptly.
+    // And the store answers the next query promptly. As root, whose budget is the ceiling,
+    // so a loaded runner is not refused by the 300 ms clock instead (ledger #1685); "promptly"
+    // is a few seconds of slack, not a stopwatch.
     let start = Instant::now();
-    let out = select(&kernel, &reader(), "ASK { <urn:n0> <urn:p> <urn:n1> }").unwrap();
+    let out = select(
+        &kernel,
+        &Capability::root(),
+        "ASK { <urn:n0> <urn:p> <urn:n1> }",
+    )
+    .unwrap();
     assert!(out.contains("true"), "{out}");
-    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
 }
 
 #[test]
@@ -243,7 +254,9 @@ fn the_scoped_doors_are_budgeted_too() {
 
 #[test]
 fn a_legitimate_query_answers_under_the_budget() {
-    let (_store, kernel) = store(TimeBudget::new(ms(300)));
+    // The store's own default (5 s), the budget a caller really gets: under the 300 ms the
+    // other tests use, a loaded CI runner refused this ordinary query (ledger #1685).
+    let (_store, kernel) = store(TimeBudget::default());
     let out = select(
         &kernel,
         &reader(),
