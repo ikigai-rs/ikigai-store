@@ -307,7 +307,16 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # least 1) or set by the host, the machine's available parallelism, and that `TimeBudget::with_max_overdue` raises it.
 # A patch: no public API changes (`TimeBudget` keeps `PartialEq`/`Eq`, now comparing what a budget allows, not whether
 # the cap was defaulted); only a refusal's wording. The test graph moves to ikigai-conformance 0.8.0 (test-only).
-version = "0.2.23"
+# ★ 0.2.24 is the 2026-10-14..22 batch. NEW: `urn:iki:store:graph-info` (one graph's quad count and the scoped
+# write's copy bound), `urn:iki:store:dump` (every quad as canonical N-Quads, broad read only) and `DurableStore::reader`
+# (a read-only snapshot reader; ledger #146, #147, #151, #152, #153, #281, #374, #1732). BEHAVIOR: a scoped update that
+# READS another graph (`WITH`/`USING`/`GRAPH <other>`/`COPY`/`MOVE`/`ADD`) is refused by name before evaluation, where
+# 0.2.23 ran it against a copy holding only its own graph (ledger #1606); the scoped write's copy is bounded (250,000
+# quads); the overdue-evaluation cap defaults to at least two and keeps slots for the host, so no one caller fills it
+# (ledger #1002). The pre-parse nesting checks are ikigai-rdf 0.2.7's shared ones (ledger #2051): N-Triples and UTF-16
+# RDF/XML documents the old scan refused are now admitted and refused by the parser, storing nothing;
+# `MAX_RDF_NESTING` keeps its name and value. A patch: the API is additive.
+version = "0.2.24"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
