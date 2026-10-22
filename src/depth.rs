@@ -78,11 +78,13 @@ pub const MAX_RDF_NESTING: usize = ikigai_rdf::MAX_TURTLE_NESTING;
 pub fn check_rdf_nesting(text: &[u8], format: RdfFormat, arg: &str) -> Result<()> {
     let checked = match format {
         RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::NTriples | RdfFormat::NQuads => {
-            let text = std::str::from_utf8(text).map_err(|e| Error::InvalidArgument {
-                name: arg.to_string(),
-                detail: format!("this {} document is not UTF-8: {e}", format.name()),
-            })?;
-            ikigai_rdf::check_turtle_nesting(text, arg)
+            // NOT a refusal for bytes that are not UTF-8: callers scan arbitrary bytes too
+            // (intray's tuples, sealed ones included, through `check_rdf_nesting` up to intray
+            // 0.1.67), and 0.2.24's refusal here refused every sealed tuple. The lossy text
+            // keeps every ASCII delimiter the scan reads, and a parser stops at the first
+            // invalid byte anyway, as intray 0.1.68's own scan does.
+            let text = String::from_utf8_lossy(text);
+            ikigai_rdf::check_turtle_nesting(&text, arg)
         }
         RdfFormat::RdfXml => ikigai_rdf::check_rdfxml_nesting(text, arg),
         other => Err(Error::InvalidArgument {
@@ -363,6 +365,26 @@ mod tests {
         ] {
             assert!(rdfxml(&text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_pass_the_turtle_scan_and_deep_ones_are_still_counted() {
+        // Ciphertext-like bytes: what intray 0.1.67 hands this check for a sealed tuple.
+        let sealed: Vec<u8> = (0u32..512).map(|i| (i * 167 % 251) as u8 | 0x80).collect();
+        assert!(std::str::from_utf8(&sealed).is_err());
+        for format in [
+            RdfFormat::Turtle,
+            RdfFormat::TriG,
+            RdfFormat::NTriples,
+            RdfFormat::NQuads,
+        ] {
+            assert!(check_rdf_nesting(&sealed, format, "content").is_ok());
+        }
+        // Invalid bytes do not hide nesting: a deep document with one stray byte is refused.
+        let mut deep =
+            format!("<urn:a> <urn:p> {} .", "<< ".repeat(MAX_RDF_NESTING + 1)).into_bytes();
+        deep.insert(0, 0xff);
+        assert!(check_rdf_nesting(&deep, RdfFormat::Turtle, "content").is_err());
     }
 
     #[test]

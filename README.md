@@ -11,9 +11,9 @@ roadmap. A store that survives a restart is the difference between those being v
 being a warm-up cost.
 
 > ⚠ **Reading this on `main`?** It can be ahead of crates.io. The latest published release is
-> **0.2.24**; a passage marked **unreleased, after 0.2.24** describes behavior merged since,
+> **0.2.25**; a passage marked **unreleased, after 0.2.25** describes behavior merged since,
 > which arrives with the next release (and takes that version number then). Everything
-> unmarked is in 0.2.24.
+> unmarked is in 0.2.25.
 
 ```rust
 use ikigai_core::Kernel;
