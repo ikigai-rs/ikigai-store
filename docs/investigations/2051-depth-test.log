@@ -1,0 +1,44 @@
+    Updating crates.io index
+     Locking 1 package to highest compatible version
+      Adding ikigai-rdf v0.2.7
+   Compiling ikigai-rdf v0.2.7
+   Compiling ikigai-store v0.2.23 (/home/agent/work/ikigai-store/item-2051)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.04s
+     Running unittests src/lib.rs (target/debug/deps/ikigai_store-23307ba3dda7e049)
+
+running 13 tests
+test depth::tests::a_format_the_scan_cannot_read_is_refused ... ok
+test depth::tests::every_constructor_spelling_is_detected ... ok
+test depth::tests::plain_updates_are_not_gated_in ... ok
+test depth::tests::brackets_in_strings_iris_comments_and_escapes_are_not_nesting ... ok
+test depth::tests::the_bound_is_the_number_the_integration_tests_restate ... ok
+test depth::tests::rdfxml_that_is_not_utf8_is_refused ... FAILED
+test depth::tests::the_refusal_names_the_argument_and_the_bound ... ok
+test depth::tests::nesting_after_a_string_or_iri_is_still_counted ... FAILED
+test depth::tests::a_stored_term_is_measured_at_and_past_the_bound ... ok
+test depth::tests::triple_terms_are_refused_one_past_the_bound_and_pass_at_it_in_every_mode ... ok
+test depth::tests::closed_triple_terms_do_not_accumulate ... ok
+test depth::tests::rdfxml_markup_that_quick_xml_skips_hides_nothing_it_reads ... ok
+test depth::tests::rdfxml_counts_parse_type_triple_elements ... ok
+
+failures:
+
+---- depth::tests::rdfxml_that_is_not_utf8_is_refused stdout ----
+
+thread 'depth::tests::rdfxml_that_is_not_utf8_is_refused' (655784) panicked at src/depth.rs:359:9:
+assertion failed: check_rdf_nesting(&utf16, RdfFormat::RdfXml, "content").is_err()
+
+---- depth::tests::nesting_after_a_string_or_iri_is_still_counted stdout ----
+
+thread 'depth::tests::nesting_after_a_string_or_iri_is_still_counted' (655780) panicked at src/depth.rs:287:13:
+<urn:a> <urn:q> 'x . <urn:a> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <<( <urn:s> <urn:p> <urn:o> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> )>> . # '
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    depth::tests::nesting_after_a_string_or_iri_is_still_counted
+    depth::tests::rdfxml_that_is_not_utf8_is_refused
+
+test result: FAILED. 11 passed; 2 failed; 0 ignored; 0 measured; 92 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--lib`
