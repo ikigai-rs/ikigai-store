@@ -11,9 +11,9 @@ roadmap. A store that survives a restart is the difference between those being v
 being a warm-up cost.
 
 > ⚠ **Reading this on `main`?** It can be ahead of crates.io. The latest published release is
-> **0.2.23**; a passage marked **unreleased, after 0.2.23** describes behavior merged since,
+> **0.2.24**; a passage marked **unreleased, after 0.2.24** describes behavior merged since,
 > which arrives with the next release (and takes that version number then). Everything
-> unmarked is in 0.2.23.
+> unmarked is in 0.2.24.
 
 ```rust
 use ikigai_core::Kernel;
@@ -83,8 +83,8 @@ where you can.
 | `urn:iki:store:graph-describe` | `Source` | SPARQL DESCRIBE, named graphs (one or several) | `urn:cap:store:read:graph:<iri>`, every one |
 | `urn:iki:store:info` | `Source` | backing, quad count, coverage | `urn:cap:store:read` |
 | `urn:iki:store:graphs` | `Source` | which named graphs you may read | `urn:cap:store:read*` (either form) |
-| `urn:iki:store:graph-info` | `Source` | one named graph's quad count, and the scoped write's copy bound (**unreleased, after 0.2.23**) | `urn:cap:store:read:graph:<iri>` |
-| `urn:iki:store:dump` | `Source` | every quad, every graph, as N-Quads in an order canonical for the backing (**unreleased, after 0.2.23**) | `urn:cap:store:read`, **and nothing narrower** |
+| `urn:iki:store:graph-info` | `Source` | one named graph's quad count, and the scoped write's copy bound (**since 0.2.24**) | `urn:cap:store:read:graph:<iri>` |
+| `urn:iki:store:dump` | `Source` | every quad, every graph, as N-Quads in an order canonical for the backing (**since 0.2.24**) | `urn:cap:store:read`, **and nothing narrower** |
 | `urn:iki:store:update` | `Sink` | SPARQL UPDATE, whole dataset | `urn:cap:store:write` |
 | `urn:iki:store:graph-update` | `Sink` | SPARQL UPDATE, one named graph | `urn:cap:store:write:graph:<iri>` |
 | `urn:iki:store:load` | `Sink` | bulk-load an RDF document | `urn:cap:store:write` |
@@ -221,7 +221,7 @@ transaction. So the shapes that defeat a syntactic check are handled by construc
 | `INSERT DATA { <s> <p> <o> }` | **refused** — the default graph is not `G` |
 | `INSERT DATA { GRAPH <other> { … } }`, `WITH <other> … USING <G> …`, `COPY`/`MOVE`/`ADD … TO <other>` | **refused** |
 | `CREATE GRAPH <other>` | **refused** — no quad, but it registers a graph |
-| `WITH <other> …`, `USING <other>`, `USING NAMED <other>`, `… WHERE { GRAPH <other> { … } }` (an `EXISTS` or a sub-select included), `COPY`/`MOVE`/`ADD <other> TO <G>` | **refused by name**, before evaluation — it reads another graph (**unreleased, after 0.2.23**, ledger #1606; 0.2.23 applies it as a no-op) |
+| `WITH <other> …`, `USING <other>`, `USING NAMED <other>`, `… WHERE { GRAPH <other> { … } }` (an `EXISTS` or a sub-select included), `COPY`/`MOVE`/`ADD <other> TO <G>` | **refused by name**, before evaluation — it reads another graph (**since 0.2.24**, ledger #1606; 0.2.23 applies it as a no-op) |
 | `DROP ALL`, `CLEAR ALL`, `DELETE WHERE { GRAPH ?g { … } }` | applied to `G` alone — the private copy held only `G`, and emptying `G` is within a grant over `G` |
 | `… WHERE { GRAPH ?g { … } }` | applied — `?g` can bind `G` and nothing else |
 
@@ -231,7 +231,7 @@ right way round: a grant that let one tenant's agent read another's graph in ord
 decide what to write in its own would be a filter, not a boundary.
 
 ★ **And an update that NAMES another graph to read is refused, not applied as a no-op**
-(**unreleased, after 0.2.23**, ledger #1606). The private copy holds `G` alone, so a `WHERE`
+(**since 0.2.24**, ledger #1606). The private copy holds `G` alone, so a `WHERE`
 reading `<other>` matched nothing, and through 0.2.23 the update answered `updated <G>: +0 -0`
 or worse: `FILTER NOT EXISTS { GRAPH <other> … }` held for every row, and `COPY <other> TO <G>`
 emptied `G`. Each looked like success. Now a constant graph other than `G` in `WITH`, `USING`,
@@ -300,7 +300,7 @@ Three more things, each of them a decision rather than an omission:
   anything outside the graph — and `src/confine.rs` gives the argument, with a differential
   test, that the update computes the same answer on the part as on the whole. The unscoped
   door copies nothing.
-- **…and the copy is bounded** (**unreleased, after 0.2.23**, ledger #146): at most 250,000
+- **…and the copy is bounded** (**since 0.2.24**, ledger #146): at most 250,000
   quads per update unless the host sets another bound
   (`DurableStore::with_max_scoped_copy_quads`). A whole-graph copy is held three times at about 2 KB a quad: measured in release, 3.7 s and +538 MB at 250,000 quads,
   9.3 s and +2.2 GB at a million, 40 s and +4.9 GB at three million
@@ -543,7 +543,7 @@ type bypasses the read boundary entirely.
 
 ## ★ One graph's size: `urn:iki:store:graph-info` (ledger #147)
 
-**Unreleased, after 0.2.23:** 0.2.23 has no `graph-info`.
+**Since 0.2.24:** 0.2.23 has no `graph-info`.
 
 `urn:iki:store:info` counts the whole store under the broad `urn:cap:store:read`, so a tenant
 holding only `urn:cap:store:read:graph:<G>` could not ask how large its own graph is.
@@ -567,7 +567,7 @@ takes the per-graph grant only: a broad reader counts with
 
 ## ★ The whole dataset out: `urn:iki:store:dump` (ledger #374)
 
-**Unreleased, after 0.2.23:** 0.2.23 has no `dump`.
+**Since 0.2.24:** 0.2.23 has no `dump`.
 
 There was a way in for a whole dataset (`urn:iki:store:load`) and no way out, so the first host
 that needed a backup wrote `SELECT ?g ?s ?p ?o`, held the result set in memory and turned it
@@ -691,7 +691,7 @@ There is no accessor that turns the first into the second. A host that wants
 and pays for it in cacheability, at the call site, on the line where the choice is made.
 `urn:iki:store:info` reports `covered: true|false` so an operator can see which it got.
 
-### A host that only READS every quad: `DurableStore::reader` (**unreleased, after 0.2.23**)
+### A host that only READS every quad: `DurableStore::reader` (**since 0.2.24**)
 
 A backup or an export needs every quad and writes none, and until ledger #1732 the only way
 to them was the shared handle, which can write, so the store stopped caching for a writer
@@ -1163,7 +1163,7 @@ two into one shared module):
    token. Such an evaluation is counted as overdue (`DurableStore::overdue_evaluations`).
    ★ **The cap is on reads IN FLIGHT** (ledger #1427): a read takes one of
    `TimeBudget::max_overdue` slots (default: a quarter of the machine's cores, at least two,
-   **unreleased, after 0.2.23**; in 0.2.23, at least one)
+   **since 0.2.24**; in 0.2.23, at least one)
    before its thread starts and gives it back when the thread ends, so at most that many reads
    evaluate at once, and so at most that many can outlive their callers. A read that finds
    every slot taken waits for one within its own budget, and is refused with a transient
@@ -1177,7 +1177,7 @@ two into one shared module):
    so they hold at most one more core. Through 0.2.20 the cap was checked against the overdue
    count alone, which rises only at a timeout, so eight requests arriving together at a cap
    of 1 all started and left eight cores pinned (`tests/overdue_cap_in_flight.rs`).
-4. ★ **No one caller can fill the cap, and the host always has room** (**unreleased, after 0.2.23**,
+4. ★ **No one caller can fill the cap, and the host always has room** (**since 0.2.24**,
    ledger #1002). Through 0.2.23 the cap was one pool for everyone: a caller that could start
    evaluations oxigraph cannot stop (gonk's anonymous HTTP door could) filled it, and then
    EVERY evaluation was refused `Unavailable`, the host's own reads and its backup included.
@@ -1319,11 +1319,11 @@ let matched = budget.run(&text.clone(), inv.capability, None, move |token| {
 - ★ **Each `EvaluationBudget::new` is its own count under its own cap — so state yours**
   (ledger #1500). Clones share a count; two `new`s never do, and neither shares the store's
   doors'. The default cap is `budget::default_max_overdue()`, a quarter of the machine's
-  available parallelism and at least two (**unreleased, after 0.2.23**; at least one through 0.2.23, which was **1 on
+  available parallelism and at least two (**since 0.2.24**; at least one through 0.2.23, which was **1 on
   anything under 8 cores**: on a 4-core CI runner one runaway `sh:select` made every later
   SHACL validation in the process `Unavailable` until it ended, ikigai-rs/ikigai-shacl PR 34).
   The caller share and host reserve apply here too, keyed by the capability `run` is given
-  (**unreleased, after 0.2.23**, ledger #1002). A consumer that would rather
+  (**since 0.2.24**, ledger #1002). A consumer that would rather
   hold more cores than refuse says so:
   `EvaluationBudget::new(TimeBudget::new(base).with_max_overdue(n))`, and a host decides
   whether consumers share one budget (one cap across them) or each keep their own. The
