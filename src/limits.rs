@@ -780,9 +780,9 @@ pub(crate) fn check_load(
 ///
 /// ★ Not a reading of the markup, on purpose. oxrdfxml takes a declaration only from text that
 /// follows the bytes `<!ENTITY` inside a DOCTYPE (`parse_doctype` splits the DOCTYPE's text at
-/// `<` and strips the prefix `!ENTITY`), and the depth scan already refuses a document that is
-/// not UTF-8, so a document without those bytes declares nothing whatever a lexer would make
-/// of it. A scan that agreed with quick-xml about where a DOCTYPE starts and ends would be one
+/// `<` and strips the prefix `!ENTITY`). This load path parses UTF-8 and stops at its first
+/// error, so a document without those bytes declares nothing the loader can expand. A scan
+/// that agreed with quick-xml about where a DOCTYPE starts and ends would be one
 /// more reading to keep in step. The cost is a document that merely MENTIONS `<!ENTITY` in a
 /// comment or a CDATA section, which is refused too.
 fn declares_an_entity(document: &[u8]) -> bool {
