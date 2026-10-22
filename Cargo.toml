@@ -316,7 +316,11 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # (ledger #1002). The pre-parse nesting checks are ikigai-rdf 0.2.7's shared ones (ledger #2051): N-Triples and UTF-16
 # RDF/XML documents the old scan refused are now admitted and refused by the parser, storing nothing;
 # `MAX_RDF_NESTING` keeps its name and value. A patch: the API is additive.
-version = "0.2.24"
+# ★ 0.2.25 FIXES A REGRESSION IN 0.2.24 (ledger #2051 follow-on): 0.2.24's `check_rdf_nesting` refused Turtle-family
+# bytes that are not UTF-8, and ikigai-intray up to 0.1.67 maps any refusal from it to "nests deeper than 64", so with
+# intray <= 0.1.67 every SEALED tuple (ikigai-layers at rest) was refused at `out`. The scan now reads such bytes
+# lossily, as 0.2.23's byte scan and intray 0.1.68's own scan do; nesting hidden behind an invalid byte is still counted.
+version = "0.2.25"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
