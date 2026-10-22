@@ -375,6 +375,8 @@ async-trait = "0.1"
 # ⚠ `"0.1.93"` is a CEILING as well as a floor — `>=0.1.93, <0.2.0`. When core reaches
 # 0.2 this line must move, or this crate silently freezes out of every release after it.
 ikigai-core = "0.1.93"
+# 0.2.7 includes the RDF/XML parseType fixes required by the shared depth scan.
+ikigai-rdf = "0.2.7"
 # In-memory store by default; `persistent` turns the RocksDB backend back on. Oxigraph
 # itself gates `oxrocksdb-sys` out of wasm by target, so the feature pulls in nothing
 # there — and this crate's durable constructors are gated off wasm too, so `persistent`

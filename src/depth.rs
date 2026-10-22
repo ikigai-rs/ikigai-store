@@ -14,20 +14,12 @@
 //! the argument that carried it. Length is not bounded: a document with a million shallow
 //! triple terms is a large document, not a deep one, and the parser carries it.
 //!
-//! ★ **The scan mirrors the PARSER'S lexing, in the mode this crate parses in** — the lesson
-//! of the same fix in `ikigai-shacl` (PR 17), where a scan that read the grammar rather than
-//! the lexer could be bypassed. This crate parses STRICT (`RdfParser::from_format`, no
-//! `lenient()`), with oxttl 0.2's lexer in its Turtle mode (Turtle, TriG) or its N-Triples mode
-//! (N-Triples, N-Quads), and quick-xml 0.37 under oxrdfxml (RDF/XML). The reading only has to
-//! agree with the parser up to the parser's FIRST error: `Store::load_from_reader` stops there
-//! and oxttl returns an error before reading another token, so nothing after it is ever built.
-//! Where the strict lexer and a lenient reading differ (a line end in a short string), the
-//! strict one errors, so the lenient reading the scan uses is a safe one.
-//!
-//! ⚠ **This is a COPY.** `ikigai-shacl`'s `depth::check_turtle_nesting` is the same Turtle scan
-//! (in lenient mode, for rudof), and ledger #976 is where the copies fold into one shared crate.
-//! No published crate exports it in a form this one can take: `ikigai-shacl` would pull rudof
-//! into a store. Keep the two Turtle readings in step until the fold.
+//! The pre-parse checks now live in `ikigai-rdf::depth`, shared with the other RDF
+//! consumers. This module dispatches to those checks and keeps the store's public paths.
+//! The Turtle reading is also used for N-Triples and N-Quads: where their strict parser
+//! disagrees (for example, single-quoted strings), it stops at the first parse error.
+//! `crate::limits::check_load` propagates that error before any statements are written;
+//! the load path neither skips parse errors nor uses a bulk loader.
 //!
 //! ★ **The second half: a triple term an UPDATE builds** (ledger #1333). `INSERT DATA` text is
 //! bounded by [`crate::limits::check_sparql`] (`<<( … )>>` and `<< … >>` count against this
@@ -55,18 +47,17 @@ use oxigraph::model::TermRef;
 /// How deep a loaded document may nest RDF 1.2 triple terms: **64**, counted per `<<( … )>>` or
 /// `<< … >>` in the Turtle family and per `rdf:parseType="Triple"` element in RDF/XML.
 ///
-/// The same number as [`crate::limits::MAX_SPARQL_NESTING`] and `ikigai-shacl`'s
+/// The same number as [`crate::limits::MAX_SPARQL_NESTING`] and `ikigai-rdf`'s
 /// `MAX_TURTLE_NESTING`: one bound on caller nesting across the doors. Real data nests triple
 /// terms a handful deep; a debug build loaded 300 levels on a 2 MiB thread and aborted at 1000.
-pub const MAX_RDF_NESTING: usize = 64;
+pub const MAX_RDF_NESTING: usize = ikigai_rdf::MAX_TURTLE_NESTING;
 
 /// Refuse an RDF document in `format` that nests triple terms deeper than [`MAX_RDF_NESTING`],
 /// without parsing it, naming the argument `arg` that carried it.
 ///
-/// Turtle and TriG are read as oxttl's Turtle-mode lexer reads them, N-Triples and N-Quads as
-/// its N-Triples-mode lexer does (no `'` strings, no long strings), and RDF/XML as quick-xml
-/// does. A format this scan does not know is refused rather than passed: a door that loads a
-/// new syntax must teach the scan to read it first.
+/// The Turtle family uses [`ikigai_rdf::check_turtle_nesting`], and RDF/XML uses
+/// [`ikigai_rdf::check_rdfxml_nesting`]. A format this scan does not know is refused
+/// rather than passed: a door that loads a new syntax must teach the scan to read it first.
 ///
 /// ```
 /// use ikigai_store::depth::{check_rdf_nesting, MAX_RDF_NESTING};
@@ -85,35 +76,32 @@ pub const MAX_RDF_NESTING: usize = 64;
 /// assert!(check_rdf_nesting(quoted.as_bytes(), RdfFormat::Turtle, "content").is_ok());
 /// ```
 pub fn check_rdf_nesting(text: &[u8], format: RdfFormat, arg: &str) -> Result<()> {
-    let deeper = match format {
-        RdfFormat::Turtle | RdfFormat::TriG => terse_exceeds(text, Lexer::Turtle),
-        RdfFormat::NTriples | RdfFormat::NQuads => terse_exceeds(text, Lexer::NTriples),
-        RdfFormat::RdfXml => xml_exceeds(text, arg)?,
-        other => {
-            return Err(Error::InvalidArgument {
+    let checked = match format {
+        RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::NTriples | RdfFormat::NQuads => {
+            let text = std::str::from_utf8(text).map_err(|e| Error::InvalidArgument {
                 name: arg.to_string(),
-                detail: format!(
-                    "{} documents cannot be checked for triple-term nesting before parsing, so \
-                     they are not loaded",
-                    other.name()
-                ),
-            })
+                detail: format!("this {} document is not UTF-8: {e}", format.name()),
+            })?;
+            ikigai_rdf::check_turtle_nesting(text, arg)
         }
-    };
-    if deeper {
-        return Err(Error::InvalidArgument {
+        RdfFormat::RdfXml => ikigai_rdf::check_rdfxml_nesting(text, arg),
+        other => Err(Error::InvalidArgument {
             name: arg.to_string(),
             detail: format!(
-                "this {} document nests RDF 1.2 triple terms deeper than {MAX_RDF_NESTING} \
-                 (MAX_RDF_NESTING), counting `<<( … )>>` and `<< … >>` (or \
-                 `rdf:parseType=\"Triple\"` elements) outside literals, IRIs and comments: the \
-                 RDF library copies a nested triple term recursively, once per level, where a \
-                 stack overflow aborts the whole host. Nothing was loaded",
-                format.name()
+                "{} documents cannot be checked for triple-term nesting before parsing, so \
+                 they are not loaded",
+                other.name()
             ),
-        });
-    }
-    Ok(())
+        }),
+    };
+    // Keep the public store bound's name in refusals, as well as its public constant.
+    checked.map_err(|err| match err {
+        Error::InvalidArgument { name, detail } => Error::InvalidArgument {
+            name,
+            detail: detail.replace("MAX_TURTLE_NESTING", "MAX_RDF_NESTING"),
+        },
+        other => other,
+    })
 }
 
 /// Whether `term` nests RDF 1.2 triple terms deeper than [`MAX_RDF_NESTING`]: the check the
@@ -145,7 +133,7 @@ pub fn nests_deeper_than_the_bound(term: TermRef<'_>) -> bool {
     ) {
         return false;
     }
-    terse_exceeds(term.to_string().as_bytes(), Lexer::NTriples)
+    ikigai_rdf::check_turtle_nesting(&term.to_string(), "content").is_err()
 }
 
 /// Whether SPARQL update `text` could build an RDF 1.2 triple term, judged from the text
@@ -188,268 +176,6 @@ pub(crate) fn grown_too_deep(arg: &str) -> Error {
              it)"
         ),
     }
-}
-
-/// Which of oxttl's lexer modes reads the text.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Lexer {
-    /// Turtle and TriG: `"` and `'` strings, each short or long (tripled).
-    Turtle,
-    /// N-Triples and N-Quads: only short `"` strings. oxttl's N-Triples mode reads `'` as no
-    /// string at all and `"""` as an empty string and then another (`lexer.rs`, the `b'"'` and
-    /// `b'\''` arms).
-    NTriples,
-}
-
-/// Whether Turtle-family `text` nests `<<` deeper than [`MAX_RDF_NESTING`].
-///
-/// The reading is oxttl 0.2's lexer (`lexer.rs`) in the parts that decide what is code:
-/// strings closing at the FIRST unescaped delimiter (a long string at the first tripled one, a
-/// short one even across a line end — where the strict lexer errors and the parse stops),
-/// `<…>` IRIs as everything up to the first `>` (both modes stop there; strict validates after),
-/// `#` comments to the line end, and `\`-escapes. So a `<<` inside a literal, an IRI or a
-/// comment is text, not nesting.
-///
-/// Copied from `ikigai-shacl`'s `check_turtle_nesting` (fold: ledger #976), with the
-/// N-Triples mode added.
-fn terse_exceeds(b: &[u8], lexer: Lexer) -> bool {
-    let at = |i: usize| b.get(i).copied();
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'#' => {
-                while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
-                    i += 1;
-                }
-            }
-            q @ (b'"' | b'\'') if q == b'"' || lexer == Lexer::Turtle => {
-                if lexer == Lexer::Turtle && at(i + 1) == Some(q) && at(i + 2) == Some(q) {
-                    // A long string: ends at the first unescaped triple quote.
-                    i += 3;
-                    while i < b.len() {
-                        if b[i] == b'\\' {
-                            i += 2;
-                        } else if b[i] == q && at(i + 1) == Some(q) && at(i + 2) == Some(q) {
-                            i += 3;
-                            break;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                } else {
-                    // A short string: ends at the quote. The strict lexer stops at a line end
-                    // with an error (and the parse with it); reading on through is the reading
-                    // that consumed what the lexer's error token consumed.
-                    i += 1;
-                    while i < b.len() {
-                        match b[i] {
-                            b'\\' => i += 2,
-                            c if c == q => {
-                                i += 1;
-                                break;
-                            }
-                            _ => i += 1,
-                        }
-                    }
-                }
-            }
-            b'<' if at(i + 1) == Some(b'<') => {
-                depth += 1;
-                if depth > MAX_RDF_NESTING {
-                    return true;
-                }
-                i += 2;
-            }
-            b'<' => {
-                // An IRI: everything up to the first `>`, a `\` escaping what follows.
-                let mut j = i + 1;
-                while j < b.len() && b[j] != b'>' {
-                    j += if b[j] == b'\\' { 2 } else { 1 };
-                }
-                if j >= b.len() {
-                    // Never closed: the parser fails here, and builds nothing after it.
-                    break;
-                }
-                i = j + 1;
-            }
-            b'>' if at(i + 1) == Some(b'>') => {
-                depth = depth.saturating_sub(1);
-                i += 2;
-            }
-            // `\` outside a string is a prefixed name's escape (`ex:a\#b`): skip what it escapes.
-            b'\\' => i += 2,
-            _ => i += 1,
-        }
-    }
-    false
-}
-
-/// Whether RDF/XML `text` nests `parseType` elements that can make a triple term deeper than
-/// [`MAX_RDF_NESTING`].
-///
-/// A triple term in RDF/XML is a property element with `rdf:parseType="Triple"`; its one node
-/// element's properties are the next level down. So the depth is the number of such elements
-/// open at once, read the way quick-xml 0.37 reads markup (`reader/mod.rs`, `parser/*.rs`):
-///
-/// - a comment ends at the first `-->` at least six bytes after its `<`, a CDATA section at
-///   the first `]]>`, a processing instruction at the first `?>`, all quote-blind;
-/// - a DOCTYPE ends at the `>` that balances its `<`s, quote-blind;
-/// - a start or end tag ends at the first `>` outside a `"…"` or `'…'` attribute value.
-///
-/// An element counts when it carries an attribute whose local name is `parseType`, under any
-/// prefix, and whose value is anything but `Literal`, `Resource` or `Collection` written out:
-/// an entity reference may expand to `Triple` (oxrdfxml reads `<!ENTITY>` declarations), so a
-/// value that could is counted. That over-counts only documents no real data looks like.
-///
-/// ⚠ The text must be UTF-8, which is all this build's quick-xml reads: a document with a NUL
-/// byte (every UTF-16 one) is refused, since a scan of bytes cannot read it and a quick-xml
-/// built with its `encoding` feature (unification again) could.
-fn xml_exceeds(b: &[u8], arg: &str) -> Result<bool> {
-    if b.contains(&0) || b.starts_with(&[0xFF, 0xFE]) || b.starts_with(&[0xFE, 0xFF]) {
-        return Err(Error::InvalidArgument {
-            name: arg.to_string(),
-            detail: "this RDF/XML document is not UTF-8 (it has a NUL byte or a UTF-16 byte \
-                     order mark): it is read as UTF-8 or not at all"
-                .to_string(),
-        });
-    }
-    let find = |from: usize, pat: &[u8]| -> Option<usize> {
-        b.get(from..)?
-            .windows(pat.len())
-            .position(|w| w == pat)
-            .map(|p| from + p)
-    };
-    // The open elements, each remembering whether it counted.
-    let mut open: Vec<bool> = Vec::new();
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'<' {
-            i += 1;
-            continue;
-        }
-        let end = match b.get(i + 1) {
-            Some(b'!') => match b.get(i + 2) {
-                // `<!--` … `-->`, whose `>` is at least six bytes on (`<!---->` is the shortest).
-                Some(b'-') => find(i + 4, b"-->").map(|p| p + 2),
-                Some(b'[') => find(i + 3, b"]]>").map(|p| p + 2),
-                Some(b'D' | b'd') => {
-                    let mut balance = 0usize;
-                    let mut end = None;
-                    for (j, &c) in b.iter().enumerate().skip(i + 2) {
-                        if c == b'<' {
-                            balance += 1;
-                        } else if c == b'>' {
-                            if balance == 0 {
-                                end = Some(j);
-                                break;
-                            }
-                            balance -= 1;
-                        }
-                    }
-                    end
-                }
-                // Not markup quick-xml reads: it fails here.
-                _ => None,
-            },
-            Some(b'?') => find(i + 1, b"?>").map(|p| p + 1),
-            Some(_) => {
-                let mut quote = None;
-                let mut end = None;
-                for (j, &c) in b.iter().enumerate().skip(i + 1) {
-                    match (quote, c) {
-                        (None, b'>') => {
-                            end = Some(j);
-                            break;
-                        }
-                        (None, b'"' | b'\'') => quote = Some(c),
-                        (Some(q), c) if c == q => quote = None,
-                        _ => {}
-                    }
-                }
-                let Some(end) = end else { break };
-                let tag = &b[i + 1..end];
-                if tag.first() == Some(&b'/') {
-                    // An end tag closes the innermost element; one with nothing open is an
-                    // error the parser stops at.
-                    match open.pop() {
-                        Some(true) => depth -= 1,
-                        Some(false) => {}
-                        None => break,
-                    }
-                } else {
-                    let counts = may_be_triple(tag);
-                    if counts {
-                        depth += 1;
-                        if depth > MAX_RDF_NESTING {
-                            return Ok(true);
-                        }
-                    }
-                    // A self-closing element opens and closes at once.
-                    if tag.last() == Some(&b'/') {
-                        if counts {
-                            depth -= 1;
-                        }
-                    } else {
-                        open.push(counts);
-                    }
-                }
-                Some(end)
-            }
-            None => None,
-        };
-        match end {
-            Some(end) => i = end + 1,
-            // Unclosed markup: the parser fails here, and builds nothing after it.
-            None => break,
-        }
-    }
-    Ok(false)
-}
-
-/// Whether a start tag's text (between `<` and `>`) carries a `parseType` attribute whose value
-/// may be `Triple`. Every `parseType` followed by `=` and a quoted value is looked at, wherever
-/// it sits, so one inside another attribute's value over-counts and nothing under-counts.
-fn may_be_triple(tag: &[u8]) -> bool {
-    const NAME: &[u8] = b"parseType";
-    let space = |c: u8| matches!(c, b' ' | b'\t' | b'\r' | b'\n');
-    let mut from = 0;
-    while let Some(p) = tag
-        .get(from..)
-        .and_then(|t| t.windows(NAME.len()).position(|w| w == NAME))
-    {
-        let start = from + p;
-        from = start + NAME.len();
-        // A local name: at the start of the attribute name or right after its prefix's `:`.
-        if start == 0 || !(space(tag[start - 1]) || tag[start - 1] == b':') {
-            continue;
-        }
-        let mut j = from;
-        while j < tag.len() && space(tag[j]) {
-            j += 1;
-        }
-        if tag.get(j) != Some(&b'=') {
-            continue;
-        }
-        j += 1;
-        while j < tag.len() && space(tag[j]) {
-            j += 1;
-        }
-        let Some(&q @ (b'"' | b'\'')) = tag.get(j) else {
-            continue;
-        };
-        let value_start = j + 1;
-        let value_end = tag[value_start..]
-            .iter()
-            .position(|&c| c == q)
-            .map_or(tag.len(), |e| value_start + e);
-        let value = &tag[value_start..value_end];
-        if !matches!(value, b"Literal" | b"Resource" | b"Collection") {
-            return true;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -562,14 +288,15 @@ mod tests {
         ] {
             assert!(turtle(&text).is_err(), "{text}");
         }
-        // N-Triples mode: a `'` opens nothing, and `"""` is an empty string then another —
-        // so neither hides what follows the way the Turtle reading would let it.
+        assert!(ntriples(&format!("<urn:a> <urn:p> {over} . # '\n")).is_err());
+        // The shared Turtle reading hides these openers in strings, but the strict
+        // N-Triples parser errors at the quotes before it can build a nested term.
         for text in [
-            format!("<urn:a> <urn:p> {over} . # '\n"),
             format!("<urn:a> <urn:q> 'x . <urn:a> <urn:p> {over} . # '"),
             format!("<urn:a> <urn:p> \"\"\"\" {over} . # \"\"\""),
         ] {
-            assert!(ntriples(&text).is_err(), "{text}");
+            assert!(ntriples(&text).is_ok(), "{text}");
+            assert_load_parse_error_and_empty(text.as_bytes(), "application/n-triples");
         }
     }
 
@@ -639,9 +366,29 @@ mod tests {
     }
 
     #[test]
-    fn rdfxml_that_is_not_utf8_is_refused() {
+    fn rdfxml_utf16_passes_the_scan_but_fails_to_load() {
         let utf16: Vec<u8> = "<r/>".encode_utf16().flat_map(u16::to_le_bytes).collect();
-        assert!(check_rdf_nesting(&utf16, RdfFormat::RdfXml, "content").is_err());
+        assert!(check_rdf_nesting(&utf16, RdfFormat::RdfXml, "content").is_ok());
+        assert_load_parse_error_and_empty(&utf16, "application/rdf+xml");
+    }
+
+    fn assert_load_parse_error_and_empty(document: &[u8], media: &str) {
+        use futures::executor::block_on;
+        use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
+        use std::sync::Arc;
+
+        let (store, dataset) = crate::DurableStore::in_memory_shared().unwrap();
+        let kernel = Kernel::new(Arc::new(crate::space(store)));
+        let request = Request::new(Verb::Sink, Iri::parse("urn:iki:store:load").unwrap())
+            .with_arg("content", ArgRef::Inline(document.to_vec()))
+            .with_arg("format", ArgRef::Inline(media.as_bytes().to_vec()));
+        let err = block_on(kernel.issue(request, &Capability::root())).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument { name, detail }
+                if name == "content" && detail.starts_with(&format!("parsing {media}:"))),
+            "{err}"
+        );
+        assert!(dataset.is_empty().unwrap());
     }
 
     #[test]
