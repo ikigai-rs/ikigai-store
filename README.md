@@ -14,6 +14,11 @@ being a warm-up cost.
 > **0.2.25**; a passage marked **unreleased, after 0.2.25** describes behavior merged since,
 > which arrives with the next release (and takes that version number then). Everything
 > unmarked is in 0.2.25.
+>
+> **Unreleased, after 0.2.25:** the next release is **0.3.0**, on `ikigai-core` 0.2.0 (the
+> streams release). No behavior changes; it is a minor because core's types are in this
+> crate's API, so a consumer moves to `ikigai-core = "0.2.0"` and `ikigai-store = "0.3.0"`
+> together.
 
 ```rust
 use ikigai_core::Kernel;
