@@ -38,6 +38,44 @@ fn issue(
     block_on(kernel.issue(request, cap))
 }
 
+fn body_dump(
+    k: &Kernel,
+    cap: &Capability,
+    args: &[(&str, &str)],
+) -> ikigai_core::Result<ikigai_core::Representation<ikigai_core::Body>> {
+    let request = args.iter().fold(
+        Request::new(Verb::Source, Iri::parse("urn:iki:store:dump").unwrap()),
+        |request, (name, value)| request.with_arg(*name, ArgRef::Inline(value.as_bytes().to_vec())),
+    );
+    block_on(k.issue_body(request, cap))
+}
+
+#[test]
+fn the_memory_body_stays_collected_sorted_and_equal_to_the_bytes_answer() {
+    let k = seeded();
+    let answer = body_dump(&k, &Capability::root(), &[]).unwrap();
+    assert!(matches!(answer.bytes, ikigai_core::Body::Bytes(_)));
+    assert_eq!(
+        block_on(answer.bytes.collect(1 << 20)).unwrap(),
+        dump(&k, &Capability::root(), &[]).unwrap()
+    );
+    for args in [[("max_rows", "1")], [("max_bytes", "1")]] {
+        assert!(matches!(
+            body_dump(&k, &Capability::root(), &args),
+            Err(Error::OverBudget { .. })
+        ));
+        // Kernel::issue collects invoke_body too; direct invoke keeps its old contract.
+        assert!(matches!(
+            dump(&k, &Capability::root(), &args),
+            Err(Error::OverBudget { .. })
+        ));
+    }
+    assert!(matches!(
+        body_dump(&k, &Capability::scoped([cap_read_graph("urn:x:g1")]), &[]),
+        Err(Error::Denied(_))
+    ));
+}
+
 /// TriG: two named graphs, the default graph, and literals that need escaping, a language
 /// tag and a datatype, so the serializer has something to get wrong.
 const DATA: &str = r#"
@@ -161,14 +199,14 @@ fn a_dataset_past_the_bound_is_refused_not_truncated() {
     let root = Capability::root();
     let err = dump(&k, &root, &[("max_rows", "3")]).unwrap_err();
     assert!(
-        matches!(&err, Error::InvalidArgument { name, detail }
-            if name == "max_rows" && detail.contains("larger than 3 quads")),
+        matches!(&err, Error::OverBudget { detail }
+            if detail.contains("3 quads")),
         "{err:?}"
     );
     let err = dump(&k, &root, &[("max_bytes", "64")]).unwrap_err();
     assert!(
-        matches!(&err, Error::InvalidArgument { name, detail }
-            if name == "max_bytes" && detail.contains("larger than 64 bytes")),
+        matches!(&err, Error::OverBudget { detail }
+            if detail.contains("64 bytes")),
         "{err:?}"
     );
     // At the bound it is answered in full.
@@ -260,6 +298,70 @@ mod durable {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_durable_body_dump_is_one_shot_and_matches_the_bytes_answer() {
+        let path = scratch("body");
+        let (k, _) = durable_kernel(&path);
+        load(&k, &many());
+        let expected = dump(&k, &Capability::root(), &[]).unwrap();
+        let request = Request::new(Verb::Source, Iri::parse("urn:iki:store:dump").unwrap());
+        let answer = block_on(k.issue_body(request, &Capability::root())).unwrap();
+        assert!(
+            answer.bytes.is_one_shot(),
+            "durable dump must not collect its answer"
+        );
+        assert_eq!(block_on(answer.bytes.collect(1 << 20)).unwrap(), expected);
+        drop(k);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn the_durable_body_keeps_the_snapshot_taken_before_its_first_poll() {
+        let path = scratch("body-snapshot");
+        let (k, _) = durable_kernel(&path);
+        load(&k, &many());
+        let expected = dump(&k, &Capability::root(), &[]).unwrap();
+        let answer = body_dump(&k, &Capability::root(), &[]).unwrap();
+        load(&k, &["<urn:new> <urn:p> \"later\" .\n".to_string()]);
+        assert_eq!(block_on(answer.bytes.collect(1 << 20)).unwrap(), expected);
+        assert_ne!(dump(&k, &Capability::root(), &[]).unwrap(), expected);
+        drop(k);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn durable_body_bounds_and_the_collecting_byte_pool_refuse() {
+        use futures::StreamExt;
+        let path = scratch("body-bounds");
+        let (k, _) = durable_kernel(&path);
+        load(&k, &many());
+        for args in [[("max_rows", "1")], [("max_bytes", "100")]] {
+            let answer = body_dump(&k, &Capability::root(), &args).unwrap();
+            let mut stream = answer.bytes.into_stream();
+            assert!(block_on(stream.next()).unwrap().is_ok());
+            loop {
+                match block_on(stream.next()).expect("a terminal error, not a clean end") {
+                    Ok(_) => {}
+                    Err(Error::OverBudget { .. }) => break,
+                    Err(other) => panic!("unexpected error: {other}"),
+                }
+            }
+            assert!(block_on(stream.next()).is_none());
+        }
+        let answer = body_dump(&k, &Capability::root(), &[]).unwrap();
+        let run = ikigai_core::IssueContext::new().with_memory_limit(8);
+        assert!(matches!(
+            block_on(answer.collect_within(run.memory_budget().unwrap())),
+            Err(Error::OverBudget { .. })
+        ));
+        assert!(matches!(
+            body_dump(&k, &Capability::scoped([cap_read_graph("urn:x:g1")]), &[]),
+            Err(Error::Denied(_))
+        ));
+        drop(k);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     /// ★ Written as read: the dump IS the store's snapshot serialized in iteration order, which

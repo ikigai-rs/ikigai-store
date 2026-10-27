@@ -15,10 +15,10 @@ being a warm-up cost.
 > which arrives with the next release (and takes that version number then). Everything
 > unmarked is in 0.2.25.
 >
-> **Unreleased, after 0.2.25:** the next release is **0.3.0**, on `ikigai-core` 0.2.0 (the
-> streams release). No behavior changes; it is a minor because core's types are in this
-> crate's API, so a consumer moves to `ikigai-core = "0.2.0"` and `ikigai-store = "0.3.0"`
-> together.
+> **Unreleased, after 0.2.25:** the next release is **0.3.1**, on `ikigai-core` 0.2.1
+> (the streams release). The 0.3.0 migration is a minor because core's types are in this
+> crate's API. The 0.3.1 patch adds streamed durable dump bodies without changing public
+> types or signatures. Incremental load and streamed query answers are still pending.
 
 ```rust
 use ikigai_core::Kernel;
@@ -617,13 +617,23 @@ ikigai --quiet -c 'sink urn:iki:store:load format=application/n-quads' < backup.
   whether to keep it, so a cacheable dump held the dataset twice even when it was far too large
   to keep (1.5M quads: 832 MB cacheable, 509 MB bare), and one small enough to keep would
   evict every other cached read. A dump recomputes every time.
-- **Bounded, and refused past the bound, never truncated.** A representation is bytes, so the
-  dump is built before it is answered: what is streamed is the inside, one pass from one
-  snapshot of the store's quads through the serializer with no result set in between. It takes
-  the query doors' answer budget (quads against `max_rows`, bytes against `max_bytes`: 100,000
-  quads and 16 MiB by default, up to 10,000,000 and 1 GiB for root or a
-  `urn:cap:store:answer:*` grant) and the caller's time budget. A dataset past either is
-  refused, saying which.
+- **Streamed on the durable backing through `Kernel::issue_body` (unreleased, 0.3.1).** The
+  answer is a one-shot body over a snapshot taken before it is returned, in RocksDB key
+  order. Each poll serializes one quad with Oxigraph's serializer; dropping the body stops
+  reading. The serializer buffers at most one quad, independent of the total dump size.
+  Memory-backed dumps stay collected and sorted. Direct `Endpoint::invoke` retains the
+  existing bytes implementation; `Kernel::issue` collects the body under the run's byte pool.
+- **Bounded, and refused past the bound, never truncated.** Both paths take the query doors'
+  answer budget (quads against `max_rows`, bytes against `max_bytes`: 100,000 quads and 16 MiB
+  by default, up to 10,000,000 and 1 GiB for root or a `urn:cap:store:answer:*` grant) and the
+  caller's time budget. A body past either size bound fails with `OverBudget`; a timeout or
+  storage failure also ends the stream with an error item. Any preceding chunks are an
+  incomplete dump and must be discarded. The time budget includes time between polls.
+
+Incremental load is not part of this change: the shared RDF nesting checks still accept
+whole byte slices, and must be made incremental before a load can safely parse a `Replay`
+without collecting it. The existing load byte, expansion, nesting, and XML-entity bounds
+remain in force. Streamed query answers are also pending.
 
 ## Three things a consumer cannot learn any other way
 

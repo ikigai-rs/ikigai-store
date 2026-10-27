@@ -326,7 +326,12 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # pass as they are. A MINOR, not a patch: core's types (`Endpoint`, `Invocation`, `Representation`, `Kernel`) are in
 # this crate's API, so a consumer on core 0.1 cannot link 0.3.0; each consumer on `^0.2` moves to `"0.3.0"` in its
 # own core 0.2.0 wave.
-version = "0.3.0"
+# ★ 0.3.1 adds one-shot durable dump bodies (ledger #2277). Direct Endpoint::invoke keeps
+# the collected bytes contract; invoke_body streams RocksDB snapshot key order, with
+# terminal OverBudget errors past the answer bounds. Memory dumps remain sorted/collected.
+# No public types or signatures change, so this is a patch. Incremental load is not included:
+# its shared pre-parse depth scans still require complete slices.
+version = "0.3.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -395,7 +400,10 @@ async-trait = "0.1"
 # under 0.x rules, so it could never reach 0.2 on its own; the core 0.2.0 sweep (wave 2,
 # ledger #2342) moved it. Every floor named above is still met by 0.2.0.
 # ⚠ `"0.2.0"` is `<0.3.0` in turn: move it when core 0.3 publishes.
-ikigai-core = "0.2.0"
+# 0.2.1 is the floor for the body path tested here (ledger #2277).
+ikigai-core = "0.2.1"
+# Runtime-free Stream::unfold for one-quad-at-a-time durable dump bodies, also on wasm.
+futures = "0.3"
 # 0.2.7 included the RDF/XML parseType fixes required by the shared depth scan; 0.3.0 is
 # the same API on ikigai-core 0.2 (the core 0.2.0 sweep, ledger #2342).
 ikigai-rdf = "0.3.0"
@@ -454,7 +462,6 @@ toml = "0.8"
 oxigraph = { version = "0.5.1", default-features = false, features = ["js"] }
 
 [dev-dependencies]
-futures = "0.3"
 # The module recipe as one test, from day one — condition 6. 0.3.0 for the AUTHORITY
 # check, which exists for Sinks like this crate's: a mutating action that declares no
 # `requires` and mutates anyway under a capability holding no grants. Both write doors
