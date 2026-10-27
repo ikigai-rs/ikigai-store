@@ -320,7 +320,13 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # bytes that are not UTF-8, and ikigai-intray up to 0.1.67 maps any refusal from it to "nests deeper than 64", so with
 # intray <= 0.1.67 every SEALED tuple (ikigai-layers at rest) was refused at `out`. The scan now reads such bytes
 # lossily, as 0.2.23's byte scan and intray 0.1.68's own scan do; nesting hidden behind an invalid byte is still counted.
-version = "0.2.25"
+# ★ 0.3.0 MOVES TO IKIGAI-CORE 0.2.0, the streams release (ledger #2261; the core 0.2.0 sweep, wave 2, ledger #2342):
+# ikigai-core and ikigai-vocab 0.2.0, ikigai-rdf 0.3.0, and ikigai-conformance 0.11.0 in the test graph. No source
+# changes: the crate builds and passes unchanged on core 0.2.0, and conformance 0.11's DATATYPES and FAILURES checks
+# pass as they are. A MINOR, not a patch: core's types (`Endpoint`, `Invocation`, `Representation`, `Kernel`) are in
+# this crate's API, so a consumer on core 0.1 cannot link 0.3.0; each consumer on `^0.2` moves to `"0.3.0"` in its
+# own core 0.2.0 wave.
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -385,11 +391,14 @@ async-trait = "0.1"
 # returns — is 0.1.45 (#70), and everything else named here (`Endpoint`, `Invocation`,
 # `Representation`, `ArgSpec::{class,one_of,default_value}`, `Description::requires`)
 # predates 0.1.0.
-# ⚠ `"0.1.93"` is a CEILING as well as a floor — `>=0.1.93, <0.2.0`. When core reaches
-# 0.2 this line must move, or this crate silently freezes out of every release after it.
-ikigai-core = "0.1.93"
-# 0.2.7 includes the RDF/XML parseType fixes required by the shared depth scan.
-ikigai-rdf = "0.2.7"
+# ★ 0.2.0 is the streams release (ledger #2261). The old `"0.1.93"` pin meant `<0.2.0`
+# under 0.x rules, so it could never reach 0.2 on its own; the core 0.2.0 sweep (wave 2,
+# ledger #2342) moved it. Every floor named above is still met by 0.2.0.
+# ⚠ `"0.2.0"` is `<0.3.0` in turn: move it when core 0.3 publishes.
+ikigai-core = "0.2.0"
+# 0.2.7 included the RDF/XML parseType fixes required by the shared depth scan; 0.3.0 is
+# the same API on ikigai-core 0.2 (the core 0.2.0 sweep, ledger #2342).
+ikigai-rdf = "0.3.0"
 # In-memory store by default; `persistent` turns the RocksDB backend back on. Oxigraph
 # itself gates `oxrocksdb-sys` out of wasm by target, so the feature pulls in nothing
 # there — and this crate's durable constructors are gated off wasm too, so `persistent`
@@ -468,14 +477,13 @@ futures = "0.3"
 # RECOMPUTE, and 0.10's FAILURES, which is OFF unless a suite opts in (`check_failures()`;
 # not enabled here yet, so the report carries one `skipped: FAILURES` line). `"0.10.0"`
 # reads as a range, `<0.11.0`; move it when 0.11 publishes.
-# ⚠ It pulls core 0.1.108 into every TEST build (conformance's floor). That is
-# NOT a reason to raise `[dependencies] ikigai-core` above: that line states what the
-# LIBRARY needs, which is 0.1.93 — the test graph's floor comes from here.
-ikigai-conformance = "0.10.0"
-# `TurtleRenderer` for the `Meta` face the kernel routes. ⚠ Resolution consequence worth
-# knowing: conformance 0.10.0 requires core 0.1.108 and its matching vocab, so the TEST graph
-# is pulled to that even though the library above genuinely builds on 0.1.93.
-ikigai-vocab = "0.1"
+# ★ 0.11.0 is conformance on ikigai-core 0.2.0 (ledger #2342), and it turns on DATATYPES
+# (a literal for an ik: property must carry its rdfs:range datatype) and FAILURES (judges
+# only actions that state failure classes) by default. `"0.10.0"` was `<0.11.0`.
+ikigai-conformance = "0.11.0"
+# `TurtleRenderer` for the `Meta` face the kernel routes. 0.2.0 is the streams release
+# (ledger #2261), matching core above; the old `"0.1"` meant `<0.2.0` under 0.x rules.
+ikigai-vocab = "0.2.0"
 
 # The peak-memory harness for `urn:iki:store:dump` (ledger #1732): it measures a RocksDB store, so
 # it needs `persistent`. ⚠ `required-features` hides a target from `--all-targets` unless the
