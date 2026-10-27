@@ -110,8 +110,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Invocation, ReprType,
-    Representation, Result, Verb,
+    ArgRef, ArgSpec, Body, Description, Endpoint, EndpointSpace, Error, Exact, FailureClass,
+    Invocation, ReprType, Representation, Result, Verb,
 };
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::{
@@ -1430,14 +1430,19 @@ impl Endpoint for GraphInfoEndpoint {
 ///
 /// # Bounded, refused past the bound, never truncated
 ///
-/// ⚠ **It is not streamed to the caller**: a [`Representation`] is bytes, so the whole dump is
-/// built before it is answered. What is streamed is the inside: one pass from one snapshot of
-/// the store's quads ([`DurableStore::snapshot_iter`]) through the serializer into a
-/// [`CappedWriter`], with no result set in between. So it takes the query doors' bounds: the
-/// caller's answer budget (quads against `max_rows`, serialized bytes against `max_bytes`;
-/// 100,000 quads and 16 MiB by default, up to 10,000,000 and 1 GiB for root or a
-/// `urn:cap:store:answer:*` grant) and its time budget. A dataset past either is refused with
-/// nothing sent, saying which bound it crossed.
+/// [`Endpoint::invoke_body`] streams a durable snapshot in key order, one serialized quad
+/// per poll, as [`Body::Once`]. Only that quad's serialized bytes are buffered; dropping the
+/// body stops the scan. The memory backing stays collected and sorted. Direct
+/// [`Endpoint::invoke`] retains the collected bytes implementation and its refusal types.
+/// [`ikigai_core::Kernel::issue`] collects the body under the run's memory budget;
+/// [`ikigai_core::Kernel::issue_body`] hands it to the caller without collecting.
+///
+/// Both paths enforce the query doors' answer bounds (quads against `max_rows`, serialized
+/// bytes against `max_bytes`; 100,000 quads and 16 MiB by default, up to 10,000,000 and 1 GiB
+/// for root or a `urn:cap:store:answer:*` grant) and the caller's time budget. Body size
+/// refusals are [`Error::OverBudget`]. If a stream fails after yielding chunks, its final
+/// item is an error: those chunks must never be treated as a complete dump. The time budget
+/// includes time between polls and is checked before and after reading and serializing a quad.
 ///
 /// # ★ The order: canonical per backing, and the answer is held once (ledger #1732)
 ///
@@ -1500,7 +1505,7 @@ impl Endpoint for DumpEndpoint {
                 let bytes = self
                     .store
                     .evaluate("", false, inv.capability, requested, move |deadline| {
-                        dump_quads(&store, deadline, answer)
+                        dump_quads(&store, deadline, answer, dump_too_large)
                     })
                     .map_err(|e| scan_timeout(e, "this dump", budget))?;
                 // ★ Never cacheable, on purpose (ledger #1732): see the type docs.
@@ -1511,6 +1516,53 @@ impl Endpoint for DumpEndpoint {
             }
             other => Err(unsupported("store-dump", other)),
         }
+    }
+
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>> {
+        self.store.serving()?;
+        if inv.request.verb != Verb::Source {
+            return Err(unsupported("store-dump", inv.request.verb));
+        }
+        let requested = crate::budget::inline_bound(inv, "budget")?;
+        let budget = crate::budget::effective_budget(
+            requested,
+            self.store.time_budget().for_capability(inv.capability),
+        )?;
+        let answer = crate::budget::effective_answer(
+            crate::budget::inline_bound(inv, "max_rows")?,
+            crate::budget::inline_bound(inv, "max_bytes")?,
+            self.store.answer_budget().for_capability(inv.capability),
+        )?;
+        let started = std::time::Instant::now();
+        let store = Arc::clone(&self.store);
+        // Memory iteration is not canonical, so it keeps the collected, sorted path.
+        // Body size refusals are OverBudget; invoke keeps its existing InvalidArgument.
+        if matches!(self.store.backing(), Backing::Memory) {
+            let bytes = self
+                .store
+                .evaluate("", false, inv.capability, requested, move |deadline| {
+                    dump_quads(&store, deadline, answer, |unit, _, bound| {
+                        streamed_dump_too_large(unit, bound)
+                    })
+                })
+                .map_err(|e| scan_timeout(e, "this dump", budget))?;
+            return Ok(Representation::from_body(
+                ReprType::new(DUMP_MEDIA).with_param("charset", "utf-8"),
+                Body::from(bytes),
+            ));
+        }
+        // Take the snapshot now, not on the first poll: subsequent writes cannot change
+        // the version promised by the answer. No quad is read until the body is polled.
+        let quads = self
+            .store
+            .evaluate("", false, inv.capability, requested, move |_| {
+                Ok(store.snapshot_iter())
+            })
+            .map_err(|e| scan_timeout(e, "this dump", budget))?;
+        Ok(Representation::from_body(
+            ReprType::new(DUMP_MEDIA).with_param("charset", "utf-8"),
+            streamed_n_quads(quads, answer, started, budget),
+        ))
     }
 
     fn name(&self) -> &str {
@@ -1531,8 +1583,10 @@ impl Endpoint for DumpEndpoint {
                  backup job and never for a tenant. Bounded like a query's answer (quads \
                  against `max_rows`, bytes against `max_bytes`, under the caller's answer \
                  budget) and by the caller's time budget; a dataset past either is refused, \
-                 never truncated. `urn:iki:store:load` with `format=application/n-quads` reads \
-                 it back.",
+                 never truncated. Durable body answers stream from one snapshot; memory answers \
+                 stay collected and sorted. A body past a size bound ends with OverBudget; \
+                 preceding chunks are not a complete dump. `urn:iki:store:load` with \
+                 `format=application/n-quads` reads it back.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -1552,6 +1606,11 @@ impl Endpoint for DumpEndpoint {
                     .optional(),
             )
             .input(answer_bytes_arg(self.store.answer_budget()))
+            .fails(FailureClass::Denied)
+            .fails(FailureClass::OverBudget)
+            .fails(FailureClass::Permanent)
+            .fails(FailureClass::Transient)
+            .fails(FailureClass::Unknown)
             .output(DUMP_MEDIA)
     }
 }
@@ -1569,8 +1628,13 @@ const DUMP_MEDIA: &str = "application/n-quads";
 ///
 /// (That shape, a default-graph quad with no fourth term, is pinned by
 /// `tests/dump.rs::the_dump_is_n_quads_with_every_graph_and_the_default_graph`.)
-fn dump_quads(store: &DurableStore, deadline: &Deadline, bound: AnswerBound) -> Result<Vec<u8>> {
-    let written = n_quads(store.snapshot_iter(), deadline, bound)?;
+fn dump_quads(
+    store: &DurableStore,
+    deadline: &Deadline,
+    bound: AnswerBound,
+    refuse: impl Fn(&str, &str, u64) -> Error,
+) -> Result<Vec<u8>> {
+    let written = n_quads(store.snapshot_iter(), deadline, bound, refuse)?;
     Ok(match store.backing() {
         // RocksDB's key order: a function of each quad alone, so it is already canonical for
         // this backing, and the answer is written once and never copied (ledger #1732).
@@ -1588,6 +1652,7 @@ fn n_quads(
     quads: impl Iterator<Item = std::result::Result<Quad, StorageError>>,
     deadline: &Deadline,
     bound: AnswerBound,
+    refuse: impl Fn(&str, &str, u64) -> Error,
 ) -> Result<Vec<u8>> {
     let io = |e: std::io::Error| Error::Endpoint(format!("serialize: {e}"));
     let mut out = CappedWriter::new(bound.bytes());
@@ -1598,7 +1663,7 @@ fn n_quads(
             deadline.check()?;
             count += 1;
             if count > bound.rows() {
-                return Err(dump_too_large("quads", "max_rows", bound.rows()));
+                return Err(refuse("quads", "max_rows", bound.rows()));
             }
             let quad = quad.map_err(|e| Error::Endpoint(format!("store: {e}")))?;
             serializer.serialize_quad(&quad).map_err(io)?;
@@ -1607,10 +1672,79 @@ fn n_quads(
         Ok(())
     })();
     if out.over() {
-        return Err(dump_too_large("bytes", "max_bytes", bound.bytes()));
+        return Err(refuse("bytes", "max_bytes", bound.bytes()));
     }
     written?;
     Ok(out.into_bytes())
+}
+
+/// One quad per poll, with at most one serialized quad held at a time. An error
+/// consumes the state, so every failure is the final item, never a clean short answer.
+fn streamed_n_quads(
+    quads: impl Iterator<Item = std::result::Result<Quad, StorageError>> + Send + 'static,
+    bound: AnswerBound,
+    started: std::time::Instant,
+    budget: std::time::Duration,
+) -> Body {
+    let state = Some((quads, 0u64, 0u64));
+    Body::once(futures::stream::unfold(state, move |state| async move {
+        let (mut quads, rows, bytes) = state?;
+        let step = (|| {
+            if started.elapsed() >= budget {
+                return Err(Error::Timeout(format!(
+                    "this dump exceeded its time budget of {} ms",
+                    budget.as_millis()
+                )));
+            }
+            let next = quads.next();
+            if started.elapsed() >= budget {
+                return Err(Error::Timeout(format!(
+                    "this dump exceeded its time budget of {} ms",
+                    budget.as_millis()
+                )));
+            }
+            let Some(quad) = next else {
+                return Ok(None);
+            };
+            if rows >= bound.rows() {
+                return Err(streamed_dump_too_large("quads", bound.rows()));
+            }
+            let quad = quad.map_err(|e| Error::Endpoint(format!("store: {e}")))?;
+            let mut out = CappedWriter::new(bound.bytes().saturating_sub(bytes));
+            let written = (|| {
+                let mut serializer =
+                    RdfSerializer::from_format(RdfFormat::NQuads).for_writer(&mut out);
+                serializer.serialize_quad(&quad)?;
+                serializer.finish()?;
+                Ok::<_, std::io::Error>(())
+            })();
+            if out.over() {
+                return Err(streamed_dump_too_large("bytes", bound.bytes()));
+            }
+            written.map_err(|e| Error::Endpoint(format!("serialize: {e}")))?;
+            if started.elapsed() >= budget {
+                return Err(Error::Timeout(format!(
+                    "this dump exceeded its time budget of {} ms",
+                    budget.as_millis()
+                )));
+            }
+            Ok(Some(ikigai_core::Bytes::from(out.into_bytes())))
+        })();
+        match step {
+            Ok(Some(chunk)) => {
+                let total = bytes + chunk.len() as u64;
+                Some((Ok(chunk), Some((quads, rows + 1, total))))
+            }
+            Ok(None) => None,
+            Err(error) => Some((Err(error), None)),
+        }
+    }))
+}
+
+fn streamed_dump_too_large(unit: &str, bound: u64) -> Error {
+    Error::OverBudget {
+        detail: format!("the dataset exceeds this dump's bound of {bound} {unit}; the stream failed, and preceding chunks are not a complete dump"),
+    }
 }
 
 /// The lines of `n_quads`, newline included, in byte order. N-Quads is one quad per line (a
@@ -2423,4 +2557,147 @@ fn graph_format(as_type: Option<&str>) -> Result<RdfFormat> {
                 GRAPH_OUTPUTS.join(", ")
             ),
         })
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use futures::{executor::block_on, StreamExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    fn quad() -> Quad {
+        RdfParser::from_format(RdfFormat::NQuads)
+            .for_slice(b"<urn:s> <urn:p> \"value\" <urn:g> .\n")
+            .next()
+            .unwrap()
+            .unwrap()
+    }
+
+    fn body(
+        quads: impl Iterator<Item = std::result::Result<Quad, StorageError>> + Send + 'static,
+        rows: u64,
+        bytes: u64,
+    ) -> Body {
+        streamed_n_quads(
+            quads,
+            AnswerBound::new(rows, bytes).unwrap(),
+            Instant::now(),
+            Duration::from_secs(60),
+        )
+    }
+
+    #[test]
+    fn direct_invoke_keeps_its_bytes_and_invalid_argument_contract() {
+        use ikigai_core::{Bindings, Capability, Iri, Request};
+        let store = Arc::new(DurableStore::in_memory().unwrap());
+        store.dataset().insert(&quad()).unwrap();
+        let endpoint = DumpEndpoint { store };
+        let cap = Capability::root();
+        let bindings = Bindings::new();
+        let request = Request::new(Verb::Source, Iri::parse("urn:iki:store:dump").unwrap());
+        let inv = Invocation::detached(&request, &bindings, &cap);
+        let bytes = block_on(endpoint.invoke(&inv)).unwrap();
+        let body = block_on(endpoint.invoke_body(&inv)).unwrap();
+        assert_eq!(block_on(body.bytes.collect(1024)).unwrap(), bytes.bytes);
+        let request = request.with_arg("max_bytes", ArgRef::Inline(b"1".to_vec()));
+        let inv = Invocation::detached(&request, &bindings, &cap);
+        assert!(matches!(
+            block_on(endpoint.invoke(&inv)),
+            Err(Error::InvalidArgument { name, .. }) if name == "max_bytes"
+        ));
+        assert!(matches!(
+            block_on(endpoint.invoke_body(&inv)),
+            Err(Error::OverBudget { .. })
+        ));
+    }
+
+    #[test]
+    fn streaming_reads_only_the_quads_polled_and_drop_stops_it() {
+        let polled = Arc::new(AtomicUsize::new(0));
+        let count = polled.clone();
+        let quads = std::iter::repeat_with(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(quad())
+        });
+        let mut stream = body(quads, 10_000_000, 1 << 30).into_stream();
+        assert_eq!(polled.load(Ordering::SeqCst), 0);
+        let first = block_on(stream.next()).unwrap().unwrap();
+        assert_eq!(first, b"<urn:s> <urn:p> \"value\" <urn:g> .\n"[..]);
+        assert_eq!(polled.load(Ordering::SeqCst), 1);
+        drop(stream);
+        assert_eq!(polled.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_large_generated_dump_never_holds_the_complete_answer() {
+        // A million quads generated on demand, consumed without a collecting sink.
+        // Both sides hold one short line, independent of the dataset's size.
+        let mut stream = body((0..1_000_000).map(|_| Ok(quad())), 1_000_000, 1 << 30).into_stream();
+        let (mut rows, mut bytes) = (0, 0);
+        while let Some(chunk) = block_on(stream.next()) {
+            let chunk = chunk.unwrap();
+            assert!(chunk.len() < 64);
+            bytes += chunk.len();
+            rows += 1;
+        }
+        assert_eq!(rows, 1_000_000);
+        assert!(bytes > 16 << 20);
+    }
+
+    #[test]
+    fn streamed_bounds_fail_after_the_prefix_and_then_end() {
+        let line_bytes = b"<urn:s> <urn:p> \"value\" <urn:g> .\n".len() as u64;
+        for (rows, bytes) in [(1, 1024), (2, line_bytes)] {
+            let mut stream = body((0..3).map(|_| Ok(quad())), rows, bytes).into_stream();
+            assert!(block_on(stream.next()).unwrap().is_ok());
+            assert!(matches!(
+                block_on(stream.next()).unwrap(),
+                Err(Error::OverBudget { .. })
+            ));
+            assert!(block_on(stream.next()).is_none());
+        }
+        let exact = body(std::iter::once(Ok(quad())), 1, line_bytes);
+        assert_eq!(
+            block_on(exact.collect(1024)).unwrap().len() as u64,
+            line_bytes
+        );
+    }
+
+    #[test]
+    fn a_storage_error_after_a_chunk_is_an_error_item() {
+        let quads = [
+            Ok(quad()),
+            Err(StorageError::from(std::io::Error::other("broken snapshot"))),
+            Ok(quad()),
+        ];
+        let mut stream = body(quads.into_iter(), 10, 1024).into_stream();
+        assert!(block_on(stream.next()).unwrap().is_ok());
+        assert!(matches!(
+            block_on(stream.next()).unwrap(),
+            Err(Error::Endpoint(_))
+        ));
+        assert!(block_on(stream.next()).is_none());
+    }
+
+    #[test]
+    fn a_stream_past_its_deadline_fails_before_reading() {
+        let polled = Arc::new(AtomicUsize::new(0));
+        let count = polled.clone();
+        let quads = std::iter::repeat_with(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(quad())
+        });
+        let streamed = streamed_n_quads(
+            quads,
+            AnswerBound::new(10, 1024).unwrap(),
+            Instant::now() - Duration::from_secs(1),
+            Duration::from_millis(1),
+        );
+        assert!(matches!(
+            block_on(streamed.collect(1024)),
+            Err(Error::Timeout(_))
+        ));
+        assert_eq!(polled.load(Ordering::SeqCst), 0);
+    }
 }
