@@ -487,7 +487,9 @@ oxigraph = { version = "0.5.1", default-features = false, features = ["js"] }
 # ★ 0.11.0 is conformance on ikigai-core 0.2.0 (ledger #2342), and it turns on DATATYPES
 # (a literal for an ik: property must carry its rdfs:range datatype) and FAILURES (judges
 # only actions that state failure classes) by default. `"0.10.0"` was `<0.11.0`.
-ikigai-conformance = "0.11.0"
+# 0.12.0 adds BODIES and BODY-INPUTS by default; tests share the kernel's space
+# with the suite so deterministic body contracts are probed, not skipped.
+ikigai-conformance = "0.12.0"
 # `TurtleRenderer` for the `Meta` face the kernel routes. 0.2.0 is the streams release
 # (ledger #2261), matching core above; the old `"0.1"` meant `<0.2.0` under 0.x rules.
 ikigai-vocab = "0.2.0"
