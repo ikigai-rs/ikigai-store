@@ -27,7 +27,8 @@
 //!   the endpoints with TWO required by-value inputs, so a BARE pipe into one is
 //!   ambiguous — naming `graph=` leaves `query` as the single unnamed required input and
 //!   the pipe works. See `src/endpoints.rs`.
-//! - **`store-graphs` needs no fixture and that is not an omission.** It declares no
+//! - **`store-graphs` needs no input fixture.** Its caller fixture preserves the broad
+//!   read grant during BODIES' bounded call. It declares no
 //!   inputs at all — the caller's capability IS its input — so the suite drives it with
 //!   nothing and gets a real answer. ⚠ The consequence worth knowing is upstream in
 //!   `ikigai-core`: `select_action` skips an action with no required inputs when a query
@@ -78,9 +79,9 @@
 //!   ([`DurableStore::spaces_bound`]), which would change the very reads being walked.
 
 use futures::executor::block_on;
-use ikigai_conformance::{Fixture, Suite};
+use ikigai_conformance::{Check, Fixture, Suite};
 use ikigai_core::{ArgRef, Capability, EndpointSpace, Iri, Kernel, Request, Verb};
-use ikigai_store::{space, DurableStore, SharerWrites};
+use ikigai_store::{cap_read_graph, space, DurableStore, SharerWrites, CAP_READ};
 use std::sync::Arc;
 
 /// A kernel over `store`, **seeded through its own Sink** with the one triple the RDF
@@ -133,10 +134,23 @@ const SPACE_LABEL: &str = "ikigai_store::space(store)";
 fn walk(suite: Suite, store: DurableStore) -> String {
     let (kernel, space) = kernel(store);
     let report = suite
+        .body_space(space.clone())
         .host_named_space(SPACE_LABEL, space)
         .run_blocking(&kernel);
     println!("{report}");
     assert!(report.is_clean(), "{report}");
+    // Live answers cannot be compared across independent calls. Every other
+    // unprobed result is a coverage gap, including a missing body_space.
+    for unprobed in report.unprobed.iter() {
+        assert!(
+            unprobed.check == Check::Bodies
+                && report.declared.live.contains(&unprobed.endpoint)
+                && unprobed
+                    .reason
+                    .starts_with("uncacheable, time-varying, or volatile answer:"),
+            "unexpected unprobed check: {unprobed:?}\n{report}"
+        );
+    }
     report.to_string()
 }
 
@@ -182,13 +196,24 @@ fn fixtures() -> Suite {
         suite.fixture(
             Fixture::new(scoped_id(id), Verb::Source)
                 .arg("query", *query)
-                .arg("graph", SCOPED_GRAPH),
+                .arg("graph", SCOPED_GRAPH)
+                .capability(Capability::scoped([cap_read_graph(SCOPED_GRAPH)])),
         )
     });
     suite
         // The per-graph count names the seeded scoped graph, so it answers for a graph that
         // exists rather than for an empty one.
-        .fixture(Fixture::new("store-graph-info", Verb::Source).arg("graph", SCOPED_GRAPH))
+        // BODIES bounds a scoped caller without changing its grants. Root would
+        // instead be narrowed to the declared scope patterns, which neither grant
+        // this graph nor preserve store-graphs' visible dataset.
+        .fixture(
+            Fixture::new("store-graph-info", Verb::Source)
+                .arg("graph", SCOPED_GRAPH)
+                .capability(Capability::scoped([cap_read_graph(SCOPED_GRAPH)])),
+        )
+        .fixture(
+            Fixture::new("store-graphs", Verb::Source).capability(Capability::scoped([CAP_READ])),
+        )
         .fixture(Fixture::new("store-load", Verb::Sink).arg("content", INSERT_TURTLE))
         .fixture(Fixture::new("store-update", Verb::Sink).arg("content", INSERT_UPDATE))
         .fixture(

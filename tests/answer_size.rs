@@ -15,7 +15,10 @@
 //! more than a few tens of megabytes.
 
 use futures::executor::block_on;
-use ikigai_core::{ArgRef, Capability, ContentId, Error, Iri, Kernel, Request, Verb};
+use ikigai_core::{
+    ArgRef, Capability, ContentId, Error, Invocation, Iri, Kernel, Request, Resolution, Scope,
+    Space, Verb,
+};
 use ikigai_store::{space, DurableStore, CAP_READ};
 use std::sync::Arc;
 
@@ -69,6 +72,23 @@ fn issue(
     let mut request = Request::new(verb, Iri::parse(iri).unwrap());
     for (name, value) in args {
         request = request.with_arg(*name, value.clone());
+    }
+    // Core settles references before dispatch. Keep the endpoint's own raw-input
+    // validation covered as well as the kernel's unresolved-reference refusal.
+    if let Some((name, _)) = args
+        .iter()
+        .find(|(_, arg)| matches!(arg, ArgRef::Reference(_)))
+    {
+        let space = space(DurableStore::in_memory().unwrap());
+        let Resolution::Hit(hit) = space.resolve(&request, &Scope::empty()) else {
+            panic!("test endpoint is bound");
+        };
+        let inv = Invocation::detached(&request, &hit.bindings, cap);
+        assert!(
+            matches!(block_on(hit.endpoint.invoke(&inv)),
+                Err(Error::InvalidArgument { name: rejected, .. }) if rejected == *name),
+            "endpoint must reject raw {name} by reference"
+        );
     }
     block_on(kernel.issue(request, cap)).map(|r| r.bytes.to_vec())
 }
@@ -173,6 +193,9 @@ fn a_budget_that_is_not_inline_is_refused_not_ignored() {
             ],
         ) {
             Err(Error::InvalidArgument { name, .. }) if name == "budget" => {}
+            Err(Error::Unresolved(iri)) if label == "by reference" => {
+                assert_eq!(iri.as_str(), "urn:example:elsewhere");
+            }
             other => panic!("budget {label}: expected a refusal naming `budget`, got {other:?}"),
         }
     }
@@ -453,6 +476,9 @@ fn a_max_rows_or_max_bytes_that_is_not_a_positive_inline_number_is_refused() {
                 &[("query", inline(all)), (arg, value)],
             ) {
                 Err(Error::InvalidArgument { name, .. }) if name == arg => {}
+                Err(Error::Unresolved(iri)) if label == "by reference" => {
+                    assert_eq!(iri.as_str(), "urn:example:elsewhere");
+                }
                 other => panic!("{arg} {label}: expected a refusal naming it, got {other:?}"),
             }
         }
