@@ -9,18 +9,29 @@
 //! plus `load`'s `format`, which had the same shape.
 //!
 //! Every argument is tried in all three unreadable forms: by reference, by content id, and
-//! inline bytes that are not UTF-8.
+//! inline bytes that are not UTF-8. Raw references are also invoked directly to keep
+//! endpoint validation covered: current core settles string references first and
+//! converts an anyURI reference to its IRI text.
 
 use futures::executor::block_on;
-use ikigai_core::{ArgRef, Capability, ContentId, Error, Iri, Kernel, Request, Verb};
+use ikigai_core::{
+    ArgRef, Capability, ContentId, EndpointSpace, Error, Invocation, Iri, Kernel, Request,
+    Resolution, Scope, Space, Verb,
+};
 use ikigai_store::{space, DurableStore};
 use std::sync::Arc;
 
-fn kernel() -> Kernel {
-    let kernel = Kernel::with_meta_renderer(
-        Arc::new(space(DurableStore::in_memory().unwrap())),
-        Arc::new(ikigai_vocab::TurtleRenderer),
-    );
+struct Fixture {
+    kernel: Kernel,
+    space: Arc<EndpointSpace>,
+}
+
+fn kernel() -> Fixture {
+    let space = Arc::new(space(DurableStore::in_memory().unwrap()));
+    let kernel = Fixture {
+        kernel: Kernel::with_meta_renderer(space.clone(), Arc::new(ikigai_vocab::TurtleRenderer)),
+        space,
+    };
     run(
         &kernel,
         Verb::Sink,
@@ -53,18 +64,38 @@ fn unreadable(value: &str) -> [(&'static str, ArgRef); 3] {
     ]
 }
 
-fn run(kernel: &Kernel, verb: Verb, iri: &str, args: &[(&str, ArgRef)]) -> Result<String, Error> {
+fn run(fixture: &Fixture, verb: Verb, iri: &str, args: &[(&str, ArgRef)]) -> Result<String, Error> {
     let mut request = Request::new(verb, Iri::parse(iri).unwrap());
     for (name, value) in args {
         request = request.with_arg(*name, value.clone());
     }
-    block_on(kernel.issue(request, &Capability::root()))
+    let cap = Capability::root();
+    if let Some((name, _)) = args
+        .iter()
+        .find(|(_, arg)| matches!(arg, ArgRef::Reference(_)))
+    {
+        // The kernel now settles references first. Invoke the same endpoint with
+        // the raw argument too, so its validation cannot regress behind that gate.
+        let Resolution::Hit(hit) = fixture.space.resolve(&request, &Scope::empty()) else {
+            panic!("test endpoint is bound");
+        };
+        let inv = Invocation::detached(&request, &hit.bindings, &cap);
+        assert!(
+            matches!(block_on(hit.endpoint.invoke(&inv)),
+                Err(Error::InvalidArgument { name: rejected, .. }) if rejected == *name),
+            "endpoint must reject raw {name} by reference"
+        );
+    }
+    block_on(fixture.kernel.issue(request, &cap))
         .map(|r| String::from_utf8_lossy(&r.bytes).into_owned())
 }
 
 fn refused_by_name(got: Result<String, Error>, name: &str, label: &str) {
     match got {
         Err(Error::InvalidArgument { name: n, .. }) if n == name => {}
+        Err(Error::Unresolved(iri)) if label.contains("by reference") => {
+            assert_eq!(iri.as_str(), "urn:example:elsewhere");
+        }
         other => panic!("`{name}` {label}: expected InvalidArgument naming it, got {other:?}"),
     }
 }
@@ -149,14 +180,40 @@ fn an_unreadable_load_graph_is_refused_not_loaded_into_the_default_graph() {
                 ("graph", arg),
             ],
         );
-        refused_by_name(got, "graph", label);
+        let by_reference = label == "by reference";
+        if by_reference {
+            // graph is xsd:anyURI: core passes the reference's IRI text inline.
+            // The raw endpoint rejection was checked by run; the kernel must
+            // honor the named graph rather than silently use the default graph.
+            got.expect("an anyURI reference names its graph");
+            let named = run(
+                &k,
+                Verb::Source,
+                "urn:iki:store:ask",
+                &[(
+                    "query",
+                    inline("ASK { GRAPH <urn:example:elsewhere> { <urn:s> <urn:p> <urn:o> } }"),
+                )],
+            )
+            .unwrap();
+            assert!(
+                named.contains("true"),
+                "reference graph was not honored: {named}"
+            );
+        } else {
+            refused_by_name(got, "graph", label);
+        }
         let anywhere = run(
             &k,
             Verb::Source,
             "urn:iki:store:ask",
             &[(
                 "query",
-                inline("ASK { { <urn:s> <urn:p> <urn:o> } UNION { GRAPH ?g { <urn:s> <urn:p> <urn:o> } } }"),
+                inline(if by_reference {
+                    "ASK { <urn:s> <urn:p> <urn:o> }"
+                } else {
+                    "ASK { { <urn:s> <urn:p> <urn:o> } UNION { GRAPH ?g { <urn:s> <urn:p> <urn:o> } } }"
+                }),
             )],
         )
         .unwrap();
