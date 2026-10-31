@@ -1610,3 +1610,9 @@ both left it the same way, the latter a near-exact analogy.
 
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your
 option.
+
+## Accessibility
+
+What this crate emits that people read (short text answers, query results, and error and refusal
+messages), the rules that output follows, how it is tested and how to report a barrier are in
+[ACCESSIBILITY.md](ACCESSIBILITY.md).
