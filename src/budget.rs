@@ -361,15 +361,26 @@ impl OverdueCap {
     /// machine's available parallelism, and how a host raises it.
     #[cfg_attr(target_family = "wasm", allow(dead_code))] // nothing is refused on wasm
     fn origin(&self) -> String {
+        self.origin_for(false)
+    }
+
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    fn origin_for(&self, consumer: bool) -> String {
         let max = self.max;
         let parallelism = match available_parallelism() {
             Some(n) => n.to_string(),
             None => "unknown".to_string(),
         };
-        let raise = "A host raises it with `TimeBudget::with_max_overdue`, on the store \
+        let raise = if consumer {
+            "A host raises it with `TimeBudget::with_max_overdue` on the `EvaluationBudget` \
+             the work ran through; each `EvaluationBudget::new` keeps a count of its own \
+             (ledger #1500)"
+        } else {
+            "A host raises it with `TimeBudget::with_max_overdue`, on the store \
                      (`DurableStore::with_time_budget`) or on the `EvaluationBudget` the \
                      evaluation ran through; each `EvaluationBudget::new` keeps a count of its \
-                     own (ledger #1500)";
+                     own (ledger #1500)"
+        };
         if self.set_by_host {
             format!(
                 "The cap of {max} was set by the host (`TimeBudget::with_max_overdue`); this \
@@ -421,6 +432,11 @@ impl Limits {
     /// share, the pool, the reserve, where each came from, and how a host changes them.
     #[cfg_attr(target_family = "wasm", allow(dead_code))] // nothing is refused on wasm
     fn shares(&self) -> String {
+        self.shares_for(false)
+    }
+
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    fn shares_for(&self, consumer: bool) -> String {
         let (max, reserve, share, pool) = (self.cap.max, self.reserve, self.share, self.pool());
         let share_from = if self.share_set_by_host {
             "set by the host (`TimeBudget::with_caller_share`)".to_string()
@@ -432,14 +448,19 @@ impl Limits {
         } else {
             format!("the default ({DEFAULT_RESERVE}, and at most the cap less 1)")
         };
+        let owner = if consumer {
+            "this evaluation budget's"
+        } else {
+            "this store's"
+        };
         format!(
             "One caller is one principal, and every capability that names none (every \
              anonymous request among them) is ONE caller. One caller's share of {share} is \
-             {share_from}; of this store's cap of {max}, {reserve} is reserved for the host, \
+             {share_from}; of {owner} cap of {max}, {reserve} is reserved for the host, \
              {reserve_from}, and is used only by root and by a capability holding \
              `{CAP_RESERVE}` (ledger #1002). A host raises a caller's share with \
              `TimeBudget::with_caller_share` and gives its own jobs `{CAP_RESERVE}`. {}",
-            self.cap.origin()
+            self.cap.origin_for(consumer)
         )
     }
 }
@@ -760,6 +781,15 @@ pub struct EvaluationBudget {
     /// The consumer's own argument that lowers the budget, for a timeout's advice; `None`
     /// leaves the advice out (ledger #1383).
     argument: Option<Arc<str>>,
+    work: Option<Arc<WorkDescription>>,
+}
+
+#[derive(Clone, Debug)]
+struct WorkDescription {
+    singular: Arc<str>,
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // no capacity refusals on wasm
+    plural: Arc<str>,
+    remedy: Arc<str>,
 }
 
 impl EvaluationBudget {
@@ -770,6 +800,7 @@ impl EvaluationBudget {
             budget,
             evaluations: Arc::default(),
             argument: None,
+            work: None,
         }
     }
 
@@ -828,6 +859,26 @@ impl EvaluationBudget {
         self
     }
 
+    /// Name the work in timeout and capacity refusals instead of SPARQL queries and
+    /// evaluations on a store. `singular` follows "this"; `plural` follows a count.
+    /// `remedy` is an imperative phrase without final punctuation, followed by
+    /// "or ask the host for a larger budget" in a timeout.
+    ///
+    /// For example, a validator can use
+    /// `with_work("SHACL validation", "SHACL validations", "Validate a smaller data graph")`.
+    /// The default keeps the store's SPARQL wording. Clones keep these descriptions and
+    /// share the same evaluation counts, even if a clone changes its descriptions.
+    /// This changes only refusal text, never the budget, cancellation, or capacity rules.
+    #[must_use]
+    pub fn with_work(mut self, singular: &str, plural: &str, remedy: &str) -> Self {
+        self.work = Some(Arc::new(WorkDescription {
+            singular: singular.into(),
+            plural: plural.into(),
+            remedy: remedy.into(),
+        }));
+        self
+    }
+
     /// The time budget these evaluations run under.
     pub fn time_budget(&self) -> TimeBudget {
         self.budget
@@ -868,6 +919,7 @@ impl EvaluationBudget {
             budget,
             write: false,
             argument: self.argument.clone(),
+            work: self.work.clone(),
         };
         on_its_own_thread(
             text,
@@ -903,6 +955,7 @@ pub(crate) struct Deadline {
     /// (ledger #1383): `budget` at this store's doors, the consumer's own name (or none)
     /// through an [`EvaluationBudget`].
     argument: Option<Arc<str>>,
+    work: Option<Arc<WorkDescription>>,
 }
 
 impl Deadline {
@@ -915,6 +968,7 @@ impl Deadline {
             budget: Duration::from_secs(3600),
             write: true,
             argument: Some(DOOR_ARGUMENT.into()),
+            work: None,
         }
     }
 
@@ -928,7 +982,12 @@ impl Deadline {
     /// between rows.
     pub(crate) fn check(&self) -> Result<()> {
         if self.token.is_cancelled() {
-            return Err(timeout(self.budget, self.write, self.argument.as_deref()));
+            return Err(timeout(
+                self.budget,
+                self.write,
+                self.argument.as_deref(),
+                self.work.as_deref(),
+            ));
         }
         Ok(())
     }
@@ -939,7 +998,12 @@ impl Deadline {
     pub(crate) fn settle<R>(&self, commit: impl FnOnce() -> Result<R>) -> Result<R> {
         let mut state = lock(&self.state);
         if *state == State::Abandoned {
-            return Err(timeout(self.budget, self.write, self.argument.as_deref()));
+            return Err(timeout(
+                self.budget,
+                self.write,
+                self.argument.as_deref(),
+                self.work.as_deref(),
+            ));
         }
         *state = State::Settled;
         commit()
@@ -955,7 +1019,12 @@ fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
 /// The argument this store's own doors read a request's lower bound from (`budget=`).
 const DOOR_ARGUMENT: &str = "budget";
 
-fn timeout(budget: Duration, write: bool, argument: Option<&str>) -> Error {
+fn timeout(
+    budget: Duration,
+    write: bool,
+    argument: Option<&str>,
+    work: Option<&WorkDescription>,
+) -> Error {
     // At the doors (`argument` is `budget`) the wording is `ikigai-sparql`'s, so a consumer
     // reading both sees one sentence. Through an `EvaluationBudget` it names the consumer's
     // own argument, or none: a caller cannot pass an argument its door does not take
@@ -964,15 +1033,18 @@ fn timeout(budget: Duration, write: bool, argument: Option<&str>) -> Error {
         Some(arg) => format!(", and a request's `{arg}=` can only lower it"),
         None => String::new(),
     };
+    let subject = match work {
+        Some(work) => format!("this {}", work.singular),
+        None if write => "this SPARQL update".into(),
+        None => "this SPARQL query".into(),
+    };
+    let remedy = work.map_or(
+        "Narrow the query — fewer joins, a bound subject, a LIMIT —",
+        |work| work.remedy.as_ref(),
+    );
     Error::Timeout(format!(
-        "{} ran past its time budget of {} ms and was stopped (ledger #964).{} The budget is \
-         set by the host{lower}. Narrow the query — fewer joins, a bound subject, a LIMIT — \
-         or ask the host for a larger budget",
-        if write {
-            "this SPARQL update"
-        } else {
-            "this SPARQL query"
-        },
+        "{subject} ran past its time budget of {} ms and was stopped (ledger #964).{} The budget is \
+         set by the host{lower}. {remedy} or ask the host for a larger budget",
         budget.as_millis(),
         if write { " Nothing was written." } else { "" },
     ))
@@ -1007,6 +1079,7 @@ where
         budget,
         write,
         argument: Some(DOOR_ARGUMENT.into()),
+        work: None,
     };
     let Admission { limits, caller } = admission;
     on_its_own_thread(text, evaluations, limits, caller, writer, deadline, work)
@@ -1222,16 +1295,17 @@ where
     // runs on the store's one writer thread, which bounds updates to one core already, so it
     // takes no slot; it is still refused while the cap is filled by overdue work.
     let slot = if writer.is_none() {
-        evaluations.reserve(&limits, &caller, budget)?;
+        evaluations.reserve(&limits, &caller, budget, deadline.work.as_deref())?;
         true
     } else {
-        evaluations.refuse_at_the_cap(&limits, &caller)?;
+        evaluations.refuse_at_the_cap(&limits, &caller, deadline.work.as_deref())?;
         false
     };
     // What is left of the caller's budget after waiting for a slot: the wait counts, as an
     // update's wait in the writer's queue counts.
     let remaining = budget.saturating_sub(started.elapsed());
     let argument = deadline.argument.clone();
+    let description = deadline.work.clone();
     let stack = crate::limits::sparql_stack_size(text);
     let (tx, rx) = std::sync::mpsc::channel();
     let state = Arc::clone(&deadline.state);
@@ -1292,7 +1366,12 @@ where
                     // only once the count holds it.
                     evaluations.abandoned(&caller, slot);
                     token.cancel();
-                    return Err(timeout(budget, write, argument.as_deref()));
+                    return Err(timeout(
+                        budget,
+                        write,
+                        argument.as_deref(),
+                        description.as_deref(),
+                    ));
                 }
             }
             // Settled: it reached its commit point in time, and its answer is on the way.
@@ -1467,10 +1546,15 @@ impl Evaluations {
 
     /// Refuse an update at once while what `caller` may use is filled by overdue work.
     #[cfg(not(target_family = "wasm"))]
-    fn refuse_at_the_cap(&self, limits: &Limits, caller: &Caller) -> Result<()> {
+    fn refuse_at_the_cap(
+        &self,
+        limits: &Limits,
+        caller: &Caller,
+        work: Option<&WorkDescription>,
+    ) -> Result<()> {
         let counts = self.counts();
         match counts.overdue_full(limits, caller) {
-            Some(full) => Err(at_the_cap(&counts, full, limits, caller)),
+            Some(full) => Err(at_the_cap(&counts, full, limits, caller, work)),
             None => Ok(()),
         }
     }
@@ -1479,12 +1563,18 @@ impl Evaluations {
     /// what it may use is filled by overdue evaluations, and when no slot came free within the
     /// budget.
     #[cfg(not(target_family = "wasm"))]
-    fn reserve(&self, limits: &Limits, caller: &Caller, budget: Duration) -> Result<()> {
+    fn reserve(
+        &self,
+        limits: &Limits,
+        caller: &Caller,
+        budget: Duration,
+        work: Option<&WorkDescription>,
+    ) -> Result<()> {
         let until = std::time::Instant::now() + budget;
         let mut counts = self.counts();
         loop {
             if let Some(full) = counts.overdue_full(limits, caller) {
-                return Err(at_the_cap(&counts, full, limits, caller));
+                return Err(at_the_cap(&counts, full, limits, caller, work));
             }
             let Some(full) = counts.running_full(limits, caller) else {
                 counts.running += 1;
@@ -1493,7 +1583,7 @@ impl Evaluations {
             };
             let now = std::time::Instant::now();
             if now >= until {
-                return Err(no_slot(&counts, full, limits, caller, budget));
+                return Err(no_slot(&counts, full, limits, caller, budget, work));
             }
             counts = self
                 .changed
@@ -1526,7 +1616,16 @@ impl Evaluations {
 /// At the shared pool or one caller's share it says whose, and ends with [`Limits::shares`]
 /// (ledger #1002).
 #[cfg(not(target_family = "wasm"))]
-fn at_the_cap(counts: &Counts, full: Full, limits: &Limits, caller: &Caller) -> Error {
+fn at_the_cap(
+    counts: &Counts,
+    full: Full,
+    limits: &Limits,
+    caller: &Caller,
+    work: Option<&WorkDescription>,
+) -> Error {
+    if let Some(work) = work {
+        return capacity_refusal(counts, full, limits, caller, work, None);
+    }
     let partway = "oxigraph cannot always stop one partway, so";
     Error::Unavailable(match full {
         Full::Store => format!(
@@ -1569,7 +1668,11 @@ fn no_slot(
     limits: &Limits,
     caller: &Caller,
     budget: Duration,
+    work: Option<&WorkDescription>,
 ) -> Error {
+    if let Some(work) = work {
+        return capacity_refusal(counts, full, limits, caller, work, Some(budget));
+    }
     let ms = budget.as_millis();
     Error::Unavailable(match full {
         Full::Store => format!(
@@ -1600,6 +1703,63 @@ fn no_slot(
             limits.shares()
         ),
     })
+}
+
+/// Consumer wording for both capacity refusals; the store keeps its existing sentences.
+#[cfg(not(target_family = "wasm"))]
+fn capacity_refusal(
+    counts: &Counts,
+    full: Full,
+    limits: &Limits,
+    caller: &Caller,
+    work: &WorkDescription,
+    waited: Option<Duration>,
+) -> Error {
+    let (tally, scope, cap, origin) = match full {
+        Full::Store => (
+            Tally {
+                running: counts.running,
+                overdue: counts.overdue,
+            },
+            "in this evaluation budget".to_string(),
+            format!("the most it allows is {}", limits.cap.max),
+            limits.cap.origin_for(true),
+        ),
+        Full::Pool => (
+            counts.shared,
+            "by this evaluation budget's callers".to_string(),
+            format!(
+                "the most its callers may have together is {}, the cap of {} less {} reserved \
+                 for the host",
+                limits.pool(),
+                limits.cap.max,
+                limits.reserve
+            ),
+            limits.shares_for(true),
+        ),
+        Full::Share => (
+            counts.tally(caller),
+            format!("by {} in this evaluation budget", caller.describe()),
+            format!("the most one caller may have is {}", limits.share),
+            limits.shares_for(true),
+        ),
+    };
+    let status = match waited {
+        Some(budget) => format!(
+            "{} {} {scope} are running ({cap}); none ended within this request's time budget \
+             of {} ms",
+            tally.running,
+            work.plural,
+            budget.as_millis(),
+        ),
+        None => format!(
+            "{} {} {scope} are still running after their callers' time budgets ran out ({cap}); \
+             work cannot always be stopped partway, so new work using these slots is refused \
+             until one finishes",
+            tally.overdue, work.plural,
+        ),
+    };
+    Error::Unavailable(format!("{status}. Retry shortly. {origin}"))
 }
 
 /// What a worker holds until it ends: its slot (a read's), and its place in the overdue count

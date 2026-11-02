@@ -132,3 +132,35 @@ fn the_doors_keep_their_sentence() {
         std::thread::sleep(ms(5));
     }
 }
+
+#[test]
+fn a_validation_timeout_names_the_work_and_its_remedy() {
+    let budget = EvaluationBudget::new(TimeBudget::new(ms(50))).with_work(
+        "SHACL validation",
+        "SHACL validations",
+        "Validate a smaller data graph",
+    );
+    let message = timeout_sentence(&budget);
+    assert!(
+        message.contains("this SHACL validation ran past"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Validate a smaller data graph"),
+        "{message}"
+    );
+    assert!(!message.contains("SPARQL"), "{message}");
+    assert!(!message.contains("fewer joins"), "{message}");
+    assert_eq!(timeout_sentence(&budget.clone()), message);
+    let budget = budget.with_argument(Some("validation_budget"));
+    let message = timeout_sentence(&budget);
+    assert!(
+        message.contains("`validation_budget=` can only lower it"),
+        "{message}"
+    );
+    assert!(message.contains("this SHACL validation"), "{message}");
+    assert!(
+        message.ends_with("Validate a smaller data graph or ask the host for a larger budget"),
+        "{message}"
+    );
+}
