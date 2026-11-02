@@ -1903,34 +1903,63 @@ impl GraphFingerprint {
 /// operator will actually hit into a sentence.
 #[cfg(all(feature = "persistent", not(target_family = "wasm")))]
 fn open_rocksdb(path: &Path) -> Result<Store> {
-    // Fail loud on an unwritable path, and say which path. Without this the first
-    // symptom is RocksDB's own errno string with no ikigai context around it.
-    if let Err(e) = std::fs::create_dir_all(path) {
-        return Err(Error::Endpoint(format!(
+    match create_and_open_dataset(path) {
+        Ok(store) => Ok(store),
+        // Fail loud on an unwritable path, and say which path. Without this the first
+        // symptom is RocksDB's own errno string with no ikigai context around it.
+        Err(DatasetOpen::Create(e)) => Err(Error::Endpoint(format!(
             "cannot create the store directory {}: {e}",
             path.display()
-        )));
-    }
-    Store::open(path).map_err(|e| {
-        let text = e.to_string();
-        if is_lock_error(&text) {
-            // ⚠ Matched on text because RocksDB reports the lock as a generic IO error
-            // and oxigraph passes it through untyped.
-            // `a_second_open_in_the_same_process_is_refused_and_the_refusal_is_legible`
-            // in tests/handle_model.rs pins this against a real second open, so an
-            // upstream rewording fails a test instead of silently degrading the message
-            // to the raw string.
-            Error::Unavailable(format!(
-                "the store at {} is already open read-write and RocksDB permits one \
-                 writer per directory. Another ikigai host (or another handle in this \
-                 process) holds it; that process must exit, or this one must reach the \
-                 data over the wire. Underlying error: {text}",
-                path.display()
-            ))
-        } else {
-            Error::Endpoint(format!("opening the store at {}: {text}", path.display()))
+        ))),
+        Err(DatasetOpen::Open(e)) => {
+            let text = e.to_string();
+            if is_lock_error(&text) {
+                // ⚠ Matched on text because RocksDB reports the lock as a generic IO error
+                // and oxigraph passes it through untyped.
+                // `a_second_open_in_the_same_process_is_refused_and_the_refusal_is_legible`
+                // in tests/handle_model.rs pins this against a real second open, so an
+                // upstream rewording fails a test instead of silently degrading the message
+                // to the raw string.
+                Err(Error::Unavailable(format!(
+                    "the store at {} is already open read-write and RocksDB permits one \
+                     writer per directory. Another ikigai host (or another handle in this \
+                     process) holds it; that process must exit, or this one must reach the \
+                     data over the wire. Underlying error: {text}",
+                    path.display()
+                )))
+            } else {
+                Err(Error::Endpoint(format!(
+                    "opening the store at {}: {text}",
+                    path.display()
+                )))
+            }
         }
-    })
+    }
+}
+
+/// Which half of [`create_and_open_dataset`] failed.
+#[cfg(all(feature = "persistent", not(target_family = "wasm")))]
+enum DatasetOpen {
+    /// The directory could not be created.
+    Create(std::io::Error),
+    /// The directory exists and RocksDB refused to open it as the dataset.
+    Open(StorageError),
+}
+
+/// The crate's one ambient filesystem reach: create the dataset directory, then open
+/// THAT directory as the RocksDB dataset.
+///
+/// Confined by construction, not by a convention at its call sites: the directory it
+/// creates is the directory it opens, in the same body, so no caller can use it to make
+/// a directory that does not become the dataset, and it touches nothing else. The path is
+/// the one a HOST passed to [`DurableStore::open`] (and the `open_shared*` forms, which
+/// call it); no endpoint opens a store, and no request names a path. ⚠ The dataset's own
+/// files are then read and written by RocksDB, in C++, which no lint sees.
+#[cfg(all(feature = "persistent", not(target_family = "wasm")))]
+#[allow(clippy::disallowed_methods)] // ambient: fs: creates only the dataset directory the host passed to DurableStore::open, then opens that same directory as the RocksDB dataset
+fn create_and_open_dataset(path: &Path) -> std::result::Result<Store, DatasetOpen> {
+    std::fs::create_dir_all(path).map_err(DatasetOpen::Create)?;
+    Store::open(path).map_err(DatasetOpen::Open)
 }
 
 /// Whether a RocksDB error string is the one-writer-per-directory refusal.
