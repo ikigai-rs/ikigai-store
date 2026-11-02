@@ -787,6 +787,7 @@ pub struct EvaluationBudget {
 #[derive(Clone, Debug)]
 struct WorkDescription {
     singular: Arc<str>,
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // no capacity refusals on wasm
     plural: Arc<str>,
     remedy: Arc<str>,
 }
