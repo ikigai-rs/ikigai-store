@@ -1331,6 +1331,12 @@ let matched = budget.run(&text.clone(), inv.capability, None, move |token| {
   take `budget=`; a consumer's sentence leaves that clause out by default, and
   `EvaluationBudget::with_argument(Some("match_budget"))` names the consumer's own argument
   instead (the one whose value it hands `run` as `requested`). Clones keep it.
+- **Name the consumer's work in refusals** with
+  `EvaluationBudget::with_work("SHACL validation", "SHACL validations", "Validate a smaller data graph")`.
+  The singular names a timeout; the plural names work occupying the cap, shared pool, or
+  caller share. The remedy is an imperative phrase without final punctuation: the timeout
+  follows it with "or ask the host for a larger budget". Clones keep the wording and share
+  the evaluation counts. Without this builder, the store's SPARQL wording stays the default.
 - ★ **Each `EvaluationBudget::new` is its own count under its own cap — so state yours**
   (ledger #1500). Clones share a count; two `new`s never do, and neither shares the store's
   doors'. The default cap is `budget::default_max_overdue()`, a quarter of the machine's

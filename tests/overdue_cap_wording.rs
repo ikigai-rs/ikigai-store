@@ -234,3 +234,80 @@ fn a_consumer_budget_counts_apart_from_every_other_and_states_its_own_cap() {
     release_all(&full, releases);
     release_all(&own, more);
 }
+
+fn validation_budget(cap: usize) -> EvaluationBudget {
+    EvaluationBudget::new(TimeBudget::new(ms(50)).with_max_overdue(cap)).with_work(
+        "SHACL validation",
+        "SHACL validations",
+        "Validate a smaller data graph",
+    )
+}
+
+fn assert_validation_capacity(message: &str, bound: &str) {
+    assert!(message.contains("1 SHACL validations"), "{message}");
+    assert!(message.contains(bound), "{message}");
+    assert!(message.contains("Retry shortly"), "{message}");
+    assert!(
+        message.contains("TimeBudget::with_max_overdue"),
+        "{message}"
+    );
+    assert!(!message.contains("SPARQL"), "{message}");
+    assert!(!message.contains("this store"), "{message}");
+    assert!(!message.contains("on the store"), "{message}");
+    assert!(!message.contains("oxigraph"), "{message}");
+}
+
+#[test]
+fn consumer_work_names_reach_overdue_store_pool_and_share_refusals() {
+    for (cap, bound) in [
+        (1, "the most it allows is 1"),
+        (2, "the most its callers may have together is 1"),
+        (3, "the most one caller may have is 1"),
+    ] {
+        let budget = validation_budget(cap);
+        let (release, held) = mpsc::channel();
+        let result = budget.run("", &reader(), None, move |_| {
+            let _ = held.recv();
+            Ok(())
+        });
+        assert!(matches!(result, Err(Error::Timeout(_))), "{result:?}");
+        // Clones keep both the description and the shared count.
+        let result = budget.clone().run("", &patient(), None, |_| Ok(()));
+        let message = match result {
+            Err(Error::Unavailable(message)) => message,
+            other => panic!("expected a capacity refusal, got {other:?}"),
+        };
+        assert_validation_capacity(&message, bound);
+        assert!(message.contains("still running"), "{message}");
+        release_all(&budget, vec![release]);
+        assert_eq!(budget.run("", &reader(), None, |_| Ok(7)), Ok(7));
+    }
+}
+
+#[test]
+fn consumer_work_names_reach_waited_store_pool_and_share_refusals() {
+    for (cap, bound) in [
+        (1, "the most it allows is 1"),
+        (2, "the most its callers may have together is 1"),
+        (3, "the most one caller may have is 1"),
+    ] {
+        let budget = validation_budget(cap);
+        let (release, held) = mpsc::channel();
+        let (started, running) = mpsc::channel();
+        let holder = {
+            let budget = budget.clone();
+            std::thread::spawn(move || budget.run("", &patient(), None, held_work(started, held)))
+        };
+        running.recv_timeout(Duration::from_secs(5)).unwrap();
+        let result = budget.run("", &reader(), None, |_| Ok(()));
+        let _ = release.send(());
+        holder.join().unwrap().unwrap();
+        let message = match result {
+            Err(Error::Unavailable(message)) => message,
+            other => panic!("expected a capacity refusal, got {other:?}"),
+        };
+        assert_validation_capacity(&message, bound);
+        assert!(message.contains("none ended within"), "{message}");
+        assert!(message.contains("50 ms"), "{message}");
+    }
+}
