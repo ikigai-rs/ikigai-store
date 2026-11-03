@@ -300,7 +300,12 @@ Three more things, each of them a decision rather than an omission:
   per write (3, 25 and 122 ms in release), and now takes about 1 ms in debug and 0.15 ms in
   release at all three (`tests/scoped_append_cost.rs`). An update that observes the graph
   as a whole still copies all of it: `CLEAR`, `DROP`, a pattern with no constant
-  (`?s ?p ?o`), and a path that can be zero-length (`p*`, `p?`) or is negated (`!p`). The
+  (`?s ?p ?o`), and a path that can be zero-length (`p*`, `p?`) or is negated (`!p`).
+  **Since 0.3.3** (ledger #2940) a `VALUES` block in the same group counts as constants:
+  `VALUES ?s { <a> <b> } ?s ?p ?o` copies the quads of `<a>` and `<b>`, in a `WHERE` and in a
+  `DELETE` template whose variable it binds, so one pattern removes any number of listed
+  subjects' quads. A list with an `UNDEF` or a literal in it, or a `VALUES` outside the
+  pattern's group, narrows nothing. The
   boundary does not depend on which quads are copied — the private store never holds
   anything outside the graph — and `src/confine.rs` gives the argument, with a differential
   test, that the update computes the same answer on the part as on the whole. The unscoped
