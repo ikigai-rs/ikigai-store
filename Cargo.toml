@@ -341,7 +341,12 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # item with any number of dependents in ONE pattern rather than a `UNION` branch each, which ran
 # out of algebra budget past 250 and then fell back to a whole-graph copy. A patch: no public
 # API moves; the only behavior change is that such an update copies less.
-version = "0.3.3"
+# ★ 0.4.0 MOVES TO IKIGAI-CORE 0.3.0, the scoped content store (ledger #2965; the core 0.3.0 cascade,
+# wave 2, ledger #3040): ikigai-core and ikigai-vocab 0.3.0, ikigai-rdf 0.5.0, and ikigai-conformance
+# 0.14.0 in the test graph. A MINOR, not a patch: core's types (`Endpoint`, `Invocation`,
+# `Representation`, `Kernel`) are in this crate's API, so a consumer on core 0.2 cannot link 0.4.0.
+# This crate never calls `ContentStore::put` or `put_replay`, so nothing moves to `put_for`.
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -411,12 +416,17 @@ async-trait = "0.1"
 # ledger #2342) moved it. Every floor named above is still met by 0.2.0.
 # ⚠ `"0.2.0"` is `<0.3.0` in turn: move it when core 0.3 publishes.
 # 0.2.1 is the floor for the body path tested here (ledger #2277).
-ikigai-core = "0.2.1"
+# ★ 0.3.0 is the scoped content store (ledger #2965): held content is scoped to whoever delivered
+# it, a principal-less hold is root's, and `ContentStore::put`/`put_replay` are root-only. This crate
+# calls neither. `"0.2.1"` was `<0.3.0`, so the core 0.3.0 cascade (ledger #3040) moved it.
+# ⚠ `"0.3.0"` is `<0.4.0` in turn: move it when core 0.4 publishes.
+ikigai-core = "0.3.0"
 # Runtime-free Stream::unfold for one-quad-at-a-time durable dump bodies, also on wasm.
 futures = "0.3"
 # 0.2.7 included the RDF/XML parseType fixes required by the shared depth scan; 0.3.0 is
-# the same API on ikigai-core 0.2 (the core 0.2.0 sweep, ledger #2342).
-ikigai-rdf = "0.3.0"
+# the same API on ikigai-core 0.2 (the core 0.2.0 sweep, ledger #2342). 0.5.0 is its release on
+# ikigai-core 0.3, so one core links (the core 0.3.0 cascade, ledger #3040).
+ikigai-rdf = "0.5.0"
 # In-memory store by default; `persistent` turns the RocksDB backend back on. Oxigraph
 # itself gates `oxrocksdb-sys` out of wasm by target, so the feature pulls in nothing
 # there — and this crate's durable constructors are gated off wasm too, so `persistent`
@@ -499,10 +509,12 @@ oxigraph = { version = "0.5.1", default-features = false, features = ["js"] }
 # only actions that state failure classes) by default. `"0.10.0"` was `<0.11.0`.
 # 0.12.0 adds BODIES and BODY-INPUTS by default; tests share the kernel's space
 # with the suite so deterministic body contracts are probed, not skipped.
-ikigai-conformance = "0.12.0"
+# 0.14.0 is conformance on ikigai-core 0.3.0, so the test build links one core (ledger #3040).
+ikigai-conformance = "0.14.0"
 # `TurtleRenderer` for the `Meta` face the kernel routes. 0.2.0 is the streams release
 # (ledger #2261), matching core above; the old `"0.1"` meant `<0.2.0` under 0.x rules.
-ikigai-vocab = "0.2.0"
+# 0.3.0 matches core 0.3.0 (the scoped content store, ledger #2965).
+ikigai-vocab = "0.3.0"
 
 # The peak-memory harness for `urn:iki:store:dump` (ledger #1732): it measures a RocksDB store, so
 # it needs `persistent`. ⚠ `required-features` hides a target from `--all-targets` unless the

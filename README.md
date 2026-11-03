@@ -11,14 +11,15 @@ roadmap. A store that survives a restart is the difference between those being v
 being a warm-up cost.
 
 > ⚠ **Reading this on `main`?** It can be ahead of crates.io. The latest published release is
-> **0.2.25**; a passage marked **unreleased, after 0.2.25** describes behavior merged since,
+> **0.3.3**; a passage marked **unreleased, after 0.3.3** describes behavior merged since,
 > which arrives with the next release (and takes that version number then). Everything
-> unmarked is in 0.2.25.
+> unmarked is in 0.3.3.
 >
-> **Unreleased, after 0.2.25:** the next release is **0.3.1**, on `ikigai-core` 0.2.1
-> (the streams release). The 0.3.0 migration is a minor because core's types are in this
-> crate's API. The 0.3.1 patch adds streamed durable dump bodies without changing public
-> types or signatures. Incremental load and streamed query answers are still pending.
+> **Unreleased, after 0.3.3:** the next release is **0.4.0**, on `ikigai-core` 0.3.0 (the
+> scoped content store). No behavior changes in this crate, which never calls
+> `ContentStore::put` or `put_replay`; it is a minor because core's types are in this crate's
+> API, so a consumer moves to `ikigai-core = "0.3.0"` and `ikigai-store = "0.4.0"` together.
+> Incremental load and streamed query answers are still pending.
 
 ```rust
 use ikigai_core::Kernel;
@@ -622,7 +623,7 @@ ikigai --quiet -c 'sink urn:iki:store:load format=application/n-quads' < backup.
   whether to keep it, so a cacheable dump held the dataset twice even when it was far too large
   to keep (1.5M quads: 832 MB cacheable, 509 MB bare), and one small enough to keep would
   evict every other cached read. A dump recomputes every time.
-- **Streamed on the durable backing through `Kernel::issue_body` (unreleased, 0.3.1).** The
+- **Streamed on the durable backing through `Kernel::issue_body` (since 0.3.1).** The
   answer is a one-shot body over a snapshot taken before it is returned, in RocksDB key
   order. Each poll serializes one quad with Oxigraph's serializer; dropping the body stops
   reading. The serializer buffers at most one quad, independent of the total dump size.
