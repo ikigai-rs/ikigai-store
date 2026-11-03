@@ -106,6 +106,8 @@ fn a_whole_graph_update_past_the_bound_is_refused_and_applies_nothing() {
         "`urn:iki:store:update`",
         "urn:iki:store:graph-info",
         "Nothing was applied",
+        "Name a subject, predicate or object in each pattern, or list subject or object IRIs \
+         in a VALUES block in the same GRAPH group, so the update observes less",
     ] {
         assert!(detail.contains(needle), "{needle:?} missing from: {detail}");
     }
