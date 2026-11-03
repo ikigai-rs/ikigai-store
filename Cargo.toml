@@ -335,7 +335,13 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # PR 77), names the crate's two ambient filesystem reaches for the Hypothesis H gate (ledger
 # #2425, PR 78), and carries ACCESSIBILITY.md and the conformance 0.12 body checks. Additive
 # only, so a patch.
-version = "0.3.2"
+# ★ 0.3.3 lets a scoped update's copy narrow by a `VALUES` block (ledger #2940): a pattern in the
+# same group as a `VALUES` whose every row binds its subject (or object) to an IRI copies only
+# those IRIs' quads, in a `WHERE` and in a `DELETE` template, so `ikigai-ledger` can delete an
+# item with any number of dependents in ONE pattern rather than a `UNION` branch each, which ran
+# out of algebra budget past 250 and then fell back to a whole-graph copy. A patch: no public
+# API moves; the only behavior change is that such an update copies less.
+version = "0.3.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]

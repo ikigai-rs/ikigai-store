@@ -132,6 +132,18 @@
 //!   `CLEAR`/`DROP`, which remove everything. So does anything this walk does not recognize
 //!   (`SERVICE`, refused anyway, and `LOAD`). Copying too much is a cost; copying too little
 //!   would be a wrong answer, so every doubt resolves to the whole graph.
+//! - ★ **A `VALUES` block lists constants** (ledger #2940). `VALUES ?s { <a> <b> } ?s ?p ?o`
+//!   has no constant in its pattern, but the join keeps only the matches whose `?s` is `<a>` or
+//!   `<b>`, so it copies the quads of `<a>` and `<b>`: one pattern for any number of subjects,
+//!   where a `UNION` branch per subject spends the algebra budget (`ikigai-ledger` deletes an
+//!   item's dependents this way). The same list narrows a `DELETE` template whose variable the
+//!   `WHERE` can only bind to a listed IRI, if at all. It narrows only what it binds for
+//!   CERTAIN: a pattern in the same group (or joined to it) as a `VALUES` whose every row binds
+//!   the variable to an IRI. An `UNDEF` row, a literal in the list, a `VALUES` outside the
+//!   `GRAPH` block or in another branch, an `OPTIONAL`, a `MINUS` or an `EXISTS` leave the
+//!   pattern as it was, and a pattern with no constant then copies the whole graph. A property
+//!   test pins it over random graphs
+//!   (`an_update_over_its_footprint_computes_what_it_computes_over_the_graph`).
 //!
 //! ⚠ What the footprint cannot preserve is an order SPARQL leaves undefined: a `LIMIT` with no
 //! `ORDER BY` picks among its solutions by the private store's insertion order, which a
@@ -164,7 +176,7 @@ use spargebra::algebra::{
     AggregateExpression, Expression, GraphPattern, OrderExpression, PropertyPathExpression,
 };
 use spargebra::term::{
-    GraphNamePattern, GroundTerm, GroundTermPattern, NamedNodePattern, TermPattern,
+    GraphNamePattern, GroundTerm, GroundTermPattern, NamedNodePattern, TermPattern, Variable,
 };
 use spargebra::{GraphUpdateOperation, Update};
 
@@ -448,7 +460,7 @@ pub(crate) enum Footprint {
 }
 
 /// One pattern's constants: a quad of the graph matches when it agrees with each one given.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Probe {
     subject: Option<NamedOrBlankNode>,
     predicate: Option<NamedNode>,
@@ -462,7 +474,8 @@ impl Probe {
 }
 
 /// The [`Footprint`] of a parsed update: every triple pattern of every `WHERE`, every
-/// `DELETE` template and every `DELETE DATA` quad, by their constants.
+/// `DELETE` template and every `DELETE DATA` quad, by their constants, and by the IRIs a
+/// `VALUES` block lists for one of their variables (ledger #2940, [`bindings`]).
 pub(crate) fn footprint(update: &Update) -> Footprint {
     let mut probes = Vec::new();
     for operation in &update.operations {
@@ -481,11 +494,26 @@ pub(crate) fn footprint(update: &Update) -> Footprint {
             GraphUpdateOperation::DeleteInsert {
                 delete, pattern, ..
             } => {
-                probes.extend(delete.iter().map(|template| Probe {
-                    subject: ground_term_pattern(&template.subject).and_then(subject),
-                    predicate: named_node(&template.predicate),
-                    object: ground_term_pattern(&template.object),
-                }));
+                // ★ A template variable the `WHERE` confines to listed IRIs (ledger #2940) can
+                // only be instantiated as one of them: an unbound one instantiates nothing.
+                let listed = if delete.is_empty() {
+                    Listed::new()
+                } else {
+                    bindings(pattern).confined
+                };
+                for template in delete {
+                    push_listed(
+                        Probe {
+                            subject: ground_term_pattern(&template.subject).and_then(subject),
+                            predicate: named_node(&template.predicate),
+                            object: ground_term_pattern(&template.object),
+                        },
+                        ground_variable(&template.subject),
+                        ground_variable(&template.object),
+                        &listed,
+                        &mut probes,
+                    );
+                }
                 pattern_probes(pattern, &mut probes)
             }
             // `CLEAR` and `DROP` remove the whole graph; `LOAD` is refused before this runs.
@@ -500,7 +528,223 @@ pub(crate) fn footprint(update: &Update) -> Footprint {
     if probes.iter().any(Probe::is_everything) {
         return Footprint::Whole;
     }
+    // A listed set is probed once per pattern that names it, and a ledger names the same set in
+    // its `WHERE` and its template: each distinct probe is read once.
+    let mut seen = HashSet::new();
+    probes.retain(|probe| seen.insert(probe.clone()));
     Footprint::Matching(probes)
+}
+
+/// For each variable, the IRIs a `VALUES` block lists for it (ledger #2940).
+type Listed = BTreeMap<Variable, BTreeSet<NamedNode>>;
+
+/// What the `VALUES` blocks in a pattern say about its solutions (ledger #2940).
+///
+/// ★ Both halves are claims about EVERY solution, so each rule below may only drop an entry
+/// it cannot prove, never invent one: a missing entry copies more, a wrong one copies less.
+#[derive(Default)]
+struct Bindings {
+    /// Every solution binds the variable to one of these IRIs: what narrows a triple pattern
+    /// joined to this one, whose matches bind the variable too.
+    certain: Listed,
+    /// Every solution binds it to one of these or leaves it unbound: what narrows a `DELETE`
+    /// template, which an unbound variable leaves uninstantiated.
+    confined: Listed,
+}
+
+/// The [`Bindings`] of `pattern`.
+///
+/// Only a `VALUES` block whose every row binds the variable to an IRI lists it: an `UNDEF` row
+/// joins with any value, and a literal is not a subject. Everything this does not reason about
+/// (`GROUP`, `LATERAL`, `SERVICE`, a pattern or path) lists nothing.
+fn bindings(pattern: &GraphPattern) -> Bindings {
+    match pattern {
+        GraphPattern::Values {
+            variables,
+            bindings,
+        } => {
+            let mut listed = Listed::new();
+            for (i, variable) in variables.iter().enumerate() {
+                let iris: Option<BTreeSet<NamedNode>> = bindings
+                    .iter()
+                    .map(|row| match row.get(i) {
+                        Some(Some(GroundTerm::NamedNode(node))) => Some(node.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(iris) = iris {
+                    listed.insert(variable.clone(), iris);
+                }
+            }
+            Bindings {
+                certain: listed.clone(),
+                confined: listed,
+            }
+        }
+        // A joined solution binds a variable when either side does, to the value both agree
+        // on: so certain on either side is certain, within both sides' lists.
+        GraphPattern::Join { left, right } => {
+            let (l, r) = (bindings(left), bindings(right));
+            let mut certain = l.certain.clone();
+            for (variable, iris) in &r.certain {
+                certain
+                    .entry(variable.clone())
+                    .and_modify(|mine| *mine = mine.intersection(iris).cloned().collect())
+                    .or_insert_with(|| iris.clone());
+            }
+            let mut confined = either(left, &l, right, &r);
+            confined.extend(certain.clone());
+            Bindings { certain, confined }
+        }
+        // Every solution extends one of the left's, so what the left certainly binds stays.
+        GraphPattern::LeftJoin { left, right, .. } => {
+            let (l, r) = (bindings(left), bindings(right));
+            let mut confined = either(left, &l, right, &r);
+            confined.extend(l.certain.clone());
+            Bindings {
+                certain: l.certain,
+                confined,
+            }
+        }
+        GraphPattern::Union { left, right } => {
+            let (l, r) = (bindings(left), bindings(right));
+            let mut certain = Listed::new();
+            for (variable, iris) in &l.certain {
+                if let Some(theirs) = r.certain.get(variable) {
+                    certain.insert(variable.clone(), iris.union(theirs).cloned().collect());
+                }
+            }
+            Bindings {
+                certain,
+                confined: either(left, &l, right, &r),
+            }
+        }
+        // Solutions of the left only, some removed.
+        GraphPattern::Minus { left, .. } => bindings(left),
+        GraphPattern::Filter { inner, .. }
+        | GraphPattern::Graph { inner, .. }
+        | GraphPattern::OrderBy { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. } => bindings(inner),
+        GraphPattern::Project { inner, variables } => {
+            let mut inner = bindings(inner);
+            inner.certain.retain(|v, _| variables.contains(v));
+            inner.confined.retain(|v, _| variables.contains(v));
+            inner
+        }
+        // `BIND` gives its variable any value at all.
+        GraphPattern::Extend {
+            inner, variable, ..
+        } => {
+            let mut inner = bindings(inner);
+            inner.certain.remove(variable);
+            inner.confined.remove(variable);
+            inner
+        }
+        GraphPattern::Bgp { .. }
+        | GraphPattern::Path { .. }
+        | GraphPattern::Group { .. }
+        | GraphPattern::Lateral { .. }
+        | GraphPattern::Service { .. } => Bindings::default(),
+    }
+}
+
+/// The variables a solution of one of two patterns binds only to listed IRIs, if at all: those
+/// each side confines, where a side that cannot bind the variable (it is not in scope there)
+/// confines it to nothing.
+fn either(left: &GraphPattern, l: &Bindings, right: &GraphPattern, r: &Bindings) -> Listed {
+    let in_scope = |pattern: &GraphPattern| {
+        let mut variables = BTreeSet::new();
+        pattern.on_in_scope_variable(|v| {
+            variables.insert(v.clone());
+        });
+        variables
+    };
+    let (left_scope, right_scope) = (in_scope(left), in_scope(right));
+    let side = |b: &Bindings, scope: &BTreeSet<Variable>, variable: &Variable| match b
+        .confined
+        .get(variable)
+    {
+        Some(iris) => Some(iris.clone()),
+        None if !scope.contains(variable) => Some(BTreeSet::new()),
+        None => None,
+    };
+    let mut confined = Listed::new();
+    for variable in l.confined.keys().chain(r.confined.keys()) {
+        if let (Some(a), Some(b)) = (
+            side(l, &left_scope, variable),
+            side(r, &right_scope, variable),
+        ) {
+            confined.insert(variable.clone(), a.union(&b).cloned().collect());
+        }
+    }
+    confined
+}
+
+/// Push `base`, or, when its subject (else its object) is a variable `listed` names and the
+/// position is not already a constant, one probe per listed IRI in that position.
+///
+/// Only one position is narrowed: a probe with fewer constants is a superset, so that is never
+/// less than the pattern can match, and narrowing both would multiply the probes.
+fn push_listed(
+    base: Probe,
+    subject_variable: Option<&Variable>,
+    object_variable: Option<&Variable>,
+    listed: &Listed,
+    probes: &mut Vec<Probe>,
+) {
+    if base.subject.is_none() {
+        if let Some(iris) = subject_variable.and_then(|v| listed.get(v)) {
+            probes.extend(iris.iter().map(|iri| Probe {
+                subject: Some(iri.clone().into()),
+                ..base.clone()
+            }));
+            return;
+        }
+        if base.object.is_none() {
+            if let Some(iris) = object_variable.and_then(|v| listed.get(v)) {
+                probes.extend(iris.iter().map(|iri| Probe {
+                    object: Some(iri.clone().into()),
+                    ..base.clone()
+                }));
+                return;
+            }
+        }
+    }
+    probes.push(base);
+}
+
+/// A `Join` operand's probes. ★ A basic graph pattern joined to a sibling that certainly binds
+/// one of its variables to listed IRIs (a `VALUES` in the same group, ledger #2940) contributes
+/// only matches binding it to one of them, so it is probed by those IRIs. Its own solutions
+/// over the copy are then fewer than over the graph, but the JOIN's are the same: every match
+/// the join keeps was copied, and a copy holds no quad the graph does not.
+fn join_operand_probes(
+    operand: &GraphPattern,
+    sibling: &GraphPattern,
+    probes: &mut Vec<Probe>,
+) -> bool {
+    if let GraphPattern::Bgp { patterns } = operand {
+        let listed = bindings(sibling).certain;
+        if !listed.is_empty() {
+            for triple in patterns {
+                push_listed(
+                    Probe {
+                        subject: term_pattern(&triple.subject).and_then(subject),
+                        predicate: named_node(&triple.predicate),
+                        object: term_pattern(&triple.object),
+                    },
+                    variable(&triple.subject),
+                    variable(&triple.object),
+                    &listed,
+                    probes,
+                );
+            }
+            return true;
+        }
+    }
+    pattern_probes(operand, probes)
 }
 
 /// Add `pattern`'s probes, or answer `false` when it can observe the graph as a whole.
@@ -524,8 +768,10 @@ fn pattern_probes(pattern: &GraphPattern, probes: &mut Vec<Probe>) -> bool {
         GraphPattern::Values { .. } => true,
         // Refused before this runs (`service::refuse_service_in_update`).
         GraphPattern::Service { .. } => false,
-        GraphPattern::Join { left, right }
-        | GraphPattern::Lateral { left, right }
+        GraphPattern::Join { left, right } => {
+            join_operand_probes(left, right, probes) && join_operand_probes(right, left, probes)
+        }
+        GraphPattern::Lateral { left, right }
         | GraphPattern::Union { left, right }
         | GraphPattern::Minus { left, right } => {
             pattern_probes(left, probes) && pattern_probes(right, probes)
@@ -661,6 +907,20 @@ fn ground_term(term: &GroundTerm) -> Option<Term> {
     match term {
         GroundTerm::NamedNode(node) => Some(node.clone().into()),
         GroundTerm::Literal(literal) => Some(literal.clone().into()),
+        _ => None,
+    }
+}
+
+fn variable(term: &TermPattern) -> Option<&Variable> {
+    match term {
+        TermPattern::Variable(variable) => Some(variable),
+        _ => None,
+    }
+}
+
+fn ground_variable(term: &GroundTermPattern) -> Option<&Variable> {
+    match term {
+        GroundTermPattern::Variable(variable) => Some(variable),
         _ => None,
     }
 }
@@ -1323,5 +1583,361 @@ mod tests {
                 g.clone(),
             ))
             .unwrap());
+    }
+
+    /// Each update that lists its subjects (or objects) in a `VALUES` block, and whether its
+    /// footprint must be the whole graph (ledger #2940).
+    ///
+    /// ★ The narrowed rows are the shapes `ikigai-ledger` deletes and purges with: one pattern
+    /// `?s ?p ?o` over a listed set, in a `WHERE` and in a `DELETE` template, alone and as one
+    /// branch of a `UNION`. The `true` rows are every way the listed set fails to bind the
+    /// pattern's variable for certain, each of which must stay whole: never under-copy.
+    const VALUES_CORPUS: &[(&str, bool)] = &[
+        // The listed subjects, read.
+        (
+            "INSERT { GRAPH <urn:x:g> { ?s <urn:x:seen> ?o } }
+             WHERE { GRAPH <urn:x:g> { VALUES ?s { <urn:x:s1> <urn:x:s3> } ?s ?p ?o } }",
+            false,
+        ),
+        // …and removed, by a template with no constant in it.
+        (
+            "DELETE { GRAPH <urn:x:g> { ?s ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { VALUES ?s { <urn:x:s1> <urn:x:s9> } ?s ?p ?o } }",
+            false,
+        ),
+        // `VALUES` after the pattern, in the same group.
+        (
+            "DELETE { GRAPH <urn:x:g> { ?s ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { ?s ?p ?o VALUES ?s { <urn:x:s2> } } }",
+            false,
+        ),
+        // The listed objects.
+        (
+            "DELETE { GRAPH <urn:x:g> { ?s ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { VALUES ?o { <urn:x:s2> <urn:x:s4> } ?s ?p ?o } }",
+            false,
+        ),
+        // Two variables in one block.
+        (
+            "DELETE { GRAPH <urn:x:g> { ?s ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { VALUES (?s ?o) { (<urn:x:s1> <urn:x:s2>) (<urn:x:s2> <urn:x:s3>) } ?s ?p ?o } }",
+            false,
+        ),
+        // `ikigai-ledger`'s removal: the item's own quads, the edges pointing at it, and its
+        // dependents listed once, each a branch of a `UNION`.
+        (
+            "DELETE { GRAPH <urn:x:g> { <urn:x:s1> ?p0 ?o0 . ?s1 ?p1 <urn:x:s1> . ?d ?dp ?do } }
+             WHERE { GRAPH <urn:x:g> {
+               { <urn:x:s1> ?p0 ?o0 }
+               UNION { ?s1 ?p1 <urn:x:s1> FILTER(?p1 != <urn:x:type>) }
+               UNION { VALUES ?d { <urn:x:s2> <urn:x:s3> } ?d ?dp ?do } } }",
+            false,
+        ),
+        // `ikigai-ledger`'s read of the same set, one pattern binding `?s ?p ?o`.
+        (
+            "INSERT { GRAPH <urn:x:g> { ?s <urn:x:gone> ?p } }
+             WHERE { GRAPH <urn:x:g> {
+               { <urn:x:s1> ?p ?o BIND(<urn:x:s1> AS ?s) }
+               UNION { VALUES ?s { <urn:x:s2> <urn:x:s3> } ?s ?p ?o } } }",
+            false,
+        ),
+        // Narrowed under a filter, in a sub-select, beside an `OPTIONAL`, and in an `EXISTS`.
+        (
+            "DELETE { GRAPH <urn:x:g> { ?s ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { VALUES ?s { <urn:x:s1> <urn:x:s2> } ?s ?p ?o FILTER(?p != <urn:x:n>) } }",
+            false,
+        ),
+        (
+            "INSERT { GRAPH <urn:x:g> { ?s <urn:x:count> ?c } }
+             WHERE { SELECT ?s (COUNT(*) AS ?c) WHERE { GRAPH <urn:x:g> { VALUES ?s { <urn:x:s1> <urn:x:s2> } ?s ?p ?o } } GROUP BY ?s }",
+            false,
+        ),
+        (
+            "DELETE { GRAPH <urn:x:g> { ?s ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { VALUES ?s { <urn:x:s1> <urn:x:s3> } ?s ?p ?o OPTIONAL { ?s <urn:x:label> ?l } } }",
+            false,
+        ),
+        (
+            "INSERT { GRAPH <urn:x:g> { <urn:x:s1> <urn:x:any> ?e } }
+             WHERE { BIND(EXISTS { GRAPH <urn:x:g> { VALUES ?s { <urn:x:s3> } ?s ?p ?o } } AS ?e) }",
+            false,
+        ),
+        // A listed set that matches nothing.
+        (
+            "DELETE { GRAPH <urn:x:g> { ?s ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { VALUES ?s { <urn:x:nobody> } ?s ?p ?o } }",
+            false,
+        ),
+        // ── Stays whole. ──
+        // An `UNDEF` row binds nothing, so the pattern is not confined to the list.
+        (
+            "DELETE { GRAPH <urn:x:g> { ?s ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { VALUES ?s { <urn:x:s1> UNDEF } ?s ?p ?o } }",
+            true,
+        ),
+        // A literal in the list, for a subject.
+        (
+            "DELETE { GRAPH <urn:x:g> { ?s ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { VALUES ?s { <urn:x:s1> \"one\" } ?s ?p ?o } }",
+            true,
+        ),
+        // A `VALUES` outside the `GRAPH` block's group.
+        (
+            "DELETE { GRAPH <urn:x:g> { ?s ?p ?o } }
+             WHERE { VALUES ?s { <urn:x:s1> } GRAPH <urn:x:g> { ?s ?p ?o } }",
+            true,
+        ),
+        // A `VALUES` in another branch of a `UNION`.
+        (
+            "DELETE { GRAPH <urn:x:g> { ?s ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { { VALUES ?s { <urn:x:s1> } } UNION { ?s ?p ?o } } }",
+            true,
+        ),
+        // A `VALUES` inside an `OPTIONAL`, `MINUS` or `FILTER NOT EXISTS`, the pattern outside.
+        (
+            "DELETE { GRAPH <urn:x:g> { ?s ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { ?s ?p ?o OPTIONAL { VALUES ?s { <urn:x:s1> } } } }",
+            true,
+        ),
+        (
+            "DELETE { GRAPH <urn:x:g> { ?s ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { ?s ?p ?o MINUS { VALUES ?s { <urn:x:s1> } } } }",
+            true,
+        ),
+        (
+            "DELETE { GRAPH <urn:x:g> { ?s ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { ?s ?p ?o FILTER NOT EXISTS { VALUES ?s { <urn:x:s1> } } } }",
+            true,
+        ),
+        // The pattern's subject is listed and its object reaches on: the second hop is free.
+        (
+            "DELETE { GRAPH <urn:x:g> { ?m ?q ?o } }
+             WHERE { GRAPH <urn:x:g> { VALUES ?s { <urn:x:s1> } ?s <urn:x:p> ?m . ?m ?q ?o } }",
+            true,
+        ),
+        // A template variable the list confines in one branch and a free pattern binds in another.
+        (
+            "DELETE { GRAPH <urn:x:g> { ?d ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { { VALUES ?d { <urn:x:s1> } ?d <urn:x:n> ?o } UNION { ?d <urn:x:type> ?o } } }",
+            true,
+        ),
+        // A `BIND` over the listed variable's name.
+        (
+            "DELETE { GRAPH <urn:x:g> { ?t ?p ?o } }
+             WHERE { GRAPH <urn:x:g> { VALUES ?s { <urn:x:s1> } ?s <urn:x:p> ?o BIND(?o AS ?t) ?t ?p ?x } }",
+            true,
+        ),
+    ];
+
+    /// ★ REPRODUCTION, then FIDELITY (ledger #2940): a `VALUES` in the same group as a pattern
+    /// copies the quads of the IRIs it lists, and nothing else when the rest of the update is
+    /// anchored too; every other shape copies the whole graph; and either way the update
+    /// computes what it computes over the whole graph.
+    #[test]
+    fn a_values_block_names_the_quads_its_group_can_match() {
+        for (update, whole) in VALUES_CORPUS {
+            let footprint = parse_one(update).footprint;
+            assert_eq!(
+                footprint == Footprint::Whole,
+                *whole,
+                "`{update}`: footprint {footprint:?}"
+            );
+            let (by_whole, by_footprint) = (store(), store());
+            let answer_whole = run(&by_whole, update, true);
+            let answer_footprint = run(&by_footprint, update, false);
+            assert_eq!(
+                answer_footprint, answer_whole,
+                "`{update}`: the answers differ"
+            );
+            assert_eq!(
+                dump(&by_footprint),
+                dump(&by_whole),
+                "`{update}` ({answer_whole}): the stores differ afterwards"
+            );
+        }
+    }
+
+    /// A graph of `items` items, each the subject of three quads, plus quads in another graph.
+    fn items(items: usize) -> Store {
+        let store = Store::new().unwrap();
+        let g = graph();
+        let other = NamedNode::new("urn:x:other").unwrap();
+        for i in 0..items {
+            let s = NamedNode::new(format!("urn:x:item:{i}")).unwrap();
+            for (p, o) in [
+                ("type", Term::from(NamedNode::new("urn:x:Item").unwrap())),
+                ("n", Literal::from(i as i64).into()),
+                (
+                    "next",
+                    NamedNode::new(format!("urn:x:item:{}", i + 1))
+                        .unwrap()
+                        .into(),
+                ),
+            ] {
+                let p = NamedNode::new(format!("urn:x:{p}")).unwrap();
+                store
+                    .insert(&Quad::new(s.clone(), p.clone(), o.clone(), g.clone()))
+                    .unwrap();
+                store
+                    .insert(&Quad::new(s.clone(), p, o, other.clone()))
+                    .unwrap();
+            }
+        }
+        store
+    }
+
+    /// ★ THE MECHANISM (ledger #2940): removing the quads of 1, 250 and 2,000 listed subjects by
+    /// ONE pattern copies three quads per listed subject, under a copy bound the whole graph
+    /// exceeds, and removes exactly what the whole-graph copy removes.
+    ///
+    /// One pattern for any number of subjects is what keeps an `ikigai-ledger` delete inside the
+    /// store's algebra budget (`budget::MAX_ALGEBRA_NODES`): a `UNION` branch per subject costs
+    /// about three operators each, and ran out past 250.
+    #[test]
+    fn a_listed_set_copies_its_own_quads_at_any_size() {
+        const ITEMS: usize = 3_000;
+        for listed in [1, 250, 2_000] {
+            let list: Vec<String> = (0..listed)
+                .map(|i| format!("<urn:x:item:{}>", i * ITEMS / listed))
+                .collect();
+            let update = format!(
+                "DELETE {{ GRAPH <urn:x:g> {{ ?s ?p ?o }} }} \
+                 WHERE {{ GRAPH <urn:x:g> {{ VALUES ?s {{ {} }} ?s ?p ?o }} }}",
+                list.join(" ")
+            );
+            let parsed = parse_one(&update);
+            assert!(
+                matches!(parsed.footprint, Footprint::Matching(_)),
+                "{listed} listed: the footprint is the whole graph"
+            );
+            let store = items(ITEMS);
+            let copied = copy(
+                &store,
+                &graph(),
+                &parsed.footprint,
+                None,
+                &Store::new().unwrap(),
+                &Deadline::never(),
+            )
+            .unwrap();
+            assert_eq!(copied.len(), 3 * listed, "{listed} listed");
+
+            // A bound the graph's 9,000 quads exceed and the listed set's do not.
+            let bound = Some(3 * listed);
+            let applied = scoped_update(
+                &store,
+                &graph(),
+                parsed.prepared,
+                &parsed.footprint,
+                bound,
+                &Deadline::never(),
+            )
+            .unwrap_or_else(|e| panic!("{listed} listed: {e}"));
+            assert_eq!((applied.added, applied.removed), (0, 3 * listed));
+
+            let by_whole = items(ITEMS);
+            assert_eq!(run(&by_whole, &update, true), format!("+0 -{}", 3 * listed));
+            assert_eq!(dump(&store), dump(&by_whole), "{listed} listed");
+        }
+    }
+
+    /// A small deterministic generator (xorshift64*), so the property test needs no dependency
+    /// and a failure names the seed that reproduces it.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.next() % 100 < percent
+        }
+    }
+
+    /// ★ PROPERTY (ledger #2940): over random small graphs and random updates whose patterns
+    /// draw on a listed set, an update run over its footprint gives the same answer and leaves
+    /// the same store as the same update run over the whole graph. The lists sometimes hold an
+    /// `UNDEF` or a literal, so the fallback is exercised beside the narrowing.
+    #[test]
+    fn an_update_over_its_footprint_computes_what_it_computes_over_the_graph() {
+        const CASES: u64 = 400;
+        let node = |i: usize| format!("<urn:x:n{i}>");
+        let mut narrowed = 0;
+        for seed in 1..=CASES {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let store = Store::new().unwrap();
+            let mut trig = String::new();
+            for _ in 0..rng.below(30) + 5 {
+                let s = node(rng.below(8));
+                let p = format!("<urn:x:p{}>", rng.below(3));
+                let o = if rng.chance(70) {
+                    node(rng.below(8))
+                } else {
+                    format!("\"v{}\"", rng.below(4))
+                };
+                let g = if rng.chance(80) {
+                    "urn:x:g"
+                } else {
+                    "urn:x:other"
+                };
+                trig.push_str(&format!("<{g}> {{ {s} {p} {o} }}\n"));
+            }
+            store.load_from_slice(RdfFormat::TriG, &trig).unwrap();
+
+            let mut list: Vec<String> =
+                (0..rng.below(4) + 1).map(|_| node(rng.below(10))).collect();
+            if rng.chance(10) {
+                list.push("UNDEF".to_string());
+            }
+            if rng.chance(10) {
+                list.push("\"v1\"".to_string());
+            }
+            let list = list.join(" ");
+            let values = |var: &str| format!("VALUES ?{var} {{ {list} }}");
+            let p = format!("<urn:x:p{}>", rng.below(3));
+            let shapes = [
+                format!("DELETE {{ GRAPH <urn:x:g> {{ ?s ?p ?o }} }} WHERE {{ GRAPH <urn:x:g> {{ {} ?s ?p ?o }} }}", values("s")),
+                format!("DELETE {{ GRAPH <urn:x:g> {{ ?s ?p ?o }} }} INSERT {{ GRAPH <urn:x:g> {{ ?o <urn:x:back> ?s }} }} WHERE {{ GRAPH <urn:x:g> {{ ?s ?p ?o {} }} }}", values("o")),
+                format!("DELETE {{ GRAPH <urn:x:g> {{ <urn:x:n0> ?p0 ?o0 . ?d ?dp ?do }} }} WHERE {{ GRAPH <urn:x:g> {{ {{ <urn:x:n0> ?p0 ?o0 }} UNION {{ {} ?d ?dp ?do }} }} }}", values("d")),
+                format!("INSERT {{ GRAPH <urn:x:g> {{ ?s <urn:x:count> ?c }} }} WHERE {{ SELECT ?s (COUNT(*) AS ?c) WHERE {{ GRAPH <urn:x:g> {{ {} ?s ?p ?o }} }} GROUP BY ?s }}", values("s")),
+                format!("DELETE {{ GRAPH <urn:x:g> {{ ?x ?p ?o }} }} WHERE {{ GRAPH <urn:x:g> {{ {} ?s {p} ?x OPTIONAL {{ ?x ?p ?o }} }} }}", values("s")),
+                format!("DELETE {{ GRAPH <urn:x:g> {{ ?s ?p ?o }} }} WHERE {{ GRAPH <urn:x:g> {{ {} ?s ?p ?o FILTER NOT EXISTS {{ ?o {p} ?any }} }} }}", values("s")),
+                format!("DELETE {{ GRAPH <urn:x:g> {{ ?s ?p ?o }} }} WHERE {{ GRAPH <urn:x:g> {{ {} ?s ?p ?o MINUS {{ ?s {p} ?o }} }} }}", values("s")),
+                format!("INSERT {{ GRAPH <urn:x:g> {{ ?s <urn:x:hop> ?o }} }} WHERE {{ GRAPH <urn:x:g> {{ {} ?s ?p ?m . ?m ?q ?o }} }}", values("s")),
+                format!("DELETE {{ GRAPH <urn:x:g> {{ ?s ?p ?o }} }} WHERE {{ GRAPH <urn:x:g> {{ {{ {} ?s ?p ?o }} UNION {{ ?s {p} ?o }} }} }}", values("s")),
+                format!("DELETE {{ GRAPH <urn:x:g> {{ ?d <urn:x:p0> ?o }} }} WHERE {{ GRAPH <urn:x:g> {{ {{ {} ?d <urn:x:p0> ?o }} UNION {{ ?d {p} ?o }} }} }}", values("d")),
+                format!("DELETE {{ GRAPH <urn:x:g> {{ ?s ?p ?o }} }} WHERE {{ {} GRAPH <urn:x:g> {{ ?s ?p ?o }} }}", values("s")),
+                format!("INSERT {{ GRAPH <urn:x:g> {{ ?s <urn:x:has> ?n }} }} WHERE {{ GRAPH <urn:x:g> {{ {} OPTIONAL {{ ?s ?p ?n }} }} }}", values("s")),
+            ];
+            let update = &shapes[rng.below(shapes.len())];
+            if parse_one(update).footprint != Footprint::Whole {
+                narrowed += 1;
+            }
+            let by_whole = Store::new().unwrap();
+            by_whole.load_from_slice(RdfFormat::TriG, &trig).unwrap();
+            let answer_whole = run(&by_whole, update, true);
+            let answer_footprint = run(&store, update, false);
+            assert_eq!(
+                answer_footprint, answer_whole,
+                "seed {seed}: `{update}` over\n{trig}"
+            );
+            assert_eq!(
+                dump(&store),
+                dump(&by_whole),
+                "seed {seed}: `{update}` ({answer_whole}) over\n{trig}"
+            );
+        }
+        assert!(
+            narrowed >= CASES / 3,
+            "only {narrowed} of {CASES} updates exercised a narrowed footprint"
+        );
     }
 }
