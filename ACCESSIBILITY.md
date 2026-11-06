@@ -53,7 +53,10 @@ Followed by reading the source:
   `malformed_input_names_the_argument_that_was_wrong`), `tests/multi_graph_read.rs`
   (`one_missing_grant_refuses_the_read_and_names_the_missing_token`), `tests/graph_scope.rs`
   (`the_refusal_names_the_graph_and_never_the_statement`), `tests/update_read_grant.rs`
-  (`an_escape_refusal_names_graphs_and_never_data`), `tests/service_egress.rs`
+  (`an_escape_refusal_names_graphs_and_never_data`), `tests/update_outside_graph.rs`
+  (`a_delete_naming_another_graph_or_the_default_graph_is_refused`,
+  `a_pattern_that_reads_the_default_graph_is_refused`, which check that the refusal names the
+  graph and says what to write instead), `tests/service_egress.rs`
   (`the_refusal_says_where_remote_data_comes_in_instead`), `tests/shared_writer.rs`
   (`the_raw_write_refusal_names_the_declaration_and_the_way_out`), and `tests/timeout_wording.rs`
   and `tests/overdue_cap_wording.rs`, which hold the time-budget refusals.

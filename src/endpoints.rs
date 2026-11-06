@@ -2017,6 +2017,12 @@ impl Endpoint for GraphUpdateEndpoint {
                         // match nothing. On the text, after the read-grant check, so a
                         // write-only caller is refused on the grant as before.
                         crate::confine::reads_outside(&parsed.reads, &target)?;
+                        // ★ …and so is a `WHERE` that reads the default graph, which the
+                        // private copy leaves empty, and a `DELETE` naming another graph or the
+                        // default graph, which removes nothing there (ledger #1612). On the
+                        // text too.
+                        crate::confine::reads_default_outside(parsed.reads_default, &target)?;
+                        crate::confine::deletes_outside(&parsed.deletes, &target)?;
                         let _writes = store.write_lock();
                         crate::confine::scoped_update(
                             store.dataset(),
@@ -2061,7 +2067,10 @@ impl Endpoint for GraphUpdateEndpoint {
                  another graph either, which is the point: this is a boundary, not a \
                  filter. An update naming another graph in `WITH`, `USING`, `USING NAMED` \
                  or a `GRAPH` block of its `WHERE` is refused by name before evaluation, \
-                 rather than applied as a no-op. An update with a `WHERE` clause (including `DELETE WHERE`, `WITH`, \
+                 rather than applied as a no-op, and so is one deleting from another graph \
+                 or the default graph, or whose `WHERE` reads the default graph (a pattern \
+                 outside any `GRAPH` block with no `WITH` or `USING` naming the graph). \
+                 An update with a `WHERE` clause (including `DELETE WHERE`, `WITH`, \
                  `COPY`, `MOVE`, `ADD`) READS the graph, so it also needs \
                  `urn:cap:store:read:graph:<IRI>` (or `urn:cap:store:read`) and is refused \
                  on the grant, before evaluation, without it; `INSERT DATA`, `DELETE DATA`, \
@@ -2078,8 +2087,10 @@ impl Endpoint for GraphUpdateEndpoint {
                     .summary(
                         "A SPARQL 1.1 UPDATE. Statements must be inside a `GRAPH <…>` \
                          block naming the scoped graph: a bare `INSERT DATA { … }` writes \
-                         the default graph and is refused. One with a `WHERE` clause also \
-                         needs the read grant on the graph.",
+                         the default graph and is refused, and so is a `WHERE` pattern \
+                         outside a `GRAPH` block unless `WITH <…>` or `USING <…>` names the \
+                         scoped graph. One with a `WHERE` clause also needs the read grant on \
+                         the graph.",
                     )
                     .class(XSD_STRING),
             )

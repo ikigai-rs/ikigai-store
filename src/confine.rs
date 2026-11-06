@@ -41,6 +41,8 @@
 //! | `WITH <other> INSERT … WHERE …` | **refused** | reads another graph (ledger #1606); with `USING <G>`, writes it |
 //! | `USING <other>`, `USING NAMED <other>`, `WITH <other> DELETE …` | **refused** by name, before evaluation | reads another graph, so it would match nothing (ledger #1606, [`reads_outside`]) |
 //! | `… WHERE { GRAPH <other> { … } }`, `COPY`/`ADD <other> TO <G>` | **refused** by name, before evaluation | same: a constant graph other than `G` anywhere in a `WHERE`, `EXISTS` included |
+//! | `DELETE DATA { GRAPH <other> … }`, `DELETE { GRAPH <other> … }`, `WITH <other> DELETE … USING <G>`, a `DELETE` of the default graph | **refused** by name, before evaluation | it would remove nothing (ledger #1612, [`deletes_outside`]) |
+//! | `… WHERE { ?s ?p ?o }` with no `GRAPH`, `WITH <G>` or `USING <G>`, `COPY DEFAULT TO <G>` | **refused**, before evaluation | reads the copy's empty default graph (ledger #1612, [`reads_default_outside`]) |
 //! | `COPY`/`MOVE`/`ADD … TO <other>` | **refused** | the destination quads escape |
 //! | `CREATE GRAPH <other>` | **refused** | creates no quad, but registers a graph |
 //! | `DROP ALL`, `CLEAR ALL` | applied to `G` alone | the private store held only `G`, and emptying `G` is within a grant over `G` |
@@ -66,8 +68,16 @@
 //! private copy and answered `+0 -0`, or worse: `FILTER NOT EXISTS` over the other graph held
 //! for every row, and `COPY <other> TO <G>` emptied `G`. [`reads_outside`] refuses each by
 //! name, on the text, before anything is evaluated. Only constant names: `GRAPH ?g` still
-//! binds `G` alone, and a pattern outside any `GRAPH` block still reads the private copy's
-//! empty default graph, unrefused.
+//! binds `G` alone.
+//!
+//! ★ **So is a `WHERE` that reads the default graph, and a `DELETE` naming another graph**
+//! (ledger #1612). A pattern outside any `GRAPH` block, with no `WITH <G>` or `USING <G>`,
+//! reads the private copy's empty default graph ([`reads_default_outside`]): `INSERT { GRAPH
+//! <G> { … } } WHERE { ?s ?p ?o }` answered `+0 -0`, and `COPY DEFAULT TO <G>` emptied `G`. A
+//! `DELETE DATA` quad or `DELETE` template in another graph or the default graph removed
+//! nothing ([`deletes_outside`]), `WITH <other> DELETE … USING <G>` included: with `USING`
+//! present the parser keeps `WITH` in the templates alone. Both on the text, before evaluation.
+//! `CLEAR`/`DROP` of another graph or `DEFAULT` still answer `+0 -0`.
 //!
 //! # ★ …and a WRITE grant alone cannot read even `G` (ledger #751)
 //!
@@ -230,6 +240,8 @@ pub(crate) fn parse(
     let footprint = footprint(&parsed);
     let inserts = insert_probes(&parsed);
     let reads = graphs_read(&parsed);
+    let reads_default = reads_default_graph(&parsed);
+    let deletes = graphs_deleted(&parsed);
     Ok(Parsed {
         prepared: crate::service::evaluator()
             .with_cancellation_token(deadline.token())
@@ -237,16 +249,22 @@ pub(crate) fn parse(
         footprint,
         inserts,
         reads,
+        reads_default,
+        deletes,
     })
 }
 
 /// A parsed, bounded update, what of a scoped graph it can observe, where its `INSERT`
-/// templates can put a triple term, and which graphs it names to read.
+/// templates can put a triple term, which graphs it names to read, whether a `WHERE` reads the
+/// default graph, and which graphs it names to delete from.
 pub(crate) struct Parsed {
     pub prepared: PreparedSparqlUpdate,
     pub footprint: Footprint,
     pub inserts: Vec<InsertProbe>,
     pub reads: GraphsRead,
+    pub reads_default: bool,
+    /// `None` is the default graph.
+    pub deletes: BTreeSet<Option<NamedNode>>,
 }
 
 /// Where an update names a graph it READS (ledger #1606), in the order a refusal lists them.
@@ -356,6 +374,128 @@ pub(crate) fn reads_outside(reads: &GraphsRead, graph: &NamedNode) -> Result<()>
             } else {
                 "reading them"
             },
+        ),
+    })
+}
+
+/// Whether some `WHERE` of `update` reads the default graph (ledger #1612): it matches a triple
+/// pattern or a path outside every `GRAPH` block, and no `WITH` or `USING` names the graph
+/// that pattern reads, so it reads the dataset's own default graph.
+///
+/// `WITH <g>` and `USING <g>` make `<g>` the default graph, and [`graphs_read`] already lists
+/// it; `USING NAMED` alone leaves the default graph empty, so it is still read here.
+pub(crate) fn reads_default_graph(update: &Update) -> bool {
+    update.operations.iter().any(|operation| {
+        let GraphUpdateOperation::DeleteInsert { using, pattern, .. } = operation else {
+            return false;
+        };
+        using
+            .as_ref()
+            .is_none_or(|dataset| dataset.default.is_empty())
+            && crate::scope::reads_the_default_graph(pattern)
+    })
+}
+
+/// Refuse a scoped update whose `WHERE` reads the default graph (ledger #1612).
+///
+/// The private copy holds `graph` alone, so its default graph is empty, and a pattern outside
+/// a `GRAPH` block matched nothing: `INSERT { GRAPH <G> { … } } WHERE { ?s ?p ?o }`, probably
+/// the commonest mistake through this door, answered `+0 -0`, and `COPY DEFAULT TO <G>`
+/// emptied `G`. Refused, not answered as if the default graph were `G` (as a scoped READ
+/// treats it, [`crate::scope::confine`]): a refusal can later become that reading without
+/// changing an update anyone saw applied, and the reverse could not. Decided on the TEXT, after
+/// the read-grant check, like [`reads_outside`].
+pub(crate) fn reads_default_outside(reads_default: bool, graph: &NamedNode) -> Result<()> {
+    if !reads_default {
+        return Ok(());
+    }
+    let g = graph.as_str();
+    Err(Error::InvalidArgument {
+        name: "content".to_string(),
+        detail: format!(
+            "this update has a pattern outside any `GRAPH` block, which reads the default \
+             graph, and the default graph is not this write's graph, `graph={g}`. \
+             `urn:iki:store:graph-update` evaluates an update against a private copy of that \
+             one graph and nothing else, so its default graph is empty and the pattern would \
+             match nothing; the update is refused rather than applied, because `+0 -0` looks \
+             exactly like an update with nothing to do. Nothing was applied: the update was \
+             not evaluated. Put the pattern inside `GRAPH <{g}> {{ … }}`, or begin the update \
+             with `WITH <{g}>`"
+        ),
+    })
+}
+
+/// Every graph an update names by a constant to DELETE from (ledger #1612): the graph of each
+/// `DELETE DATA` quad and of each `DELETE` template, the default graph included. `WITH <g>` is
+/// already in a template as its graph (spargebra injects it, `USING` or not). A `GRAPH ?g`
+/// template names nothing until evaluation, and the private copy keeps it inside the scope.
+/// `None` is the default graph.
+pub(crate) fn graphs_deleted(update: &Update) -> BTreeSet<Option<NamedNode>> {
+    let mut deletes = BTreeSet::new();
+    for operation in &update.operations {
+        match operation {
+            GraphUpdateOperation::DeleteData { data } => {
+                deletes.extend(data.iter().map(|quad| match &quad.graph_name {
+                    spargebra::term::GraphName::NamedNode(node) => Some(node.clone()),
+                    spargebra::term::GraphName::DefaultGraph => None,
+                }));
+            }
+            GraphUpdateOperation::DeleteInsert { delete, .. } => {
+                for template in delete {
+                    match &template.graph_name {
+                        GraphNamePattern::NamedNode(node) => {
+                            deletes.insert(Some(node.clone()));
+                        }
+                        GraphNamePattern::DefaultGraph => {
+                            deletes.insert(None);
+                        }
+                        GraphNamePattern::Variable(_) => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    deletes
+}
+
+/// Refuse a scoped update that names a graph other than `graph`, or the default graph, to
+/// delete from (ledger #1612).
+///
+/// An `INSERT` there is refused on its effect, by [`scoped_update`], because a quad lands
+/// outside `graph`. A `DELETE` there has no effect to see: the private copy holds no quad of
+/// that graph, so it removed nothing and the update answered `-0`, whether the caller
+/// mistyped the IRI, forgot a `GRAPH` block, or wrote `WITH <other>` beside `USING <graph>`
+/// (which leaves `WITH` in the templates alone). Refused by name on the TEXT, so it says
+/// nothing about the data, and a write-only caller's `DELETE DATA` reaches it too.
+pub(crate) fn deletes_outside(
+    deletes: &BTreeSet<Option<NamedNode>>,
+    graph: &NamedNode,
+) -> Result<()> {
+    let outside: Vec<String> = deletes
+        .iter()
+        .filter(|name| name.as_ref() != Some(graph))
+        .map(|name| match name {
+            Some(node) => format!("<{}>", node.as_str()),
+            None => "the default graph".to_string(),
+        })
+        .collect();
+    if outside.is_empty() {
+        return Ok(());
+    }
+    let g = graph.as_str();
+    Err(Error::InvalidArgument {
+        name: "content".to_string(),
+        detail: format!(
+            "this update deletes from {} (in `DELETE DATA` or a `DELETE` template, where \
+             `WITH` names the graph too), which {} not this write's graph, `graph={g}`. \
+             `urn:iki:store:graph-update` can change that one graph and nothing else, so the \
+             delete would remove nothing; the update is refused rather than applied, because \
+             `-0` looks exactly like a delete with nothing to remove. Nothing was applied: the \
+             update was not evaluated. Name `GRAPH <{g}>` in the delete, or, holding \
+             `urn:cap:store:write`, use `urn:iki:store:update`",
+            outside.join(", "),
+            if outside.len() == 1 { "is" } else { "are" },
         ),
     })
 }
