@@ -101,6 +101,8 @@ fn a_whole_graph_update_past_the_bound_is_refused_and_applies_nothing() {
         panic!("expected an InvalidArgument, got {err:?}");
     };
     assert_eq!(name, "content");
+    assert!(detail.starts_with("Name a subject"), "{detail}");
+    assert!(!detail.contains("ledger #"), "{detail}");
     for needle in [
         "copies at most 10 quads",
         "`urn:iki:store:update`",

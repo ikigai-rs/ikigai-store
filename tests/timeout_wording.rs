@@ -6,7 +6,7 @@
 //! `requested` bound (intray, shacl, layers and markdown all pass `None`), so the sentence
 //! names an argument their callers cannot send, and markdown rewrote it in its own words.
 //!
-//! These pin both halves: the doors' sentence is exactly what it was, and a consumer's names
+//! These pin both halves: the doors' sentence names `budget=`, and a consumer's names
 //! its own argument, or none.
 
 use futures::executor::block_on;
@@ -63,9 +63,9 @@ fn a_consumers_timeout_names_no_budget_argument_by_default() {
     );
     assert_eq!(
         message,
-        "this SPARQL query ran past its time budget of 50 ms and was stopped (ledger #964). \
-         The budget is set by the host. Narrow the query — fewer joins, a bound subject, a \
-         LIMIT — or ask the host for a larger budget"
+        "Narrow the query — fewer joins, a bound subject, a LIMIT — or ask the host for a \
+         larger budget. This SPARQL query ran past its time budget of 50 ms and was stopped. \
+         The budget is set by the host."
     );
 }
 
@@ -75,10 +75,9 @@ fn a_consumer_names_its_own_argument() {
     let message = timeout_sentence(&budget);
     assert_eq!(
         message,
-        "this SPARQL query ran past its time budget of 50 ms and was stopped (ledger #964). \
-         The budget is set by the host, and a request's `match_budget=` can only lower it. \
-         Narrow the query — fewer joins, a bound subject, a LIMIT — or ask the host for a \
-         larger budget"
+        "Narrow the query — fewer joins, a bound subject, a LIMIT — or ask the host for a \
+         larger budget. This SPARQL query ran past its time budget of 50 ms and was stopped. \
+         The budget is set by the host, and a request's `match_budget=` can only lower it."
     );
     // And a clone keeps it, as it keeps the overdue count.
     assert_eq!(timeout_sentence(&budget.clone()), message);
@@ -88,7 +87,7 @@ fn a_consumer_names_its_own_argument() {
 }
 
 #[test]
-fn the_doors_keep_their_sentence() {
+fn the_doors_name_their_budget_argument() {
     // 60 nodes, two edges each, and a read only the clock can stop: a cross product of four
     // patterns is refused for its SIZE first on a fast machine (ledger #1685).
     let triples = common::seed_triples();
@@ -115,10 +114,9 @@ fn the_doors_keep_their_sentence() {
     match result {
         Err(Error::Timeout(message)) => assert_eq!(
             message,
-            "this SPARQL query ran past its time budget of 300 ms and was stopped (ledger \
-             #964). The budget is set by the host, and a request's `budget=` can only lower \
-             it. Narrow the query — fewer joins, a bound subject, a LIMIT — or ask the host \
-             for a larger budget"
+            "Narrow the query — fewer joins, a bound subject, a LIMIT — or ask the host for a \
+             larger budget. This SPARQL query ran past its time budget of 300 ms and was stopped. \
+             The budget is set by the host, and a request's `budget=` can only lower it."
         ),
         Ok(rep) => panic!(
             "expected a Timeout, got {}",
@@ -142,11 +140,11 @@ fn a_validation_timeout_names_the_work_and_its_remedy() {
     );
     let message = timeout_sentence(&budget);
     assert!(
-        message.contains("this SHACL validation ran past"),
+        message.contains("This SHACL validation ran past"),
         "{message}"
     );
     assert!(
-        message.contains("Validate a smaller data graph"),
+        message.starts_with("Validate a smaller data graph"),
         "{message}"
     );
     assert!(!message.contains("SPARQL"), "{message}");
@@ -158,9 +156,9 @@ fn a_validation_timeout_names_the_work_and_its_remedy() {
         message.contains("`validation_budget=` can only lower it"),
         "{message}"
     );
-    assert!(message.contains("this SHACL validation"), "{message}");
+    assert!(message.contains("This SHACL validation"), "{message}");
     assert!(
-        message.ends_with("Validate a smaller data graph or ask the host for a larger budget"),
+        message.starts_with("Validate a smaller data graph or ask the host for a larger budget."),
         "{message}"
     );
 }

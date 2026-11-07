@@ -1188,14 +1188,14 @@ fn copy_too_large(graph: &NamedNode, bound: usize, footprint: &Footprint) -> Err
     Error::InvalidArgument {
         name: "content".to_string(),
         detail: format!(
-            "this update {why}, and graph <{g}> holds more than {bound} of them: \
-             `urn:iki:store:graph-update` evaluates an update against a private copy of what it \
-             can observe and copies at most {bound} quads (the host's bound, ledger #146). \
-             Nothing was applied. Name a subject, predicate or object in each pattern, or list \
+            "Name a subject, predicate or object in each pattern, or list \
              subject or object IRIs in a VALUES block in the same GRAPH group, so the update \
              observes less, or, holding `urn:cap:store:write` (and `urn:cap:store:read` \
              for a `WHERE`), use `urn:iki:store:update`, which evaluates in place and copies \
-             nothing. `urn:iki:store:graph-info graph={g}` says how many quads the graph holds",
+             nothing. This update {why}, and graph <{g}> holds more than {bound} of them: \
+             `urn:iki:store:graph-update` evaluates an update against a private copy of what it \
+             can observe and copies at most {bound} quads (the host's bound). Nothing was \
+             applied. `urn:iki:store:graph-info graph={g}` says how many quads the graph holds",
             g = graph.as_str(),
         ),
     }
