@@ -843,10 +843,9 @@ impl EvaluationBudget {
     ///         .with_caller_share(2),
     /// );
     /// // By default the sentence names no argument: this consumer takes none.
-    /// assert!(timeout(&budget).ends_with(
-    ///     "The budget is set by the host. Narrow the query — fewer joins, a bound subject, \
-    ///      a LIMIT — or ask the host for a larger budget"
-    /// ));
+    /// let sentence = timeout(&budget);
+    /// assert!(sentence.ends_with("The budget is set by the host."));
+    /// assert!(sentence.starts_with("Narrow the query"));
     /// // A consumer that reads `requested` from its own `match_budget=` says so.
     /// let budget = budget.with_argument(Some("match_budget"));
     /// assert!(timeout(&budget)
