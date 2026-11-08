@@ -288,14 +288,15 @@ fn the_broad_door_needs_the_broad_read_grant_for_a_where() {
         run(&k, Verb::Sink, BROAD, &[("content", insert)], &write).unwrap(),
         "updated\n"
     );
-    // With the read grant, the WHERE runs and the counts come back.
+    // With the read grant, the WHERE runs. No door counts the store (ledger #3270).
     let both = Capability::scoped([CAP_WRITE.to_string(), CAP_READ.to_string()]);
     let out = run(&k, Verb::Sink, BROAD, &[("content", &exfil)], &both).unwrap();
-    assert!(out.starts_with("updated: ") && out.contains("->"), "{out}");
+    assert_eq!(out, "updated\n");
     assert!(holds(&k, "urn:nowhere", "urn:a:1"));
 }
 
-/// `urn:iki:store:load` reads nothing, so it stays write-only — but its counts are a read.
+/// `urn:iki:store:load` reads nothing, so it stays write-only — but what it added is a read:
+/// a statement the store held already adds nothing.
 #[test]
 fn load_reports_counts_only_to_a_reader() {
     let k = kernel();
@@ -321,5 +322,22 @@ fn load_reports_counts_only_to_a_reader() {
         &both,
     )
     .unwrap();
-    assert!(out.contains("->"), "{out}");
+    assert_eq!(out, "loaded text/turtle: +0 quads\n");
+}
+
+/// A statement written twice in one document is added once.
+#[test]
+fn load_counts_a_repeated_statement_once() {
+    let k = kernel();
+    let doc = "<urn:d:1> <urn:p> \"x\" . <urn:d:1> <urn:p> \"x\" . _:b <urn:p> \"x\" .";
+    let both = Capability::scoped([CAP_WRITE.to_string(), CAP_READ.to_string()]);
+    let out = run(
+        &k,
+        Verb::Sink,
+        "urn:iki:store:load",
+        &[("content", doc)],
+        &both,
+    )
+    .unwrap();
+    assert_eq!(out, "loaded text/turtle: +2 quads\n");
 }

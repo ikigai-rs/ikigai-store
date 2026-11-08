@@ -148,7 +148,7 @@
 //! scoped door `cap_read_graph(graph)` beside the write grant, on the broad door
 //! [`CAP_READ`] beside [`CAP_WRITE`]. It is decided on the update's text before anything
 //! is evaluated, a refusal never quotes data, and a caller that may not read is not told
-//! the quad counts. `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP` and `CREATE` stay
+//! what a scoped update or a load added. `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP` and `CREATE` stay
 //! write-only. (Ledger #751: a write-only grant could read `G` through the refusal text,
 //! and then through refused-or-not.)
 //!

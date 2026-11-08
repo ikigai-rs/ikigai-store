@@ -79,7 +79,7 @@ fn a_document_loaded_through_the_kernel_is_queryable() {
         r#"@prefix ex: <http://ex/> . ex:a ex:name "Alice" . ex:b ex:name "Bob" ."#,
     )
     .unwrap();
-    assert!(report.contains("0 -> 2 quads"), "{report}");
+    assert_eq!(report, "loaded text/turtle: +2 quads\n");
 
     let json = select(&k, &c, "SELECT ?name WHERE { ?s <http://ex/name> ?name }").unwrap();
     assert!(json.contains("Alice") && json.contains("Bob"), "{json}");
@@ -101,7 +101,7 @@ fn an_update_through_the_kernel_changes_what_a_query_sees() {
         ))
         .unwrap(),
     );
-    assert!(report.contains("0 -> 1 quads"), "{report}");
+    assert_eq!(report, "updated\n");
     assert!(ask(&k, &c, "ASK { ?s ?p ?o }").unwrap().contains("true"));
 }
 
