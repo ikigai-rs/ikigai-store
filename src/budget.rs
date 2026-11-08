@@ -3683,3 +3683,7 @@ mod tests {
         check_update(&parse(&data), "content").unwrap();
     }
 }
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "review_store_86.rs"]
+mod review_store_86;

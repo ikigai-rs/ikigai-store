@@ -1,0 +1,39 @@
+Review of ikigai-store PR 86
+Reviewed head: a87180307920b953cda017d34331b9036c6b2adf
+Reviewer: Codex (GPT), independent of the PR's stated Claude author.
+Recommendation: request changes for claim 4. No implementation fix or PR created.
+
+Finding: the overdue cap does not bound replacement writer threads (high).
+Reproduction: cargo test --all-features --lib review_host_refused_writes_are_bounded_by_the_overdue_cap -- --nocapture
+Expected: cap=1 permits at most one pinned refused writer.
+Actual: three sequential 100 ms host updates all time out and leave three distinct writer threads concurrently inside their work, with overdue=3. Each takes the actual WriteLock with its Deadline. The test releases all workers before asserting, so it cleans up even on the expected failure. Scaling the loop creates further pinned writers; no admission check bounds host updates.
+Path: on_its_own_thread gives updates no reservation and calls refuse_at_the_cap. Counts::overdue_full checks overdue_reads against cap.max, then returns None for Caller::Host. Abandoned updates increment overdue but not overdue_reads. Writer::replace starts another thread after each refusal. Caller::Host includes root and CAP_RESERVE holders. Before replacement these sequential requests could only pin the original worker; replacement removes that incidental bound. This is a lifecycle/resource bound failure, not evidence of an abandoned commit.
+
+Claim 1: HOLDS in the inspected commit paths and tests.
+Deadline::settle takes deadline.state, rejects Abandoned, sets Settled, and retains the state mutex across commit(). The timeout transition takes that same mutex and only changes Running to Abandoned. The worker completion path never overwrites Abandoned. Both the broad endpoint's transaction.commit and confine's scoped transaction.commit go through settle. The existing a_commit_after_the_caller_gave_up_does_not_happen passes in the full suite. The review_abandonment_and_commit_are_mutually_exclusive probe confirms the mutex remains held while commit is paused and a later abandoned settle never invokes its commit closure. The memory integration probe also observes no urn:copied quads after the abandoned work finishes.
+
+Claim 2: HOLDS in code and the takeover/unwind probes.
+WriteLock::take checks Abandoned under the holder state mutex while holding the Holding mutex. Abandoned is final. Generations advance under Holding; a dropped guard clears the holder only when its own generation still matches. review_takeover_and_stale_guard_drop_do_not_release_the_new_holder confirms a stale drop cannot release the replacement and a third writer waits. review_panicking_guard_releases_the_hold confirms unwinding releases the hold. Abandoned evaluation can overlap another evaluation, but cannot commit; a non-abandoned holder cannot be taken over. Thus the crate-mediated commit paths remain serialized. Raw-handle writers outside the crate's locking contract are outside this claim.
+
+Claim 3: HOLDS for the exercised queue handover and reply paths; see question below.
+Writer::replace shares the same Arc<Mutex<Receiver<Job>>> and retains its Sender. The receiver guard ends before job execution. The retired flag makes a displaced worker leave after its running job. Job closures each own their own reply sender. review_replacement_preserves_queued_jobs_and_replies queues twenty numbered jobs behind a blocked worker, replaces it, and verifies every job runs in order with its matching reply before releasing the old worker. The PR's RocksDB follower-write test passes. Existing queued-abandonment and writer-panic tests pass in the full suite. Commit serialization follows the write lock and settle reasoning above, not exclusive ownership of the receiver.
+
+Claim 4: DOES NOT HOLD; reproduced finding above.
+The sequential host case alone disproves the stated existing-cap bound. Read-slot accounting and ordinary callers' pool/share limits do not supply the missing bound on host replacement writers. This review does not claim that normal caller admission has a strict in-flight writer reservation either: updates explicitly reserve none.
+
+Claim 5: HOLDS for the exercised memory case.
+The memory variant of the PR's 4-way INSERT/WHERE workload times out at 100 ms. Its follower write completes in 7.777550917 seconds under a 60 s budget, rather than immediately. It lands exactly one target-graph quad; the overdue count drains to zero and the abandoned update contributes no copied quads. This demonstrates waiting followed by completion for this workload, rather than deadlock. It does not promise termination of an evaluation the backend itself cannot finish.
+
+Validation on the unmodified PR head:
+- cargo test --all-features: exit 0, 462 passed, 0 failed, 11 ignored across 52 result groups (including doctests). review-full-suite.log preserves output. This run compiled before the review-only probes were added, and does not include them.
+- cargo test --all-features --test refused_write_releases_writer -- --nocapture: exit 0, 1 passed, 0 failed, 0.25 seconds.
+Review-only validation:
+- cargo test --all-features --lib review_ -- --nocapture: exit 101, 4 passed and the cap reproduction failed as intended; review-probes.log preserves the exact failure.
+- cargo test --all-features --test review_store_86_memory -- --nocapture: exit 0, 1 passed, 8.00 seconds total.
+- PR CI was green when checked: https://github.com/ikigai-rs/ikigai-store/actions/runs/42502124633
+No CI was requested for this intentionally failing reproduction branch. No merge, publication, issue mutation, or public review comment was performed.
+
+Question, not a finding:
+Writer::replace starts the replacement before marking the old worker retired. The timed-out job can finish before replace obtains the writer slot, and the old worker can already be in its next job or recv. The current tests cover a worker that stays blocked until after replacement, not this late-retirement interleaving. I have no reproduction of a lost/reordered write or incorrect reply from this window. A deterministic scheduler/hook test would strengthen the queue-handover evidence. Repeated replacement's effect on the thread-local RocksDB height-generator rationale of #1127 also remains unmeasured here; serialized commits alone do not measure that performance property.
+
+The scratch branch adds only review tests, a cfg(test) module hook, this report, and captured logs on top of the reviewed PR head. Its expected red test is evidence, not a proposed fix.

@@ -1,0 +1,26 @@
+   Compiling ikigai-store v0.4.0 (/Users/agent/work/ikigai-store/item-3282)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.80s
+     Running unittests src/lib.rs (target/debug/deps/ikigai_store-2ea42ab1cebdf971)
+
+running 5 tests
+
+thread 'budget::review_store_86::review_panicking_guard_releases_the_hold' (17641073) panicked at src/review_store_86.rs:147:9:
+review guard unwind
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test budget::review_store_86::review_panicking_guard_releases_the_hold ... ok
+test budget::review_store_86::review_replacement_preserves_queued_jobs_and_replies ... ok
+test budget::review_store_86::review_abandonment_and_commit_are_mutually_exclusive ... ok
+test budget::review_store_86::review_takeover_and_stale_guard_drop_do_not_release_the_new_holder ... ok
+
+thread 'budget::review_store_86::review_host_refused_writes_are_bounded_by_the_overdue_cap' (17641072) panicked at src/review_store_86.rs:47:5:
+cap=1 but 3 separate writer threads are pinned; overdue=3; answers=[Err(Timeout("Narrow the query — fewer joins, a bound subject, a LIMIT — or ask the host for a larger budget. This SPARQL update ran past its time budget of 100 ms and was stopped. Nothing was written. The budget is set by the host, and a request's `budget=` can only lower it.")), Err(Timeout("Narrow the query — fewer joins, a bound subject, a LIMIT — or ask the host for a larger budget. This SPARQL update ran past its time budget of 100 ms and was stopped. Nothing was written. The budget is set by the host, and a request's `budget=` can only lower it.")), Err(Timeout("Narrow the query — fewer joins, a bound subject, a LIMIT — or ask the host for a larger budget. This SPARQL update ran past its time budget of 100 ms and was stopped. Nothing was written. The budget is set by the host, and a request's `budget=` can only lower it."))]
+test budget::review_store_86::review_host_refused_writes_are_bounded_by_the_overdue_cap ... FAILED
+
+failures:
+
+failures:
+    budget::review_store_86::review_host_refused_writes_are_bounded_by_the_overdue_cap
+
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 120 filtered out; finished in 0.54s
+
+error: test failed, to rerun pass `--lib`

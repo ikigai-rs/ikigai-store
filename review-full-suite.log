@@ -1,0 +1,931 @@
+    Updating crates.io index
+     Locking 156 packages to highest compatible versions
+      Adding oxiri v0.2.11 (available: v0.3.1)
+      Adding toml v0.8.23 (available: v1.2.1+spec-1.1.0)
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.27
+   Compiling libc v0.2.191
+   Compiling cfg-if v1.0.5
+   Compiling typenum v1.20.1
+   Compiling memchr v2.8.3
+   Compiling getrandom v0.3.4
+   Compiling zerocopy v0.8.63
+   Compiling const-oid v0.10.2
+   Compiling stable_deref_trait v1.2.1
+   Compiling thiserror v2.0.21
+   Compiling oxiri v0.2.11
+   Compiling shlex v2.0.1
+   Compiling oxilangtag v0.1.6
+   Compiling hex v0.4.3
+   Compiling find-msvc-tools v0.1.15
+   Compiling serde_core v1.0.229
+   Compiling serde v1.0.229
+   Compiling glob v0.3.4
+   Compiling writeable v0.6.4
+   Compiling utf_types v1.0.0
+   Compiling litemap v0.8.3
+   Compiling itoa v1.0.18
+   Compiling futures-sink v0.3.34
+   Compiling smallvec v1.16.5
+   Compiling futures-core v0.3.34
+   Compiling prettyplease v0.3.0
+   Compiling icu_normalizer_data v2.4.0
+   Compiling utf8_iter v1.1.0
+   Compiling icu_properties_data v2.4.0
+   Compiling quick-xml v0.37.5
+   Compiling futures-channel v0.3.34
+   Compiling clang-sys v1.9.1
+   Compiling slab v0.4.12
+   Compiling bytes v1.12.1
+   Compiling regex-syntax v0.8.11
+   Compiling pin-project-lite v0.2.17
+   Compiling futures-io v0.3.34
+   Compiling json-event-parser v0.2.3
+   Compiling futures-task v0.3.34
+   Compiling zmij v1.0.23
+   Compiling minimal-lexical v0.2.1
+   Compiling hybrid-array v0.4.15
+   Compiling libloading v0.8.9
+   Compiling bindgen v0.73.2
+   Compiling peg-runtime v0.8.6
+   Compiling serde_json v1.0.154
+   Compiling rustc-hash v2.1.3
+   Compiling arrayvec v0.7.8
+   Compiling ryu-js v1.0.3
+   Compiling log v0.4.35
+   Compiling constant_time_eq v0.4.2
+   Compiling nom v7.1.3
+   Compiling bitflags v2.13.2
+   Compiling aho-corasick v1.1.5
+   Compiling percent-encoding v2.3.2
+   Compiling parking_lot_core v0.9.12
+   Compiling httparse v1.10.1
+   Compiling crossbeam-utils v0.8.23
+   Compiling form_urlencoded v1.2.2
+   Compiling crypto-common v0.2.2
+   Compiling block-buffer v0.12.1
+   Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.3
+   Compiling scopeguard v1.2.0
+   Compiling http v1.5.0
+   Compiling syn v3.0.9
+   Compiling hashbrown v0.14.5
+   Compiling peg-macros v0.8.6
+   Compiling lock_api v0.4.14
+   Compiling once_cell v1.21.4
+   Compiling winnow v0.7.15
+   Compiling cpufeatures v0.3.1
+   Compiling jobserver v0.1.35
+   Compiling regex-automata v0.4.18
+   Compiling rand_core v0.9.5
+   Compiling indexmap v2.14.2
+   Compiling digest v0.11.3
+   Compiling cc v1.11.1
+   Compiling sha2 v0.11.1
+   Compiling sha1 v0.11.0
+   Compiling md-5 v0.11.0
+   Compiling cexpr v0.6.0
+   Compiling toml_write v0.1.2
+   Compiling siphasher v1.0.4
+   Compiling dashmap v6.2.1
+   Compiling peg v0.8.6
+   Compiling regex v1.13.1
+   Compiling blake3 v1.8.7
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling synstructure v0.14.0
+   Compiling rand v0.9.5
+   Compiling thiserror-impl v2.0.21
+   Compiling zerovec-derive v0.11.7
+   Compiling displaydoc v0.2.7
+   Compiling serde_derive v1.0.229
+   Compiling futures-macro v0.3.34
+   Compiling async-trait v0.1.92
+   Compiling zerofrom-derive v0.1.8
+   Compiling yoke-derive v0.8.4
+   Compiling futures-util v0.3.34
+   Compiling zerofrom v0.1.8
+   Compiling yoke v0.8.4
+   Compiling oxsdatatypes v0.2.4
+   Compiling zerovec v0.11.9
+   Compiling zerotrie v0.2.5
+   Compiling oxrdf v0.3.5
+   Compiling tinystr v0.8.5
+   Compiling potential_utf v0.1.6
+   Compiling oxttl v0.2.5
+   Compiling oxrdfxml v0.2.5
+   Compiling oxjsonld v0.2.7
+   Compiling spargebra v0.4.8
+   Compiling sparesults v0.3.5
+   Compiling icu_collections v2.4.0
+   Compiling icu_locale_core v2.4.0
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling toml_edit v0.22.27
+   Compiling ikigai-core v0.3.1
+   Compiling futures-executor v0.3.34
+   Compiling oxrdfio v0.2.7
+   Compiling futures v0.3.34
+   Compiling icu_provider v2.4.0
+   Compiling icu_properties v2.4.0
+   Compiling icu_normalizer v2.4.0
+   Compiling oxrocksdb-sys v0.5.13
+   Compiling sparopt v0.3.9
+   Compiling idna_adapter v1.2.2
+   Compiling toml v0.8.23
+   Compiling spareval v0.2.9
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling oxhttp v0.3.3
+   Compiling ikigai-rdf v0.5.0
+   Compiling ikigai-vocab v0.3.1
+   Compiling ikigai-conformance v0.14.0
+   Compiling oxigraph v0.5.13
+   Compiling ikigai-store v0.4.0 (/Users/agent/work/ikigai-store/item-3282)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 52.61s
+     Running unittests src/lib.rs (target/debug/deps/ikigai_store-2ea42ab1cebdf971)
+
+running 120 tests
+test budget::tests::a_ceiling_below_the_base_lowers_the_base ... ok
+test budget::tests::an_answer_inside_the_budget_is_returned ... ok
+test budget::tests::answer_grants_are_monotone_and_clamped ... ok
+test budget::tests::grants_raise_the_budget_and_nothing_lowers_it ... ok
+test budget::tests::an_update_needing_more_stack_moves_the_writer_to_a_larger_thread ... ok
+test budget::tests::every_write_on_a_store_runs_on_one_thread ... ok
+test budget::tests::the_shared_constants_and_wording_are_the_contracts ... ok
+test budget::tests::a_panic_in_the_work_reaches_the_caller ... ok
+test budget::tests::a_caller_is_its_principal_and_every_principal_less_capability_is_one ... ok
+test budget::tests::a_panic_in_a_write_reaches_its_caller_and_the_writer_lives_on ... ok
+test config::tests::an_unreadable_layer_is_loud_and_names_the_file ... ok
+test budget::tests::a_join_counts_its_patterns_its_path_steps_and_its_nested_groups ... ok
+test config::tests::only_store_toml_layers_are_read ... ok
+test config::tests::a_misspelled_key_is_loud ... ok
+test config::tests::an_empty_path_is_refused_rather_than_resolved ... ok
+test config::tests::the_app_layer_overrides_the_shared_one ... ok
+test config::tests::an_absolute_path_is_taken_as_written_and_a_relative_one_is_rooted_at_the_data_home ... ok
+test config::tests::the_first_broken_layer_is_the_one_reported ... ok
+test config::tests::with_no_config_file_the_store_sits_under_the_data_home ... ok
+test budget::tests::wrappers_that_survive_normalization_are_not_over_refused_within_the_bound ... ok
+test depth::tests::a_format_the_scan_cannot_read_is_refused ... ok
+test depth::tests::a_stored_term_is_measured_at_and_past_the_bound ... ok
+test depth::tests::brackets_in_strings_iris_comments_and_escapes_are_not_nesting ... ok
+test depth::tests::bytes_that_are_not_utf8_pass_the_turtle_scan_and_deep_ones_are_still_counted ... ok
+test budget::tests::the_algebra_bounds_admit_at_the_bound_and_refuse_one_past_it_by_name ... ok
+test depth::tests::every_constructor_spelling_is_detected ... ok
+test depth::tests::closed_triple_terms_do_not_accumulate ... ok
+test depth::tests::plain_updates_are_not_gated_in ... ok
+test depth::tests::nesting_after_a_string_or_iri_is_still_counted ... ok
+test depth::tests::rdfxml_markup_that_quick_xml_skips_hides_nothing_it_reads ... ok
+test depth::tests::rdfxml_utf16_passes_the_scan_but_fails_to_load ... ok
+test depth::tests::the_bound_is_the_number_the_integration_tests_restate ... ok
+test depth::tests::the_refusal_names_the_argument_and_the_bound ... ok
+test depth::tests::triple_terms_are_refused_one_past_the_bound_and_pass_at_it_in_every_mode ... ok
+test depth::tests::rdfxml_counts_parse_type_triple_elements ... ok
+test endpoints::stream_tests::a_storage_error_after_a_chunk_is_an_error_item ... ok
+test endpoints::stream_tests::a_stream_past_its_deadline_fails_before_reading ... ok
+test endpoints::stream_tests::direct_invoke_keeps_its_bytes_and_invalid_argument_contract ... ok
+test endpoints::stream_tests::dump_refusals_put_the_action_first_without_internal_references ... ok
+test endpoints::stream_tests::streamed_bounds_fail_after_the_prefix_and_then_end ... ok
+test endpoints::stream_tests::streaming_reads_only_the_quads_polled_and_drop_stops_it ... ok
+test limits::tests::a_less_than_reading_is_followed_where_an_expression_can_be ... ok
+test limits::tests::a_run_of_not_nests_and_not_equal_does_not ... ok
+test limits::tests::a_triple_term_closes_only_on_its_own_token ... ok
+test limits::tests::a_triple_term_template_nests_to_the_rdf_bound_and_the_refusal_names_it ... ok
+test limits::tests::brackets_of_every_kind_count_and_close_only_what_they_match ... ok
+test limits::tests::strings_iris_and_comments_hide_brackets ... ok
+test limits::tests::the_bound_is_the_number_the_integration_tests_restate ... ok
+test limits::tests::the_bounds_refuse_by_name_and_admit_at_the_bound ... ok
+test limits::tests::triple_terms_and_brackets_are_counted_apart ... ok
+test limits::tests::triple_terms_nest_and_the_unescaped_reading_is_scanned_too ... ok
+test budget::tests::constants_in_values_and_in_lists_cost_nothing ... ok
+test scope::tests::a_bare_describe_reads_only_the_default_graph ... ok
+test scope::tests::a_comma_does_not_separate_graphs ... ok
+test scope::tests::a_dataset_clause_is_detected_exactly ... ok
+test scope::tests::a_bare_pattern_reads_the_permitted_graph_and_only_it ... ok
+test scope::tests::a_graph_block_naming_another_tenant_matches_nothing ... ok
+test scope::tests::a_graph_set_parses_to_one_sorted_deduplicated_set ... ok
+test scope::tests::a_from_clause_cannot_widen_the_confinement ... ok
+test scope::tests::a_property_path_cannot_walk_out_of_the_scope ... ok
+test scope::tests::a_join_across_the_set_answers_through_the_merged_default_graph_and_by_name ... ok
+test scope::tests::a_service_clause_is_refused_by_the_evaluator_this_crate_builds ... ok
+test scope::tests::a_property_path_crosses_members_of_the_set_and_cannot_walk_out_of_it ... ok
+test scope::tests::a_service_clause_is_refused_over_a_set_too ... ok
+test scope::tests::a_unicode_space_inside_an_iri_does_not_separate_graphs ... ok
+test scope::tests::a_triple_in_two_members_matches_once_per_member_in_the_default_graph ... ok
+test budget::tests::a_wrapper_the_planner_can_erase_does_not_reset_the_join_count ... ok
+test scope::tests::an_empty_graph_list_is_refused_not_read_as_no_graphs ... ok
+test scope::tests::a_variable_graph_binds_only_members_of_the_set ... ok
+test scope::tests::a_variable_graph_enumerates_only_the_permitted_set ... ok
+test scope::tests::construct_is_confined_and_still_answers ... ok
+test scope::tests::enumerating_graph_names_is_confined_as_well ... ok
+test scope::tests::one_bad_member_refuses_the_whole_set_and_names_it ... ok
+test scope::tests::nested_reads_of_another_graph_are_confined ... ok
+test service::tests::the_consumer_update_form_reads_the_same_where_and_passes_load ... ok
+test service::tests::the_evaluator_refuses_every_service_itself ... ok
+test service::tests::the_store_refusal_is_unchanged_and_the_consumer_one_drops_its_remedy ... ok
+test scope::tests::nothing_reaches_a_graph_outside_the_set ... ok
+test service::tests::every_evaluator_in_this_crate_is_built_by_evaluator ... ok
+test service::tests::the_walk_does_not_refuse_what_is_not_a_service ... ok
+test service::tests::the_walk_reads_an_update_s_where ... ok
+test sparql::tests::a_backslash_is_escaped_before_a_quote_can_hide_behind_it ... ok
+test sparql::tests::a_bare_json_string_is_a_plain_literal ... ok
+test sparql::tests::an_injected_literal_cannot_escape_its_quotes ... ok
+test sparql::tests::an_iri_with_a_closing_bracket_is_refused_not_mangled ... ok
+test sparql::tests::bindings_json_round_trips_through_parse_bindings ... ok
+test sparql::tests::json_scalars_become_typed_literals ... ok
+test sparql::tests::oxigraph_escapes_control_characters_for_us ... ok
+test sparql::tests::a_quoted_triple_is_refused_and_never_coerced_into_a_literal - should panic ... ok
+test sparql::tests::scalars_carry_their_datatypes ... ok
+test sparql::tests::the_results_json_term_shapes_round_trip ... ok
+test sparql::tests::unbindable_values_are_refused_with_the_reason ... ok
+test store::tests::a_declaration_is_exact_and_names_nothing_it_was_not_given ... ok
+test store::tests::a_panic_in_a_shared_write_reaches_its_caller_and_the_writer_lives_on ... ok
+test store::tests::a_record_commits_whole_or_not_at_all ... ok
+test store::tests::a_write_from_inside_a_write_is_refused_not_deadlocked ... ok
+test store::tests::an_owned_in_memory_store_is_the_sole_writer ... ok
+test store::tests::handing_out_the_handle_forfeits_coverage_at_construction ... ok
+test store::tests::only_a_shared_store_hands_out_a_writer ... ok
+test store::tests::the_coverage_table_holds_on_all_three_modes ... ok
+test service::tests::the_walk_finds_service_in_every_position ... ok
+test store::tests::the_deprecated_spelling_delegates_exactly ... ok
+test store::tests::the_fingerprint_moves_when_a_reserved_graph_changes ... ok
+test store::tests::the_lock_matcher_knows_both_spellings ... ok
+test store::tests::a_shared_write_commits_on_the_stores_one_writer_thread_whatever_thread_asks ... ok
+test confine::tests::an_append_copies_its_footprint_and_not_the_graph ... ok
+test confine::tests::a_values_block_names_the_quads_its_group_can_match ... ok
+test budget::tests::an_update_counts_every_where_clause_toward_one_total ... ok
+test confine::tests::the_footprint_computes_what_the_whole_graph_computes ... ok
+test budget::tests::work_that_cannot_be_stopped_is_counted_and_caps_new_work ... ok
+test budget::tests::a_commit_after_the_caller_gave_up_does_not_happen ... ok
+test budget::tests::a_read_that_waits_past_its_budget_for_a_slot_is_refused ... ok
+test budget::tests::an_overdue_update_counts_against_its_caller_but_never_refuses_the_hosts_read ... ok
+test budget::tests::a_queued_write_whose_caller_gave_up_is_not_run ... ok
+test budget::tests::past_the_budget_the_caller_is_answered_with_a_timeout_and_the_work_is_told_to_stop ... ok
+test budget::tests::reads_in_flight_never_exceed_the_cap_and_the_rest_wait ... ok
+test confine::tests::an_update_over_its_footprint_computes_what_it_computes_over_the_graph ... ok
+test budget::tests::the_public_measure_agrees_with_the_check_at_both_bounds ... ok
+test confine::tests::a_listed_set_copies_its_own_quads_at_any_size ... ok
+test endpoints::stream_tests::a_large_generated_dump_never_holds_the_complete_answer ... ok
+
+test result: ok. 120 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.42s
+
+     Running tests/answer_size.rs (target/debug/deps/answer_size-1c8d6b3e11f40a9a)
+
+running 9 tests
+test a_budget_that_is_not_inline_is_refused_not_ignored ... ok
+test a_max_rows_or_max_bytes_that_is_not_a_positive_inline_number_is_refused ... ok
+test ask_is_exempt ... ok
+test the_byte_bound_is_exact ... ok
+test the_row_bound_is_exact_on_every_door_and_every_serialization ... ok
+test grants_raise_the_bound_and_a_request_only_lowers_it ... ok
+test a_cross_product_past_the_base_row_bound_is_refused_not_answered ... ok
+test an_answer_past_the_base_byte_bound_is_refused_not_answered ... ok
+test the_cross_product_is_refused_by_size_before_time ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.97s
+
+     Running tests/answer_size_measure.rs (target/debug/deps/answer_size_measure-a480bedcf9c2adfe)
+
+running 2 tests
+test measure_backup ... ignored
+test measure_cross_product ... ignored
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bindings.rs (target/debug/deps/bindings-c34fe49146053ad4)
+
+running 10 tests
+test a_malformed_bindings_argument_is_refused_by_name ... ok
+test the_write_doors_refuse_bindings_and_say_what_to_use_instead ... ok
+test an_unprojected_binding_is_refused_with_the_fix ... ok
+test a_binding_the_query_never_mentions_is_refused_not_ignored ... ok
+test an_iri_binds_in_the_subject_position ... ok
+test a_bare_json_string_binds_as_a_plain_literal ... ok
+test a_query_without_bindings_is_unchanged ... ok
+test a_hostile_binding_is_matched_as_data_not_executed_as_syntax ... ok
+test the_other_query_forms_bind_any_variable_in_the_pattern ... ok
+test a_binding_for_a_variable_only_inside_exists_or_minus_gets_the_one_working_fix ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/conformance.rs (target/debug/deps/conformance-48e461abc29fbd4e)
+
+running 3 tests
+test a_shared_store_conforms_as_a_live_one ... ok
+test a_declared_shared_store_conforms_as_cacheable_exactly_where_it_promised ... ok
+test conforms ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/consumer_threads.rs (target/debug/deps/consumer_threads-c1c603cfda036336)
+
+running 1 test
+test a_store_write_invalidates_a_consumer_that_declares_no_thread_of_its_own ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/dataset_directory.rs (target/debug/deps/dataset_directory-97cc885b71e0262c)
+
+running 2 tests
+test a_directory_that_cannot_be_created_is_refused_naming_the_path ... ok
+test a_missing_nested_directory_is_created_and_opened_as_the_dataset ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/dump.rs (target/debug/deps/dump-23fd77e230360706)
+
+running 11 tests
+test only_the_broad_read_grant_dumps ... ok
+test a_dataset_past_the_bound_is_refused_not_truncated ... ok
+test the_dump_is_n_quads_with_every_graph_and_the_default_graph ... ok
+test the_memory_body_stays_collected_sorted_and_equal_to_the_bytes_answer ... ok
+test the_dump_is_sorted_and_round_trips_through_load ... ok
+test a_dump_is_never_cacheable_though_the_stores_other_reads_are ... ok
+test durable::durable_body_bounds_and_the_collecting_byte_pool_refuse ... ok
+test durable::a_durable_dump_is_the_stores_key_order_written_as_read ... ok
+test durable::a_durable_body_dump_is_one_shot_and_matches_the_bytes_answer ... ok
+test durable::the_durable_body_keeps_the_snapshot_taken_before_its_first_poll ... ok
+test durable::a_durable_dump_does_not_depend_on_history_and_round_trips ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/endpoints.rs (target/debug/deps/endpoints-cddf3bb8b0f71ab7)
+
+running 10 tests
+test a_caller_without_the_scope_is_denied_in_both_directions ... ok
+test info_reports_the_backing_and_whether_coverage_holds ... ok
+test malformed_input_names_the_argument_that_was_wrong ... ok
+test an_update_through_the_kernel_changes_what_a_query_sees ... ok
+test a_document_loaded_through_the_kernel_is_queryable ... ok
+test load_honours_the_graph_argument_and_refuses_a_non_iri ... ok
+test a_shared_store_never_caches_so_a_raw_handle_write_is_still_visible ... ok
+test a_query_of_the_wrong_form_is_refused_by_the_iri_it_was_sent_to ... ok
+test an_as_the_query_form_cannot_answer_in_is_refused ... ok
+test a_covered_read_caches_and_both_writing_iris_cut_it ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/form_families.rs (target/debug/deps/form_families-43ebae2b5e33d33a)
+
+running 1 test
+test a_query_iri_answers_its_family_and_refuses_the_other ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/graph_existence_oracle.rs (target/debug/deps/graph_existence_oracle-0e6ff41f8e875d4e)
+
+running 9 tests
+test the_broad_reader_keeps_the_standard_error ... ok
+test the_whole_dataset_operations_are_unchanged ... ok
+test another_graph_named_through_the_scoped_door_is_refused_whatever_it_holds ... ok
+test create_graph_tells_a_write_only_caller_nothing_about_the_graph ... ok
+test a_caller_who_may_read_the_graph_keeps_the_standard_error ... ok
+test clear_graph_tells_a_write_only_caller_nothing_about_the_graph ... ok
+test drop_graph_tells_a_write_only_caller_nothing_about_the_graph ... ok
+test a_graph_operation_inside_a_longer_update_is_uniform_too ... ok
+test the_broad_door_tells_a_write_only_caller_nothing_either ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/graph_info.rs (target/debug/deps/graph_info-4803598fcccb44c0)
+
+running 5 tests
+test only_the_grant_for_that_graph_reads_its_size ... ok
+test a_graph_that_is_not_an_iri_is_refused_by_name ... ok
+test a_graph_that_does_not_exist_is_said_to_be_absent ... ok
+test a_tenant_counts_its_own_graph_and_nothing_else ... ok
+test a_write_is_counted ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/graph_name_enumeration.rs (target/debug/deps/graph_name_enumeration-dba97dec177594b0)
+
+running 1 test
+test a_scoped_read_cannot_enumerate_another_tenants_graph_names ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/graph_outside_set.rs (target/debug/deps/graph_outside_set-aa96198a428127f1)
+
+running 5 tests
+test every_outside_graph_is_named_once ... ok
+test all_four_scoped_forms_refuse_it ... ok
+test the_broad_door_is_untouched ... ok
+test in_set_and_variable_graphs_still_answer ... ok
+test a_constant_graph_outside_the_set_is_refused_wherever_it_appears ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/graph_scope.rs (target/debug/deps/graph_scope-e183beb81a115a8b)
+
+running 13 tests
+test a_graph_that_is_not_an_iri_is_refused_by_name ... ok
+test no_grants_at_all_opens_neither_door ... ok
+test the_refusal_names_the_graph_and_never_the_statement ... ok
+test a_graph_grant_is_refused_for_another_graph ... ok
+test a_scoped_update_cannot_read_another_graph ... ok
+test a_graph_grant_writes_its_own_graph ... ok
+test several_graph_grants_are_held_and_used_independently ... ok
+test a_graph_grant_deletes_and_inserts_atomically_in_its_own_graph ... ok
+test a_scoped_write_invalidates_a_cached_read ... ok
+test neither_write_scope_stands_in_for_the_other ... ok
+test a_variable_graph_and_drop_all_are_confined_rather_than_refused ... ok
+test an_update_that_reaches_outside_the_graph_is_refused_in_full ... ok
+test a_narrow_footprint_reads_and_writes_nothing_outside_the_graph ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/graphs.rs (target/debug/deps/graphs-703773fe47371196)
+
+running 18 tests
+test only_source_is_answered ... ok
+test a_write_only_capability_is_denied_rather_than_told_it_may_read_nothing ... ok
+test the_default_graph_is_never_listed ... ok
+test a_grant_for_a_graph_that_does_not_exist_lists_nothing ... ok
+test a_shared_store_forfeits_the_listing_the_way_it_forfeits_every_broad_read ... ok
+test a_capability_holding_nothing_is_denied ... ok
+test a_tenant_is_never_told_another_tenants_graph_exists ... ok
+test the_cache_does_not_serve_one_capabilitys_listing_to_another ... ok
+test a_tenant_sees_the_graphs_its_own_grants_name ... ok
+test both_halves_of_the_read_family_satisfy_the_declared_scope ... ok
+test a_declaration_makes_a_tenants_listing_cacheable_and_leaves_roots_live ... ok
+test the_two_paths_produce_the_same_shape ... ok
+test a_candidate_the_sharer_may_write_forfeits_the_whole_tenant_listing ... ok
+test a_broad_reader_gets_exactly_what_root_gets ... ok
+test root_lists_every_named_graph ... ok
+test a_held_family_wildcard_enumerates_nothing ... ok
+test a_graph_appears_as_soon_as_something_is_written_to_it ... ok
+test a_listing_is_cached_and_a_write_that_creates_a_graph_cuts_it ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/handle_model.rs (target/debug/deps/handle_model-69afc39e177b44ba)
+
+running 4 tests
+test m1_open_cost_by_population ... ignored, benchmark: writes 1M quads; run explicitly in release
+test a_read_only_opener_is_a_frozen_snapshot ... ok
+test a_second_open_in_the_same_process_is_refused_and_the_refusal_is_legible ... ok
+test what_was_written_survives_the_handle ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/join_graph_blocks.rs (target/debug/deps/join_graph_blocks-389dd4302bd178ea)
+
+running 6 tests
+test an_updates_where_is_counted_the_same_way ... ok
+test the_bound_is_the_flattened_total ... ok
+test through_the_door_the_query_is_refused_before_planning ... ok
+test union_optional_and_minus_branches_stay_separate_joins ... ok
+test graph_blocks_count_toward_the_enclosing_join ... ok
+test one_tenants_update_does_not_block_another_tenants_write ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/join_normalized_wrappers.rs (target/debug/deps/join_normalized_wrappers-c576e44d86c12b36)
+
+running 3 tests
+test probe_child ... ok
+test erasable_wrappers_count_toward_the_enclosing_join ... ok
+test wrappers_the_planner_erases_are_refused_at_the_doors_before_planning ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+
+     Running tests/load_bounds.rs (target/debug/deps/load_bounds-bad504c2cd19692f)
+
+running 5 tests
+test a_refused_document_does_not_wait_for_the_writer ... ok
+test an_rdf_xml_entity_declaration_is_refused ... ok
+test a_document_over_the_load_bound_is_refused ... ok
+test a_doctype_without_entities_still_loads ... ok
+test a_prefix_that_expands_past_the_bound_is_refused ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/load_contract.rs (target/debug/deps/load_contract-640fb8532194a9e6)
+
+running 2 tests
+test load_refuses_a_format_outside_its_declared_one_of ... ok
+test load_graph_replaces_a_quad_documents_default_graph_and_nothing_else ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/match_time_budget.rs (target/debug/deps/match_time_budget-2903a51907f23050)
+
+running 7 tests
+test after_the_algebra_bounds_still_refuse_before_anything_runs ... ok
+test after_a_legitimate_match_answers_and_a_request_can_only_lower_the_budget ... ok
+test after_a_consumer_is_answered_at_its_budget_and_the_worker_is_counted_until_it_ends ... ok
+test after_at_the_cap_a_new_evaluation_is_refused_at_once_until_one_ends ... ok
+test before_the_bare_evaluator_runs_the_template_to_the_end_whatever_it_costs ... ok
+test a_token_alone_stops_it_late_because_the_cross_product_is_in_memory ... ok
+test the_store_doors_already_bounded_this_template ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.78s
+
+     Running tests/multi_graph_read.rs (target/debug/deps/multi_graph_read-8703866c507513f3)
+
+running 13 tests
+test the_scoped_forms_declare_a_graph_list_under_the_family_wildcard ... ok
+test an_empty_graph_list_is_refused_by_name ... ok
+test every_missing_grant_is_named_not_only_the_first ... ok
+test a_comma_separated_list_is_refused_with_the_separator_named ... ok
+test a_from_clause_is_still_refused_over_a_set ... ok
+test one_missing_grant_refuses_the_read_and_names_the_missing_token ... ok
+test a_held_grant_outside_the_named_set_does_not_widen_it ... ok
+test order_and_repetition_give_the_same_answer ... ok
+test holding_both_grants_joins_across_both_graphs ... ok
+test one_uncovered_graph_makes_the_whole_read_uncached ... ok
+test a_set_reaches_nothing_outside_itself ... ok
+test every_spelling_of_a_set_shares_one_cache_entry ... ok
+test all_four_scoped_forms_read_the_whole_set ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/narrowed_join.rs (target/debug/deps/narrowed_join-94193f062815d648)
+
+running 3 tests
+test an_over_narrowed_by_a_declaring_store_names_the_store ... ok
+test a_later_over_narrowed_by_the_first_names_what_the_join_dropped ... ok
+test a_graph_never_asked_for_is_refused_without_blaming_the_join ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/overdue_cap_in_flight.rs (target/debug/deps/overdue_cap_in_flight-44b52fbeee2075a5)
+
+running 2 tests
+test concurrent_fast_requests_wait_for_a_slot_and_are_answered ... ok
+test concurrent_requests_cannot_overshoot_the_cap ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.02s
+
+     Running tests/overdue_cap_wording.rs (target/debug/deps/overdue_cap_wording-fb2724bb2fa563d5)
+
+running 6 tests
+test at_a_cap_the_host_set_the_refusal_says_so_and_names_the_parallelism ... ok
+test a_read_that_waited_for_a_slot_names_the_cap_and_where_it_came_from_too ... ok
+test consumer_work_names_reach_waited_store_pool_and_share_refusals ... ok
+test at_the_default_cap_the_refusal_says_it_is_the_default_and_names_the_parallelism ... ok
+test consumer_work_names_reach_overdue_store_pool_and_share_refusals ... ok
+test a_consumer_budget_counts_apart_from_every_other_and_states_its_own_cap ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+
+     Running tests/overdue_share.rs (target/debug/deps/overdue_share-a3a52d86f1c1c382)
+
+running 5 tests
+test every_capability_without_a_principal_is_one_caller ... ok
+test a_host_set_share_lets_one_caller_run_that_many ... ok
+test a_full_share_refuses_its_own_caller_and_names_it ... ok
+test one_callers_runaways_do_not_refuse_the_hosts_own_read ... ok
+test the_reserve_is_the_hosts_while_the_callers_pool_is_full ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.87s
+
+     Running tests/post_bulk_read.rs (target/debug/deps/post_bulk_read-f1b287e4ec76a85d)
+
+running 4 tests
+test measure_a_read_after_a_bulk_write ... ignored, a measurement: run with --ignored --nocapture
+test a_read_after_bulk_loads_from_fresh_threads_answers_like_a_read_on_a_fresh_copy ... ok
+test an_in_memory_store_reads_after_a_bulk_write_like_a_fresh_copy ... ok
+test a_read_after_a_bulk_write_answers_like_a_read_on_a_fresh_copy ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.46s
+
+     Running tests/provenance.rs (target/debug/deps/provenance-c10c9e0b6a730dbd)
+
+running 14 tests
+test two_overs_on_a_handle_the_host_opened_share_one_writer ... ok
+test a_joined_writer_on_an_undeclared_store_keeps_the_callers_fence ... ok
+test over_on_an_undeclared_shared_stores_handle_joins_the_stores_writer ... ok
+test a_rewrapped_clone_of_the_handle_carries_no_provenance ... ok
+test over_on_a_declaring_stores_handle_joins_the_stores_writer ... ok
+test a_joined_over_write_from_inside_the_stores_write_is_refused_not_deadlocked ... ok
+test a_nested_write_across_two_overs_on_one_handle_is_refused_not_deadlocked ... ok
+test a_later_over_on_a_host_opened_handle_is_narrowed_to_the_first ... ok
+test over_on_a_standalone_store_or_an_orphaned_handle_makes_its_own_writer ... ok
+test a_host_opened_handle_whose_writers_are_gone_gets_a_fresh_writer ... ok
+test a_joined_writer_keeps_the_stores_promise_and_the_callers_fence ... ok
+test overs_asked_for_at_once_on_one_handle_share_one_writer ... ok
+test a_rewrite_through_a_second_over_cannot_land_inside_the_firsts_read_modify_write ... ok
+test a_rewrite_through_over_cannot_land_inside_a_stores_read_modify_write ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+     Running tests/read_scope.rs (target/debug/deps/read_scope-4863ca7204877e47)
+
+running 18 tests
+test the_declared_scopes_are_distinct ... ok
+test a_graph_that_is_not_an_iri_is_refused_by_name ... ok
+test the_wildcard_token_itself_grants_nothing ... ok
+test no_grants_at_all_opens_neither_read_door ... ok
+test a_graph_grant_is_refused_for_another_graph ... ok
+test a_query_of_the_wrong_form_is_refused_under_the_scoped_iri_too ... ok
+test a_query_naming_its_own_dataset_is_refused ... ok
+test a_write_scope_does_not_imply_a_read_scope_over_the_same_graph ... ok
+test a_graph_grant_reads_its_own_graph ... ok
+test bindings_reach_the_scoped_forms ... ok
+test two_tenants_running_the_same_query_do_not_share_a_cached_answer ... ok
+test a_variable_graph_enumerates_only_the_permitted_graph ... ok
+test several_graph_grants_are_held_and_used_independently ... ok
+test neither_read_scope_stands_in_for_the_other ... ok
+test a_scoped_read_is_invalidated_by_a_write ... ok
+test the_scoped_graph_is_reachable_as_the_default_graph_and_by_name ... ok
+test all_four_scoped_forms_answer_over_the_permitted_graph ... ok
+test a_scoped_read_cannot_reach_another_graph_by_any_shape ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/refused_write_releases_writer.rs (target/debug/deps/refused_write_releases_writer-ba923da38b57e077)
+
+running 1 test
+test a_scoped_write_behind_a_refused_one_is_not_refused ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running tests/scoped_append_cost.rs (target/debug/deps/scoped_append_cost-fb1e66eebf27f7a8)
+
+running 2 tests
+test measure_an_append_as_the_graph_grows ... ignored, a measurement: run with --ignored --nocapture
+test an_append_costs_the_same_at_three_thousand_items_as_at_a_hundred ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/scoped_copy_bound.rs (target/debug/deps/scoped_copy_bound-bb9db7919163c29d)
+
+running 5 tests
+test the_default_bound_is_the_stated_one ... ok
+test an_update_that_names_its_constants_is_not_bounded_by_the_graph ... ok
+test a_whole_graph_update_at_the_bound_is_applied ... ok
+test a_whole_graph_update_past_the_bound_is_refused_and_applies_nothing ... ok
+test a_write_only_caller_is_never_refused_on_the_bound ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/scoped_copy_measure.rs (target/debug/deps/scoped_copy_measure-dd687f2febc35b2a)
+
+running 1 test
+test measure_a_whole_graph_scoped_write ... ignored, a measurement: run with --ignored --nocapture
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/service_egress.rs (target/debug/deps/service_egress-54fd92fa24d98107)
+
+running 6 tests
+test the_refusal_says_where_remote_data_comes_in_instead ... ok
+test load_sends_nothing ... ok
+test a_query_without_service_still_answers ... ok
+test control_raw_oxigraph_with_http_client_reaches_the_stub ... ok
+test service_is_refused_at_every_door_and_nothing_reaches_the_network ... ok
+test from_and_from_named_are_not_dereferenced ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/shared_coverage.rs (target/debug/deps/shared_coverage-78cd0dd361879091)
+
+running 12 tests
+test measure_the_cost_of_sharing ... ignored, benchmark: builds a corpus and times reads; run explicitly
+test the_tripwire_refuses_a_store_that_declared_nothing ... ok
+test the_tripwire_is_silent_on_a_kept_promise_and_names_the_graph_on_a_broken_one ... ok
+test the_tripwire_catches_a_graph_that_appears_and_one_that_vanishes ... ok
+test a_permitted_graph_is_not_in_the_fingerprint ... ok
+test info_names_the_declaration_and_says_nothing_extra_without_one ... ok
+test a_declared_promise_that_is_broken_is_silent_staleness ... ok
+test an_owned_store_is_unaffected ... ok
+test an_undeclared_shared_store_still_caches_nothing_at_all ... ok
+test the_broad_faces_and_info_stay_bare_whatever_was_declared ... ok
+test a_graph_the_sharer_may_write_is_never_cached ... ok
+test a_scoped_read_of_a_reserved_graph_is_cached_and_the_kernel_still_cuts_it ... ok
+
+test result: ok. 11 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/shared_writer.rs (target/debug/deps/shared_writer-33939eca20cf5d8e)
+
+running 11 tests
+test the_raw_write_refusal_names_the_declaration_and_the_way_out ... ok
+test a_raw_write_on_a_declaring_writer_cannot_reach_a_reserved_graph ... ok
+test a_write_from_inside_an_over_write_is_refused_not_deadlocked ... ok
+test a_swallowed_refusal_still_rolls_back ... ok
+test a_remove_from_an_undeclared_graph_is_refused ... ok
+test an_undeclared_writer_refuses_nothing ... ok
+test a_blank_node_graph_is_never_declared_and_extend_stops_at_the_first_refusal ... ok
+test a_write_to_an_undeclared_graph_is_refused_and_rolls_back_the_whole_record ... ok
+test a_declared_write_reaches_the_default_graph_and_every_declared_graph ... ok
+test an_over_writer_commits_on_one_thread_of_its_own_and_keeps_its_declaration ... ok
+test a_load_asked_from_inside_a_shared_write_is_refused_not_deadlocked ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/snapshot_reader.rs (target/debug/deps/snapshot_reader-9b6bb4a028400159)
+
+running 4 tests
+test a_reader_sees_every_graph_and_the_default_graph ... ok
+test each_snapshot_is_consistent_and_the_next_one_sees_later_writes ... ok
+test a_reader_costs_an_owned_store_none_of_its_caching ... ok
+test on_rocksdb_too_a_reader_keeps_the_store_owned_and_reads_a_snapshot ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/sparql_nesting.rs (target/debug/deps/sparql_nesting-64c79e44b883b315)
+
+running 15 tests
+test probe_child ... ok
+test a_less_than_that_hides_a_string_from_an_iri_reading_is_still_counted ... ok
+test the_costliest_bracket_at_the_bound_runs ... ok
+test brackets_in_strings_iris_and_comments_are_not_nesting ... ok
+test the_costliest_bracket_around_triple_terms_both_at_their_bounds_runs ... ok
+test a_query_at_the_bound_parses_and_runs_at_every_door ... ok
+test a_query_past_the_byte_bound_is_refused_by_name ... ok
+test three_thousand_parentheses_are_refused_at_both_update_doors_and_abort_nothing ... ok
+test a_long_flat_chain_runs_on_the_stack_the_query_is_given ... ok
+test a_run_of_not_is_nesting_and_is_refused_at_any_length ... ok
+test three_thousand_parentheses_are_refused_at_every_query_door_and_abort_nothing ... ok
+test a_chain_twenty_times_what_a_worker_stack_holds_is_parsed_then_refused_by_the_algebra_bound ... ok
+test an_arithmetic_chain_at_the_algebra_bound_runs_in_every_build ... ok
+test the_costliest_shapes_per_byte_at_the_byte_bound_abort_nothing ... ok
+test the_load_and_bindings_parsers_do_not_recurse_on_nesting ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.89s
+
+     Running tests/sparql_stack_measure.rs (target/debug/deps/sparql_stack_measure-dc1982dc160797f6)
+
+running 2 tests
+test measure_overflow_depths ... ignored
+test measure_child ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sparql_time_budget.rs (target/debug/deps/sparql_time_budget-613e9e24ccbf8efe)
+
+running 11 tests
+test a_legitimate_query_answers_under_the_budget ... ok
+test the_slow_query_cannot_reach_a_size_bound ... ok
+test the_shapes_oxigraph_plans_too_slowly_are_refused_before_planning ... ok
+test a_shape_oxigraph_cannot_stop_is_counted_and_capped ... ok
+test the_scoped_doors_are_budgeted_too ... ok
+test a_query_that_would_run_for_hours_is_refused_at_the_budget_and_its_core_released ... ok
+test a_construct_is_stopped_between_rows_too ... ok
+test a_request_budget_can_only_tighten ... ok
+test a_budget_grant_raises_the_budget_and_root_gets_the_ceiling ... ok
+test an_update_that_runs_out_of_time_writes_nothing_then_or_later ... ok
+test a_scoped_update_that_runs_out_of_time_writes_nothing_then_or_later ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.12s
+
+     Running tests/sparql_time_measure.rs (target/debug/deps/sparql_time_measure-84faad8e17f6a6b0)
+
+running 3 tests
+test measure_evaluation_time ... ignored
+test measure_legitimate ... ignored
+test time_child ... ok
+
+test result: ok. 1 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/timeout_wording.rs (target/debug/deps/timeout_wording-d1f8c4da99c77b20)
+
+running 4 tests
+test a_consumers_timeout_names_no_budget_argument_by_default ... ok
+test the_doors_name_their_budget_argument ... ok
+test a_consumer_names_its_own_argument ... ok
+test a_validation_timeout_names_the_work_and_its_remedy ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
+     Running tests/triple_term_growth.rs (target/debug/deps/triple_term_growth-e6f68ba09bd98673)
+
+running 6 tests
+test probe_child ... ok
+test a_deep_term_already_stored_is_not_this_updates_doing ... ok
+test a_template_nests_to_the_bound_in_one_request_and_no_further ... ok
+test at_the_bound_an_update_commits_and_one_level_past_applies_nothing ... ok
+test on_rocksdb_the_bound_holds_and_an_old_deep_term_is_passed_over ... ok
+test a_triple_term_grown_across_updates_is_refused_past_the_bound_and_aborts_nothing ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.60s
+
+     Running tests/triple_term_nesting.rs (target/debug/deps/triple_term_nesting-802138c6362939cb)
+
+running 6 tests
+test probe_child ... ok
+test one_past_the_bound_is_refused_in_every_syntax ... ok
+test sparql_load_is_refused_at_both_update_doors ... ok
+test a_document_at_the_bound_loads_in_every_syntax ... ok
+test three_thousand_nested_triple_terms_are_refused_in_every_syntax_and_abort_nothing ... ok
+test fifty_thousand_nested_triple_terms_are_refused_too ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/two_spaces.rs (target/debug/deps/two_spaces-ff4be0177aeab978)
+
+running 5 tests
+test coverage_follows_the_number_of_live_spaces ... ok
+test one_store_with_a_space_per_kernel_is_never_stale ... ok
+test a_space_bound_after_a_cached_read_refuses_rather_than_go_stale_under_it ... ok
+test one_space_shared_by_two_kernels_is_the_hazard_this_crate_cannot_see ... ok
+test a_write_through_one_space_is_seen_by_a_kernel_over_the_other ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/unicode_graph_iri.rs (target/debug/deps/unicode_graph_iri-06ae380e8e938f09)
+
+running 1 test
+test a_graph_iri_containing_a_unicode_space_is_read_as_itself ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/unreadable_arguments.rs (target/debug/deps/unreadable_arguments-2fb11c64ac070752)
+
+running 5 tests
+test a_write_refuses_bindings_in_any_form ... ok
+test an_unreadable_load_format_is_refused_not_defaulted ... ok
+test an_unreadable_bindings_argument_is_refused_not_dropped ... ok
+test an_unreadable_as_is_refused_not_substituted ... ok
+test an_unreadable_load_graph_is_refused_not_loaded_into_the_default_graph ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/update_outside_graph.rs (target/debug/deps/update_outside_graph-2e37e15b98864c64)
+
+running 5 tests
+test a_write_only_caller_is_refused_on_the_read_grant_first ... ok
+test every_outside_graph_is_named_once ... ok
+test the_broad_door_still_reads_another_graph ... ok
+test the_scoped_graph_and_variable_graphs_still_apply ... ok
+test a_constant_graph_outside_the_scope_is_refused_wherever_the_update_reads_it ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/update_read_grant.rs (target/debug/deps/update_read_grant-d7e32625503858de)
+
+running 9 tests
+test a_write_only_grant_cannot_read_the_graph_through_the_refusal ... ok
+test an_escape_refusal_names_graphs_and_never_data ... ok
+test a_write_only_grant_has_no_boolean_oracle_over_the_graph ... ok
+test load_counts_a_repeated_statement_once ... ok
+test load_reports_counts_only_to_a_reader ... ok
+test a_write_only_grant_learns_nothing_from_the_success_line ... ok
+test the_broad_read_grant_also_satisfies_the_read_half ... ok
+test the_broad_door_needs_the_broad_read_grant_for_a_where ... ok
+test the_read_grant_rule_classifies_every_operation ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/write_cost.rs (target/debug/deps/write_cost-77230f24192e9cd6)
+
+running 3 tests
+test measure_a_small_write_as_the_store_grows ... ignored, a measurement: run with --ignored --nocapture
+test a_small_load_costs_the_same_in_a_large_store ... ok
+test a_small_update_costs_the_same_in_a_large_store ... ok
+
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.05s
+
+   Doc-tests ikigai_store
+
+running 44 tests
+test src/budget.rs - budget::cap_answer (line 2252) ... ok
+test src/budget.rs - budget::cap_answer_bytes (line 2262) ... ok
+test src/endpoints.rs - endpoints::cap_read_graph (line 228) ... ok
+test src/budget.rs - budget::effective_budget (line 254) ... ok
+test src/budget.rs - budget::effective_answer (line 2063) ... ok
+test src/lib.rs - (line 46) - compile ... ok
+test src/depth.rs - depth::nests_deeper_than_the_bound (line 123) ... ok
+test src/budget.rs - budget::cap_budget (line 201) ... ok
+test src/budget.rs - budget::TimeBudget::with_caller_share (line 607) ... ok
+test src/budget.rs - budget::AnswerBound (line 1990) ... ok
+test src/budget.rs - budget::AlgebraCost (line 2392) ... ok
+test src/budget.rs - budget::CappedWriter (line 2176) ... ok
+test src/budget.rs - budget::TimeBudget::for_capability (line 664) ... ok
+test src/budget.rs - budget::too_large (line 2145) ... ok
+test src/budget.rs - budget::TimeBudget::with_reserve (line 580) ... ok
+test src/depth.rs - depth::check_rdf_nesting (line 62) ... ok
+test src/budget.rs - budget::AnswerBudget::for_capability (line 2324) ... ok
+test src/budget.rs - budget::EvaluationBudget (line 736) ... ok
+test src/store.rs - store::DurableStore::open_shared_declaring (line 394) - compile ... ok
+test src/endpoints.rs - endpoints::cap_write_graph (line 211) ... ok
+test src/budget.rs - budget::EvaluationBudget::with_argument (line 817) ... ok
+test src/limits.rs - limits::check_sparql (line 260) ... ok
+test src/limits.rs - limits::sparql_stack_size (line 221) ... ok
+test src/limits.rs - limits::on_sparql_stack (line 362) ... ok
+test src/service.rs - service::has_service (line 187) ... ok
+test src/service.rs - service (line 59) ... ok
+test src/sparql.rs - sparql (line 35) ... ok
+test src/sparql.rs - sparql::literal (line 65) ... ok
+test src/sparql.rs - sparql::lang_literal (line 126) ... ok
+test src/store.rs - store::DurableStore::with_answer_budget (line 776) ... ok
+test src/sparql.rs - sparql::iri (line 148) ... ok
+test src/sparql.rs - sparql::typed_literal (line 78) ... ok
+test src/service.rs - service::refuse_service_with (line 223) ... ok
+test src/sparql.rs - sparql::typed_literal (line 94) ... ok
+test src/store.rs - store::DurableStore::with_max_scoped_copy_quads (line 834) ... ok
+test src/store.rs - store::SnapshotReader (line 1039) - compile fail ... ok
+test src/store.rs - store::DurableStore::with_max_load_bytes (line 802) ... ok
+test src/store.rs - store::DurableStore::with_time_budget (line 750) ... ok
+test src/sparql.rs - sparql::bindings_json (line 205) ... ok
+test src/store.rs - store::DurableStore::reserved_graphs_fingerprint (line 651) ... ok
+test src/store.rs - store::SnapshotReader (line 1026) ... ok
+test src/store.rs - store::SharedWriter::over (line 1334) ... ok
+test src/store.rs - store::SharedWriter (line 1197) ... ok
+test src/store.rs - store::SharerWrites (line 99) ... ok
+
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.64s
+
