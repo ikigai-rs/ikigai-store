@@ -1816,12 +1816,8 @@ impl Endpoint for UpdateEndpoint {
                 let store = Arc::clone(&self.store);
                 let text = update.to_string();
                 let requested = crate::budget::inline_bound(inv, "budget")?;
-                let (before, after) = self.store.evaluate(
-                    update,
-                    true,
-                    inv.capability,
-                    requested,
-                    move |deadline| {
+                self.store
+                    .evaluate(update, true, inv.capability, requested, move |deadline| {
                         // ★ A graph-management operation is an existence oracle for a
                         // caller who may not read (ledger #761): silenced. `src/confine.rs`.
                         let unreadable = if may_read {
@@ -1841,7 +1837,6 @@ impl Endpoint for UpdateEndpoint {
                             )));
                         }
                         let _writes = store.write_lock();
-                        let before = count(&store)?;
                         // ★ On a transaction this crate commits, not `on_store(…).execute()`,
                         // which commits inside oxigraph: the commit has to be the deadline's.
                         let mut transaction = store.dataset().start_transaction().map_err(|e| {
@@ -1869,15 +1864,13 @@ impl Endpoint for UpdateEndpoint {
                                 .commit()
                                 .map_err(|e| Error::Endpoint(format!("update: committing: {e}")))
                         })?;
-                        Ok((before, count(&store)?))
-                    },
-                )?;
-                // The counts are a read of the dataset, so only for a caller that may read.
-                Ok(plain(if may_read {
-                    format!("updated: {before} -> {after} quads\n")
-                } else {
-                    "updated\n".to_string()
-                }))
+                        Ok(())
+                    })?;
+                // ⚠ No quad counts (ledger #3270): oxigraph keeps no size, so counting the
+                // dataset before and after scanned all of it twice under the write lock, and a
+                // one-triple update cost 1.4 s at 10M quads and was refused at 1B. oxigraph
+                // reports nothing of what an update changed; `urn:iki:store:info` counts.
+                Ok(plain("updated\n".to_string()))
             }
             other => Err(unsupported("store-update", other)),
         }
@@ -1894,7 +1887,7 @@ impl Endpoint for UpdateEndpoint {
                 "Apply a SPARQL 1.1 UPDATE to the store. An update with a `WHERE` clause \
                  (including `DELETE WHERE`, `WITH`, `COPY`, `MOVE`, `ADD`) reads the \
                  dataset and also needs `urn:cap:store:read`, refused on the grant before \
-                 evaluation; a caller without it is not told the quad counts, and its \
+                 evaluation; a caller without it has its \
                  `DROP`, `CLEAR` and `CREATE` of a graph run as `SILENT`, so they do not say \
                  whether the graph exists. `LOAD` is refused: load a document through \
                  `urn:iki:store:load`. Cuts the \
@@ -1912,13 +1905,6 @@ impl Endpoint for UpdateEndpoint {
             .input(budget_arg())
             .output("text/plain")
     }
-}
-
-fn count(store: &DurableStore) -> Result<usize> {
-    store
-        .dataset()
-        .len()
-        .map_err(|e| Error::Endpoint(format!("counting quads: {e}")))
 }
 
 // --------------------------------------------------------------- graph-scoped update
@@ -2160,21 +2146,40 @@ impl Endpoint for LoadEndpoint {
                 // statements are not kept from the first).
                 let document = bytes.to_vec();
                 let label = media.to_string();
-                let (before, after) = self.store.on_writer(move |store| {
-                    let before = count(store)?;
-                    store
-                        .dataset()
-                        .load_from_reader(parser, document.as_slice())
-                        .map_err(|e| Error::InvalidArgument {
+                //
+                // ★ What the document added, not the store's size before and after (ledger
+                // #3270): oxigraph keeps no size, so those were two scans of the whole dataset
+                // under the write lock, and loading in pieces was quadratic in the store
+                // (1,980 s for 100M quads). `Store::load_from_reader`'s own loop, with a point
+                // lookup per statement, and only for a caller that may read: whether a quad
+                // was there already is a read.
+                let may_read = inv.capability.allows(CAP_READ);
+                let added = self.store.on_writer(move |store| {
+                    let mut transaction = store.dataset().start_transaction().map_err(|e| {
+                        Error::Endpoint(format!("load: starting a transaction: {e}"))
+                    })?;
+                    let mut added = 0usize;
+                    for quad in parser.rename_blank_nodes().for_slice(document.as_slice()) {
+                        let quad = quad.map_err(|e| Error::InvalidArgument {
                             name: "content".to_string(),
                             detail: format!("parsing {label}: {e}"),
                         })?;
-                    Ok((before, count(store)?))
+                        if may_read
+                            && !transaction
+                                .contains(&quad)
+                                .map_err(|e| Error::Endpoint(format!("load: {e}")))?
+                        {
+                            added += 1;
+                        }
+                        transaction.insert(&quad);
+                    }
+                    transaction
+                        .commit()
+                        .map_err(|e| Error::Endpoint(format!("load: committing: {e}")))?;
+                    Ok(added)
                 })?;
-                // The counts are a read (a document whose quads were all there already
-                // adds nothing), so only for a caller that may read the dataset.
-                Ok(plain(if inv.capability.allows(CAP_READ) {
-                    format!("loaded {media}: {before} -> {after} quads\n")
+                Ok(plain(if may_read {
+                    format!("loaded {media}: +{added} quads\n")
                 } else {
                     format!("loaded {media}\n")
                 }))

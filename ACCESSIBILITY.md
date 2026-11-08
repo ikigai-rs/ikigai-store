@@ -20,8 +20,8 @@ conformance claim. Adapted from the
   `quads: …`, `covered: …`, and a `sharer writes: …` line when the host declared one),
   `urn:iki:store:graphs` (the graphs a caller may read, one IRI per line),
   `urn:iki:store:graph-info`, and the one-line receipts of the writing doors
-  (`updated: <before> -> <after> quads`, `updated <graph>`, `loaded <media type>: <before> ->
-  <after> quads`).
+  (`updated`, `updated <graph>: +<added> -<removed> quads`, `loaded <media type>: +<added>
+  quads`, and without the numbers for a caller that may not read).
 - **Query answers and dumps**: SPARQL result sets and graphs in the syntaxes each door declares,
   and `urn:iki:store:dump`'s N-Quads. They are data for programs that people also read.
 - **Error and refusal messages**: the `Denied`, `InvalidArgument`, `Timeout`, `OverBudget` and

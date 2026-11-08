@@ -188,7 +188,7 @@ fn a_document_at_the_bound_loads_in_every_syntax() {
     for case in FORMATS {
         let k = kernel();
         let loaded = load(&k, case, BOUND).unwrap_or_else(|e| panic!("{case}: {e}"));
-        assert!(loaded.contains("0 -> 1 quads"), "{case}: {loaded}");
+        assert!(loaded.contains(": +1 quads"), "{case}: {loaded}");
     }
 }
 
@@ -234,11 +234,11 @@ fn sparql_load_is_refused_at_both_update_doors() {
         );
     }
     // Nothing of the refused request was applied, its `INSERT DATA` included.
-    let count = update(
-        &k,
-        "urn:iki:store:update",
-        "INSERT DATA { <urn:a> <urn:b> <urn:c> }",
-    )
+    let info = block_on(k.issue(
+        Request::new(Verb::Source, Iri::parse("urn:iki:store:info").unwrap()),
+        &Capability::root(),
+    ))
+    .map(|rep| String::from_utf8_lossy(&rep.bytes).into_owned())
     .unwrap();
-    assert!(count.contains("0 -> 1 quads"), "{count}");
+    assert!(info.contains("quads: 0"), "{info}");
 }
