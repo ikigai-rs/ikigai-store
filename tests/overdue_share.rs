@@ -216,7 +216,7 @@ fn a_full_share_refuses_its_own_caller_and_names_it() {
             );
             assert!(
                 message.starts_with(
-                    "1 SPARQL evaluations by the principal <urn:example:person:alice> on this \
+                    "Retry shortly. 1 SPARQL evaluations by the principal <urn:example:person:alice> on this \
                      store are still running after their time budgets ran out (the most one \
                      caller may have is 1)"
                 ),

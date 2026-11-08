@@ -129,7 +129,7 @@ fn a_cross_product_past_the_base_row_bound_is_refused_not_answered() {
             "urn:iki:store:select",
             &[("query", inline(query))],
         ),
-        "the answer exceeds 100000 rows; add LIMIT, narrow the query, or ask the host for more",
+        "Add LIMIT, narrow the query, or ask the host for more: the answer exceeds 100000 rows",
     );
     // …and the same rows under a LIMIT inside the bound are answered.
     let body = issue(
@@ -163,7 +163,7 @@ fn an_answer_past_the_base_byte_bound_is_refused_not_answered() {
                 inline("SELECT ?o ?c WHERE { ?a ?p ?o . ?b ?q ?c }"),
             )],
         ),
-        "the answer exceeds 16777216 bytes; add LIMIT, narrow the query, or ask the host for more",
+        "Add LIMIT, narrow the query, or ask the host for more: the answer exceeds 16777216 bytes",
     );
 }
 
@@ -333,7 +333,7 @@ fn the_row_bound_is_exact_on_every_door_and_every_serialization() {
             let under = small(n - 1, 1 << 20);
             refused(
                 source(&under, cap, iri, query, &args),
-                &format!("the answer exceeds {} {unit};", n - 1),
+                &format!("the answer exceeds {} {unit}.", n - 1),
             );
             // Through `max_rows=`, which lowers the same way.
             let mut lowered = args.clone();
@@ -344,7 +344,7 @@ fn the_row_bound_is_exact_on_every_door_and_every_serialization() {
             source(&at, cap, iri, query, &exact).unwrap();
             refused(
                 source(&at, cap, iri, query, &lowered),
-                &format!("the answer exceeds 19 {unit};"),
+                &format!("the answer exceeds 19 {unit}."),
             );
         }
     }
@@ -364,7 +364,7 @@ fn the_byte_bound_is_exact() {
         source(&small(1_000, size), &reader(), iri, query, &[]).unwrap();
         refused(
             source(&small(1_000, size - 1), &reader(), iri, query, &[]),
-            &format!("the answer exceeds {} bytes;", size - 1),
+            &format!("the answer exceeds {} bytes.", size - 1),
         );
         let k = small(1_000, 1 << 20);
         let exact = size.to_string();
@@ -372,7 +372,7 @@ fn the_byte_bound_is_exact() {
         source(&k, &reader(), iri, query, &[("max_bytes", &exact)]).unwrap();
         refused(
             source(&k, &reader(), iri, query, &[("max_bytes", &under)]),
-            &format!("the answer exceeds {} bytes;", size - 1),
+            &format!("the answer exceeds {} bytes.", size - 1),
         );
     }
 }
@@ -511,7 +511,7 @@ fn the_cross_product_is_refused_by_size_before_time() {
             )],
         ),
         // Nine columns a row, so the byte bound is reached first (at ~60,000 rows).
-        "the answer exceeds 16777216 bytes;",
+        "the answer exceeds 16777216 bytes.",
     );
     eprintln!("refused by size after {:?}", started.elapsed());
 }

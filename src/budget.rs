@@ -373,13 +373,12 @@ impl OverdueCap {
         };
         let raise = if consumer {
             "A host raises it with `TimeBudget::with_max_overdue` on the `EvaluationBudget` \
-             the work ran through; each `EvaluationBudget::new` keeps a count of its own \
-             (ledger #1500)"
+             the work ran through; each `EvaluationBudget::new` keeps a count of its own"
         } else {
             "A host raises it with `TimeBudget::with_max_overdue`, on the store \
                      (`DurableStore::with_time_budget`) or on the `EvaluationBudget` the \
                      evaluation ran through; each `EvaluationBudget::new` keeps a count of its \
-                     own (ledger #1500)"
+                     own"
         };
         if self.set_by_host {
             format!(
@@ -458,7 +457,7 @@ impl Limits {
              anonymous request among them) is ONE caller. One caller's share of {share} is \
              {share_from}; of {owner} cap of {max}, {reserve} is reserved for the host, \
              {reserve_from}, and is used only by root and by a capability holding \
-             `{CAP_RESERVE}` (ledger #1002). A host raises a caller's share with \
+             `{CAP_RESERVE}`. A host raises a caller's share with \
              `TimeBudget::with_caller_share` and gives its own jobs `{CAP_RESERVE}`. {}",
             self.cap.origin_for(consumer)
         )
@@ -844,10 +843,9 @@ impl EvaluationBudget {
     ///         .with_caller_share(2),
     /// );
     /// // By default the sentence names no argument: this consumer takes none.
-    /// assert!(timeout(&budget).ends_with(
-    ///     "The budget is set by the host. Narrow the query — fewer joins, a bound subject, \
-    ///      a LIMIT — or ask the host for a larger budget"
-    /// ));
+    /// let sentence = timeout(&budget);
+    /// assert!(sentence.ends_with("The budget is set by the host."));
+    /// assert!(sentence.starts_with("Narrow the query"));
     /// // A consumer that reads `requested` from its own `match_budget=` says so.
     /// let budget = budget.with_argument(Some("match_budget"));
     /// assert!(timeout(&budget)
@@ -1025,8 +1023,7 @@ fn timeout(
     argument: Option<&str>,
     work: Option<&WorkDescription>,
 ) -> Error {
-    // At the doors (`argument` is `budget`) the wording is `ikigai-sparql`'s, so a consumer
-    // reading both sees one sentence. Through an `EvaluationBudget` it names the consumer's
+    // At the doors `argument` is `budget`. Through an `EvaluationBudget` it names the consumer's
     // own argument, or none: a caller cannot pass an argument its door does not take
     // (ledger #1383).
     let lower = match argument {
@@ -1034,17 +1031,17 @@ fn timeout(
         None => String::new(),
     };
     let subject = match work {
-        Some(work) => format!("this {}", work.singular),
-        None if write => "this SPARQL update".into(),
-        None => "this SPARQL query".into(),
+        Some(work) => format!("This {}", work.singular),
+        None if write => "This SPARQL update".into(),
+        None => "This SPARQL query".into(),
     };
     let remedy = work.map_or(
         "Narrow the query — fewer joins, a bound subject, a LIMIT —",
         |work| work.remedy.as_ref(),
     );
     Error::Timeout(format!(
-        "{subject} ran past its time budget of {} ms and was stopped (ledger #964).{} The budget is \
-         set by the host{lower}. {remedy} or ask the host for a larger budget",
+        "{remedy} or ask the host for a larger budget. {subject} ran past its time budget of \
+         {} ms and was stopped.{} The budget is set by the host{lower}.",
         budget.as_millis(),
         if write { " Nothing was written." } else { "" },
     ))
@@ -1629,18 +1626,19 @@ fn at_the_cap(
     let partway = "oxigraph cannot always stop one partway, so";
     Error::Unavailable(match full {
         Full::Store => format!(
-            "{} SPARQL evaluations on this store are still running after their callers' time \
-             budgets ran out (the most it allows is {}); {partway} new ones are refused until \
-             one finishes, rather than letting each request hold another core. Retry shortly. {}",
+            "Retry shortly. {} SPARQL evaluations on this store are still running after their \
+             callers' time budgets ran out (the most it allows is {}); {partway} new ones are \
+             refused until one finishes, rather than letting each request hold another core. \
+             {}",
             counts.overdue,
             limits.cap.max,
             limits.cap.origin()
         ),
         Full::Pool => format!(
-            "{} SPARQL evaluations by this store's callers are still running after their \
-             callers' time budgets ran out (the most its callers may have together is {}, the \
-             cap of {} less {} reserved for the host); {partway} callers' new ones are refused \
-             until one finishes. The host's own are not. Retry shortly. {}",
+            "Retry shortly. {} SPARQL evaluations by this store's callers are still running \
+             after their callers' time budgets ran out (the most its callers may have together \
+             is {}, the cap of {} less {} reserved for the host); {partway} callers' new ones \
+             are refused until one finishes. The host's own are not. {}",
             counts.shared.overdue,
             limits.pool(),
             limits.cap.max,
@@ -1648,10 +1646,10 @@ fn at_the_cap(
             limits.shares()
         ),
         Full::Share => format!(
-            "{} SPARQL evaluations by {} on this store are still running after their time \
-             budgets ran out (the most one caller may have is {}); {partway} this caller's new \
-             ones are refused until one of its own finishes. Other callers are not held up by \
-             them. Retry shortly. {}",
+            "Retry shortly. {} SPARQL evaluations by {} on this store are still running after \
+             their time budgets ran out (the most one caller may have is {}); {partway} this \
+             caller's new ones are refused until one of its own finishes. Other callers are \
+             not held up by them. {}",
             counts.tally(caller).overdue,
             caller.describe(),
             limits.share,
@@ -1676,17 +1674,17 @@ fn no_slot(
     let ms = budget.as_millis();
     Error::Unavailable(match full {
         Full::Store => format!(
-            "{} SPARQL evaluations are running on this store, and the most it runs at once is \
-             {}, so that work oxigraph cannot stop partway can hold no more than that many \
-             cores; none ended within this request's time budget of {ms} ms. Retry shortly. {}",
+            "Retry shortly. {} SPARQL evaluations are running on this store, and the most it \
+             runs at once is {}, so that work oxigraph cannot stop partway can hold no more \
+             than that many cores; none ended within this request's time budget of {ms} ms. {}",
             counts.running,
             limits.cap.max,
             limits.cap.origin()
         ),
         Full::Pool => format!(
-            "{} SPARQL evaluations by this store's callers are running, and the most its \
-             callers may run together is {} (the cap of {} less {} reserved for the host); none \
-             ended within this request's time budget of {ms} ms. Retry shortly. {}",
+            "Retry shortly. {} SPARQL evaluations by this store's callers are running, and the \
+             most its callers may run together is {} (the cap of {} less {} reserved for the \
+             host); none ended within this request's time budget of {ms} ms. {}",
             counts.shared.running,
             limits.pool(),
             limits.cap.max,
@@ -1694,9 +1692,9 @@ fn no_slot(
             limits.shares()
         ),
         Full::Share => format!(
-            "{} SPARQL evaluations by {} are running on this store, and the most one caller \
-             may run at once is {}; none of them ended within this request's time budget of \
-             {ms} ms. Retry shortly. {}",
+            "Retry shortly. {} SPARQL evaluations by {} are running on this store, and the \
+             most one caller may run at once is {}; none of them ended within this request's \
+             time budget of {ms} ms. {}",
             counts.tally(caller).running,
             caller.describe(),
             limits.share,
@@ -1759,7 +1757,7 @@ fn capacity_refusal(
             tally.overdue, work.plural,
         ),
     };
-    Error::Unavailable(format!("{status}. Retry shortly. {origin}"))
+    Error::Unavailable(format!("Retry shortly. {status}. {origin}"))
 }
 
 /// What a worker holds until it ends: its slot (a read's), and its place in the overdue count
@@ -1971,9 +1969,10 @@ pub fn inline_bound<'a>(inv: &Invocation<'a>, name: &str) -> Result<Option<&'a s
     let refuse = |how: &str| Error::InvalidArgument {
         name: name.to_string(),
         detail: format!(
-            "`{name}=` was given {how}: a bound is read only as an inline value, and one given \
-             any other way is refused rather than ignored, because ignoring it would apply this \
-             space's own bound in place of the one a host's door meant to stamp (ledger #970)"
+            "Give `{name}=` as inline UTF-8 text. It was given {how}: a bound is read only as \
+             an inline value, and one given any other way is refused rather than ignored, \
+             because ignoring it would apply this space's own bound in place of the one a \
+             host's door meant to stamp"
         ),
     };
     match request.args.get(name) {
@@ -2005,7 +2004,7 @@ pub enum Measure {
 ///
 /// let text = too_large(Measure::Rows, 100_000).to_string();
 /// assert!(text.contains(
-///     "the answer exceeds 100000 rows; add LIMIT, narrow the query, or ask the host for more"
+///     "Add LIMIT, narrow the query, or ask the host for more: the answer exceeds 100000 rows"
 /// ));
 /// ```
 pub fn too_large(measure: Measure, bound: u64) -> Error {
@@ -2017,8 +2016,8 @@ pub fn too_large(measure: Measure, bound: u64) -> Error {
     Error::InvalidArgument {
         name: "query".to_string(),
         detail: format!(
-            "the answer exceeds {bound} {unit}; add LIMIT, narrow the query, or ask the host for \
-             more. It was refused, not truncated: no part of it was sent (ledger #970). A \
+            "Add LIMIT, narrow the query, or ask the host for more: the answer exceeds {bound} \
+             {unit}. It was refused, not truncated: no part of it was sent. A \
              request's `{arg}=` can only lower this bound"
         ),
     }
@@ -2350,11 +2349,11 @@ impl Cost {
             return Err(Error::InvalidArgument {
                 name: arg.to_string(),
                 detail: format!(
-                    "this SPARQL text joins {} patterns in one group, and this endpoint refuses \
-                     more than {MAX_JOIN_OPERANDS} (MAX_JOIN_OPERANDS) before planning: the \
-                     planner's join ordering grows about with the cube of that number and \
-                     cannot be interrupted (ledger #964). A sequence path counts one pattern a \
-                     step. Split the query, or move a list of values into VALUES",
+                    "Split the query, or move a list of values into VALUES. This SPARQL text \
+                     joins {} patterns in one group, and this endpoint refuses more than \
+                     {MAX_JOIN_OPERANDS} (MAX_JOIN_OPERANDS) before planning: the planner's \
+                     join ordering grows about with the cube of that number and cannot be \
+                     interrupted. A sequence path counts one pattern a step.",
                     self.widest_join
                 ),
             });
@@ -2363,11 +2362,12 @@ impl Cost {
             return Err(Error::InvalidArgument {
                 name: arg.to_string(),
                 detail: format!(
-                    "this SPARQL text has {} algebra operators (patterns, OPTIONAL/UNION/FILTER/\
-                     BIND, path and expression operators), and this endpoint refuses more than \
-                     {MAX_ALGEBRA_NODES} (MAX_ALGEBRA_NODES) before planning: the planner is \
-                     quadratic in several of them and cannot be interrupted (ledger #964). \
-                     Constants in VALUES and IN (…) cost nothing; use them for long lists",
+                    "Use constants in VALUES and IN (…) for long lists, or split the query. \
+                     This SPARQL text has {} algebra operators (patterns, \
+                     OPTIONAL/UNION/FILTER/BIND, path and expression operators), and this \
+                     endpoint refuses more than {MAX_ALGEBRA_NODES} (MAX_ALGEBRA_NODES) before \
+                     planning: the planner is quadratic in several of them and cannot be \
+                     interrupted. Constants in VALUES and IN (…) cost nothing.",
                     self.nodes
                 ),
             });
@@ -3274,13 +3274,16 @@ mod tests {
 
     #[test]
     fn the_shared_constants_and_wording_are_the_contracts() {
-        // ledger #970: identical in `ikigai-sparql`; change both or neither.
+        // Ledger #970: shared answer bounds; refusal wording is maintained here.
         assert_eq!(DEFAULT_MAX_ROWS, 100_000);
         assert_eq!(DEFAULT_MAX_BYTES, 16 * 1024 * 1024);
         assert_eq!(CEILING_MAX_ROWS, 10_000_000);
         assert_eq!(CEILING_MAX_BYTES, 1024 * 1024 * 1024);
+        assert!(!too_large(Measure::Triples, 7)
+            .to_string()
+            .contains("ledger #"));
         assert!(too_large(Measure::Triples, 7).to_string().contains(
-            "the answer exceeds 7 triples; add LIMIT, narrow the query, or ask the host for more"
+            "Add LIMIT, narrow the query, or ask the host for more: the answer exceeds 7 triples"
         ));
     }
 
@@ -3377,7 +3380,9 @@ mod tests {
             let err = query(&text).unwrap_err();
             assert!(
                 matches!(&err, Error::InvalidArgument { name, detail } if name == "query"
-                    && detail.contains("MAX_JOIN_OPERANDS")),
+                    && detail.contains("MAX_JOIN_OPERANDS")
+                    && detail.starts_with("Split the query")
+                    && !detail.contains("ledger #")),
                 "{wrap}: {err}"
             );
         }
@@ -3501,7 +3506,9 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(&err, Error::InvalidArgument { name, detail } if name == "query"
-                && detail.contains("MAX_JOIN_OPERANDS")),
+                && detail.contains("MAX_JOIN_OPERANDS")
+                && detail.starts_with("Split the query")
+                && !detail.contains("ledger #")),
             "{err}"
         );
         // `1||1||…`: n terms are n-1 operators, plus the FILTER and the empty group.
@@ -3510,6 +3517,8 @@ mod tests {
         query(&chain(MAX_ALGEBRA_NODES - nodes)).unwrap();
         let err = query(&chain(MAX_ALGEBRA_NODES - nodes + 1)).unwrap_err();
         assert!(err.to_string().contains("MAX_ALGEBRA_NODES"), "{err}");
+        assert!(matches!(&err, Error::InvalidArgument { detail, .. }
+            if detail.starts_with("Use constants in VALUES") && !detail.contains("ledger #")));
     }
 
     #[test]

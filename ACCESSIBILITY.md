@@ -64,8 +64,6 @@ Followed by reading the source:
 
 Found by reading the source on 2026-10-31, not by testing:
 
-- Many refusals cite an internal work-item number in parentheses (in `src/budget.rs`,
-  `src/confine.rs` and `src/endpoints.rs`), which a reader outside the project cannot look up.
 - Several refusals run to a paragraph: what to do comes after the reasoning, and a reader
   listening to it hears the whole explanation first.
 - `urn:iki:store:info`'s `covered: true` or `covered: false` names a term the answer does not
@@ -97,3 +95,4 @@ technology, if you are comfortable sharing them. Anything security-sensitive goe
 | Date | Change |
 |---|---|
 | 2026-10-31 | First version. |
+| 2026-11-07 | Removed internal work-item numbers from refusals and moved the actions first in budget, copy-bound, and dump refusals. |

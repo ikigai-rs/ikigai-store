@@ -1761,10 +1761,10 @@ fn dump_too_large(unit: &str, arg: &str, bound: u64) -> Error {
     Error::InvalidArgument {
         name: arg.to_string(),
         detail: format!(
-            "the dataset is larger than {bound} {unit}, the most this capability may dump. It \
-             was refused, not truncated: no part of it was sent (ledger #374). The host raises \
-             the bound with a `urn:cap:store:answer:*` grant (root gets the ceiling); a request's \
-             `{arg}=` can only lower it. A tenant's own graph is \
+            "Ask the host to raise the bound with a `urn:cap:store:answer:*` grant (root gets the \
+             ceiling). The dataset is larger than {bound} {unit}, the most this capability may \
+             dump. It was refused, not truncated: no part of it was sent. A request's \
+             `{arg}=` can only lower the bound. A tenant's own graph is \
              `urn:iki:store:graph-construct`, under the per-graph grant"
         ),
     }
@@ -1776,10 +1776,10 @@ fn dump_too_large(unit: &str, arg: &str, bound: u64) -> Error {
 fn scan_timeout(e: Error, what: &str, budget: std::time::Duration) -> Error {
     match e {
         Error::Timeout(_) => Error::Timeout(format!(
-            "{what} ran past its time budget of {} ms and was stopped, with nothing answered \
-             (ledger #964). The budget is set by the host, which raises it with a \
-             `urn:cap:store:budget:<ms>` grant (root gets 120 s by default); a request's \
-             `budget=` can only lower it",
+            "Ask the host for a larger budget with a `urn:cap:store:budget:<ms>` grant (root \
+             gets 120 s by default). {what} ran past its time budget of {} ms and was stopped, \
+             with nothing answered. The budget is set by the host; a request's `budget=` can \
+             only lower it",
             budget.as_millis()
         )),
         other => other,
@@ -2585,6 +2585,34 @@ mod stream_tests {
             Instant::now(),
             Duration::from_secs(60),
         )
+    }
+
+    #[test]
+    fn dump_refusals_put_the_action_first_without_internal_references() {
+        let Error::InvalidArgument { detail, .. } = dump_too_large("quads", "max_rows", 7) else {
+            panic!("expected an invalid argument");
+        };
+        assert!(
+            detail.starts_with("Ask the host to raise the bound"),
+            "{detail}"
+        );
+        assert!(detail.contains("larger than 7 quads"), "{detail}");
+        assert!(detail.contains("refused, not truncated"), "{detail}");
+        assert!(!detail.contains("ledger #"), "{detail}");
+        let Error::Timeout(detail) = scan_timeout(
+            Error::Timeout("ignored".into()),
+            "this dump",
+            std::time::Duration::from_millis(5),
+        ) else {
+            panic!("expected a timeout");
+        };
+        assert!(
+            detail.starts_with("Ask the host for a larger budget"),
+            "{detail}"
+        );
+        assert!(detail.contains("5 ms"), "{detail}");
+        assert!(detail.contains("nothing answered"), "{detail}");
+        assert!(!detail.contains("ledger #"), "{detail}");
     }
 
     #[test]

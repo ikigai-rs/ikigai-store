@@ -246,7 +246,8 @@ fn validation_budget(cap: usize) -> EvaluationBudget {
 fn assert_validation_capacity(message: &str, bound: &str) {
     assert!(message.contains("1 SHACL validations"), "{message}");
     assert!(message.contains(bound), "{message}");
-    assert!(message.contains("Retry shortly"), "{message}");
+    assert!(message.starts_with("Retry shortly."), "{message}");
+    assert!(!message.contains("ledger #"), "{message}");
     assert!(
         message.contains("TimeBudget::with_max_overdue"),
         "{message}"
