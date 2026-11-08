@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use ikigai_core::{Capability, Error, Result};
 use oxigraph::model::{
@@ -240,7 +240,7 @@ pub struct DurableStore {
     backing: Backing,
     coverage: Coverage,
     /// Serializes every write this crate performs — see [`write_lock`](Self::write_lock).
-    writes: Arc<Mutex<()>>,
+    writes: Arc<crate::budget::WriteLock>,
     /// How many spaces are bound over this dataset right now, shared by every clone. Each
     /// space is a kernel's door, and a kernel cannot see another kernel's writes — see
     /// [`spaces_bound`](Self::spaces_bound).
@@ -309,7 +309,7 @@ impl DurableStore {
             store: Arc::new(Store::new().map_err(endpoint_err)?),
             backing: Backing::Memory,
             coverage: Coverage::Owned,
-            writes: Arc::new(Mutex::new(())),
+            writes: Arc::default(),
             spaces: Arc::new(AtomicUsize::new(0)),
             cached: Arc::new(AtomicBool::new(false)),
             binding: None,
@@ -365,7 +365,7 @@ impl DurableStore {
             store: Arc::new(open_rocksdb(path.as_ref())?),
             backing: Backing::Durable(path.as_ref().to_path_buf()),
             coverage: Coverage::Owned,
-            writes: Arc::new(Mutex::new(())),
+            writes: Arc::default(),
             spaces: Arc::new(AtomicUsize::new(0)),
             cached: Arc::new(AtomicBool::new(false)),
             binding: None,
@@ -998,8 +998,14 @@ impl DurableStore {
     /// A poisoned lock is treated as held-and-released rather than fatal: the data is an
     /// `Arc<Store>` that no panic here can leave half-written, since every mutation goes
     /// through an oxigraph transaction that either commits or does not.
-    pub(crate) fn write_lock(&self) -> MutexGuard<'_, ()> {
-        self.writes.lock().unwrap_or_else(|e| e.into_inner())
+    pub(crate) fn write_lock(&self) -> crate::budget::WriteGuard<'_> {
+        self.writes.lock()
+    }
+
+    /// [`write_lock`](Self::write_lock) for an update under `deadline`, which the next writer
+    /// takes over once the update's caller has given up on it (ledger #3271).
+    pub(crate) fn write_lock_for(&self, deadline: &Deadline) -> crate::budget::WriteGuard<'_> {
+        self.writes.lock_for(deadline)
     }
 }
 
@@ -1244,7 +1250,7 @@ impl std::fmt::Debug for SnapshotReader {
 #[derive(Clone)]
 pub struct SharedWriter {
     store: Arc<Store>,
-    writes: Arc<Mutex<()>>,
+    writes: Arc<crate::budget::WriteLock>,
     writer: Arc<crate::budget::Writer>,
     /// The graphs this writer may write, or `None` when nothing was declared.
     declared: Option<Arc<SharerWrites>>,
@@ -1497,7 +1503,7 @@ impl SharedWriter {
             // Taken ON the writer thread, as the store's update doors take it: taken on the
             // caller's thread it would wait for a door's job queued ahead of this one, which
             // waits for the lock.
-            let _writes = writes.lock().unwrap_or_else(|e| e.into_inner());
+            let _writes = writes.lock();
             job()
         };
         match self.writer.call(crate::limits::STACK_BASE, job) {
@@ -1531,7 +1537,7 @@ mod given_out {
     /// called on.
     pub(super) struct GivenOut {
         pub(super) handle: Weak<Store>,
-        pub(super) writes: Weak<Mutex<()>>,
+        pub(super) writes: Weak<crate::budget::WriteLock>,
         pub(super) writer: Weak<crate::budget::Writer>,
         /// The ceiling a joining `over` is narrowed to: the store's own declaration, or
         /// `None` when it declared nothing (`open_shared`); for a handle `over` recorded, the
@@ -1543,7 +1549,7 @@ mod given_out {
 
     /// The writer a handle belongs to.
     pub(super) struct Joined {
-        pub(super) writes: Arc<Mutex<()>>,
+        pub(super) writes: Arc<crate::budget::WriteLock>,
         pub(super) writer: Arc<crate::budget::Writer>,
         pub(super) declared: Option<SharerWrites>,
         pub(super) source: CeilingSource,
@@ -1597,7 +1603,7 @@ mod given_out {
         // The writer this `over` starts. Its `declared` is its own declaration, so `over`
         // narrows it by nothing; `source` is what a LATER `over` will be told won.
         let joined = Joined {
-            writes: Arc::new(Mutex::new(())),
+            writes: Arc::default(),
             writer: Arc::default(),
             declared: Some(writes.clone()),
             source: CeilingSource::FirstOver,

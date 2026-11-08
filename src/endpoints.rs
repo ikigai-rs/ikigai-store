@@ -1836,7 +1836,7 @@ impl Endpoint for UpdateEndpoint {
                              `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP`, `CREATE`"
                             )));
                         }
-                        let _writes = store.write_lock();
+                        let _writes = store.write_lock_for(deadline);
                         // ★ On a transaction this crate commits, not `on_store(…).execute()`,
                         // which commits inside oxigraph: the commit has to be the deadline's.
                         let mut transaction = store.dataset().start_transaction().map_err(|e| {
@@ -2003,7 +2003,7 @@ impl Endpoint for GraphUpdateEndpoint {
                         // match nothing. On the text, after the read-grant check, so a
                         // write-only caller is refused on the grant as before.
                         crate::confine::reads_outside(&parsed.reads, &target)?;
-                        let _writes = store.write_lock();
+                        let _writes = store.write_lock_for(deadline);
                         crate::confine::scoped_update(
                             store.dataset(),
                             &target,

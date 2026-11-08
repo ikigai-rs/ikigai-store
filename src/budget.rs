@@ -1008,6 +1008,86 @@ impl Deadline {
     }
 }
 
+/// A store's write lock, which a write refused at its budget gives up (ledger #3271).
+///
+/// ★ **Why a plain mutex was not enough.** Oxigraph cannot stop every evaluation at its
+/// cancellation token (section 3), so an update refused at its budget may run on for as long
+/// as its evaluation takes, and it held the lock all that time: at 1B quads a scoped write
+/// queued behind refused broad ones waited out its own 120 s and was refused too. An update
+/// whose caller gave up can never commit (its commit goes through [`Deadline::settle`], which
+/// refuses once the state is `Abandoned`, and that state is final), so the lock it holds
+/// orders nothing any more: the next writer takes it over. The refused update's own guard,
+/// when it finally drops, releases nothing it no longer holds.
+#[derive(Default)]
+pub(crate) struct WriteLock {
+    holding: Mutex<Holding>,
+    freed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct Holding {
+    /// Bumped on every take, so a guard releases only the hold it took.
+    generation: u64,
+    /// `None` when free; `Some(None)` held by a write with no deadline (a load, a host's
+    /// write); `Some(Some(state))` held by an update with one.
+    holder: Option<Option<Arc<Mutex<State>>>>,
+}
+
+/// One hold of a [`WriteLock`], released when dropped unless another writer took it over.
+pub(crate) struct WriteGuard<'a> {
+    lock: &'a WriteLock,
+    generation: u64,
+}
+
+impl WriteLock {
+    /// Take the lock for a write with no deadline: it is never given up.
+    pub(crate) fn lock(&self) -> WriteGuard<'_> {
+        self.take(None)
+    }
+
+    /// Take the lock for an update under `deadline`: another writer takes it over once the
+    /// update's caller has given up on it.
+    pub(crate) fn lock_for(&self, deadline: &Deadline) -> WriteGuard<'_> {
+        self.take(Some(Arc::clone(&deadline.state)))
+    }
+
+    fn take(&self, holder: Option<Arc<Mutex<State>>>) -> WriteGuard<'_> {
+        let mut holding = self.holding.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let free = match &holding.holder {
+                None => true,
+                Some(None) => false,
+                Some(Some(state)) => *lock(state) == State::Abandoned,
+            };
+            if free {
+                holding.generation += 1;
+                holding.holder = Some(holder);
+                return WriteGuard {
+                    lock: self,
+                    generation: holding.generation,
+                };
+            }
+            // A holder's caller gives up on its own thread, which knows nothing of this lock,
+            // so a waiter looks again now and then as well as when the lock is freed.
+            holding = self
+                .freed
+                .wait_timeout(holding, std::time::Duration::from_millis(10))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        let mut holding = self.lock.holding.lock().unwrap_or_else(|e| e.into_inner());
+        if holding.generation == self.generation {
+            holding.holder = None;
+            self.lock.freed.notify_one();
+        }
+    }
+}
+
 fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     // A panic in `commit` poisons this; the state it guards is a plain enum that is valid
     // either way, so poisoning carries no meaning here.
@@ -1135,6 +1215,11 @@ pub(crate) struct Writer {
 #[cfg(not(target_family = "wasm"))]
 struct WriterThread {
     jobs: std::sync::mpsc::Sender<Job>,
+    /// The queue's receiving end, shared by a thread and the one that replaces it when it is
+    /// stuck on a refused write (ledger #3271), so what was queued behind that write moves.
+    queue: Arc<Mutex<std::sync::mpsc::Receiver<Job>>>,
+    /// Set on a thread that was replaced: it exits after the job it is running.
+    retired: Arc<std::sync::atomic::AtomicBool>,
     stack: usize,
     /// The thread's id: a job running on it that queues another here is refused.
     id: std::thread::ThreadId,
@@ -1179,29 +1264,39 @@ impl Writer {
             ))
             .max(stack);
         let (jobs, queue) = std::sync::mpsc::channel::<Job>();
-        let started = std::thread::Builder::new()
-            .name(WRITER_THREAD_NAME.to_string())
-            .stack_size(size)
-            .spawn(move || {
-                for job in queue {
-                    job();
-                }
-            })
-            .map_err(|e| {
-                Error::Unavailable(format!(
-                    "could not start a {} MiB thread to run this store's writes on: {e}",
-                    size >> 20
-                ))
-            })?;
-        let id = started.thread().id();
+        let queue = Arc::new(Mutex::new(queue));
+        let (id, retired) = start_writer_thread(size, &queue)?;
         jobs.send(job)
             .map_err(|_| Error::Endpoint("internal: a new store writer thread ended".into()))?;
         *slot = Some(WriterThread {
             jobs,
+            queue,
+            retired,
             stack: size,
             id,
         });
         Ok(())
+    }
+
+    /// Give the writer's queue to a new thread when the current one is running a write whose
+    /// caller gave up (ledger #3271): oxigraph may not stop it for as long as its evaluation
+    /// takes, and every write queued behind it would wait that long. The stuck thread finishes
+    /// that write, which cannot commit, and exits. A write's thread changes only here and when
+    /// the stack grows, so commits still come from one thread at a time (ledger #1127).
+    fn replace(&self, stuck: std::thread::ThreadId) {
+        let mut slot = self.thread.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(current) = slot.as_mut() else { return };
+        if current.id != stuck {
+            return;
+        }
+        // If no thread can be started the queue stays with the stuck one, as before.
+        if let Ok((id, retired)) = start_writer_thread(current.stack, &current.queue) {
+            current
+                .retired
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            current.id = id;
+            current.retired = retired;
+        }
     }
 
     /// Run `work` on the writer thread and wait for its answer, with no deadline: the door
@@ -1236,6 +1331,37 @@ impl Writer {
         let slot = self.thread.lock().unwrap_or_else(|e| e.into_inner());
         slot.as_ref().map(|current| current.stack)
     }
+}
+
+/// Start a writer thread of `size` taking jobs from `queue`, until the queue closes (the
+/// store is gone) or the thread is retired (replaced while stuck, [`Writer::replace`]).
+#[cfg(not(target_family = "wasm"))]
+fn start_writer_thread(
+    size: usize,
+    queue: &Arc<Mutex<std::sync::mpsc::Receiver<Job>>>,
+) -> Result<(std::thread::ThreadId, Arc<std::sync::atomic::AtomicBool>)> {
+    let retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (queue, done) = (Arc::clone(queue), Arc::clone(&retired));
+    let started = std::thread::Builder::new()
+        .name(WRITER_THREAD_NAME.to_string())
+        .stack_size(size)
+        .spawn(move || loop {
+            // The receiver is locked only while waiting, never while a job runs, so a thread
+            // stuck in a job leaves the queue to the one that replaced it.
+            let job = queue.lock().unwrap_or_else(|e| e.into_inner()).recv();
+            let Ok(job) = job else { return };
+            job();
+            if done.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+        })
+        .map_err(|e| {
+            Error::Unavailable(format!(
+                "could not start a {} MiB thread to run this store's writes on: {e}",
+                size >> 20
+            ))
+        })?;
+    Ok((started.thread().id(), retired))
 }
 
 /// The name of a store's writer thread, which a host can see in a profile or a panic message.
@@ -1314,13 +1440,22 @@ where
         slot,
         caller: caller.clone(),
     };
+    // The writer thread the job is running on, once it runs: a refused write's thread is
+    // replaced (ledger #3271).
+    let running_on: Arc<Mutex<Option<std::thread::ThreadId>>> = Arc::default();
+    let running = Arc::clone(&running_on);
     let body = move || {
         let hold = hold;
         // A write can wait in the writer's queue past its caller's budget: then the caller has
         // already been answered and counted it overdue, and running it would only be work
         // whose commit `settle` refuses. `hold` leaves the count when it drops.
-        if *lock(&deadline.state) == State::Abandoned {
-            return;
+        {
+            let state = lock(&deadline.state);
+            if *state == State::Abandoned {
+                return;
+            }
+            // Under the state lock, so a caller that gives up sees it either way.
+            *running.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
         }
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&deadline)));
         {
@@ -1363,6 +1498,14 @@ where
                     // only once the count holds it.
                     evaluations.abandoned(&caller, slot);
                     token.cancel();
+                    drop(state);
+                    // ★ A write oxigraph does not stop keeps its thread (ledger #3271): the
+                    // queue behind it moves to another, and its write lock is taken over by
+                    // the next writer (`WriteLock`). It can never commit.
+                    let stuck = *running_on.lock().unwrap_or_else(|e| e.into_inner());
+                    if let (Some(writer), Some(stuck)) = (writer, stuck) {
+                        writer.replace(stuck);
+                    }
                     return Err(timeout(
                         budget,
                         write,
