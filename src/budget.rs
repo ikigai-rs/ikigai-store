@@ -64,9 +64,11 @@
 //!   of [`TimeBudget::max_overdue`] slots before its thread starts and gives it back when the
 //!   thread ends, however it ends. So at most that many reads evaluate on one store at once,
 //!   and so at most that many can outlive their callers: **one store's callers can pin at most
-//!   `max_overdue` cores with reads, plus the store's one writer thread** (an update runs there
-//!   and takes no slot; the writer bounds updates to one core already, and one waiting in its
-//!   queue holds none). A read that finds every slot taken WAITS for one, within its own budget
+//!   `max_overdue` cores with reads, and as many again with updates** (an update takes no read
+//!   slot, and one waiting in the writer's queue holds nothing, but a refused update oxigraph
+//!   cannot stop keeps a writer thread while another takes the queue, so at most `max_overdue`
+//!   updates run at once, the host's included: see `Writer::replace`, ledger #3271). A read
+//!   that finds every slot taken WAITS for one, within its own budget
 //!   (the wait counts against it), and is refused with a transient [`Error::Unavailable`] if
 //!   none comes free; while `max_overdue` evaluations are OVERDUE, every new one, read or
 //!   update, is refused at once with an `Unavailable` saying why. The price is that SPARQL
@@ -346,7 +348,8 @@ fn available_parallelism() -> Option<usize> {
     std::thread::available_parallelism().ok().map(|n| n.get())
 }
 
-/// The cap on reads in flight (and so on overdue evaluations), and whether the host set it,
+/// The cap on reads in flight and on updates running (and so on overdue evaluations of each),
+/// and whether the host set it,
 /// for the refusal at the cap to say where the number came from (ledger #1500).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OverdueCap {
@@ -548,7 +551,10 @@ impl TimeBudget {
 
     /// How many reads may evaluate at once, and so how many may still be running after their
     /// callers gave up (at least 1); at that many overdue, new evaluations are refused at once.
-    /// See the module docs for what that trades (ledger #1427). The default is
+    /// See the module docs for what that trades (ledger #1427). It is also how many updates
+    /// may run at once, each holding a writer thread if its caller gives up and oxigraph cannot
+    /// stop it; at that many, new updates are refused at once, the host's too (ledger #3271).
+    /// The default is
     /// [`default_max_overdue`]; a refusal at the cap says which of the two it is (ledger #1500).
     pub fn with_max_overdue(mut self, n: usize) -> Self {
         self.max_overdue = OverdueCap {
@@ -1008,6 +1014,86 @@ impl Deadline {
     }
 }
 
+/// A store's write lock, which a write refused at its budget gives up (ledger #3271).
+///
+/// ★ **Why a plain mutex was not enough.** Oxigraph cannot stop every evaluation at its
+/// cancellation token (section 3), so an update refused at its budget may run on for as long
+/// as its evaluation takes, and it held the lock all that time: at 1B quads a scoped write
+/// queued behind refused broad ones waited out its own 120 s and was refused too. An update
+/// whose caller gave up can never commit (its commit goes through [`Deadline::settle`], which
+/// refuses once the state is `Abandoned`, and that state is final), so the lock it holds
+/// orders nothing any more: the next writer takes it over. The refused update's own guard,
+/// when it finally drops, releases nothing it no longer holds.
+#[derive(Default)]
+pub(crate) struct WriteLock {
+    holding: Mutex<Holding>,
+    freed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct Holding {
+    /// Bumped on every take, so a guard releases only the hold it took.
+    generation: u64,
+    /// `None` when free; `Some(None)` held by a write with no deadline (a load, a host's
+    /// write); `Some(Some(state))` held by an update with one.
+    holder: Option<Option<Arc<Mutex<State>>>>,
+}
+
+/// One hold of a [`WriteLock`], released when dropped unless another writer took it over.
+pub(crate) struct WriteGuard<'a> {
+    lock: &'a WriteLock,
+    generation: u64,
+}
+
+impl WriteLock {
+    /// Take the lock for a write with no deadline: it is never given up.
+    pub(crate) fn lock(&self) -> WriteGuard<'_> {
+        self.take(None)
+    }
+
+    /// Take the lock for an update under `deadline`: another writer takes it over once the
+    /// update's caller has given up on it.
+    pub(crate) fn lock_for(&self, deadline: &Deadline) -> WriteGuard<'_> {
+        self.take(Some(Arc::clone(&deadline.state)))
+    }
+
+    fn take(&self, holder: Option<Arc<Mutex<State>>>) -> WriteGuard<'_> {
+        let mut holding = self.holding.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let free = match &holding.holder {
+                None => true,
+                Some(None) => false,
+                Some(Some(state)) => *lock(state) == State::Abandoned,
+            };
+            if free {
+                holding.generation += 1;
+                holding.holder = Some(holder);
+                return WriteGuard {
+                    lock: self,
+                    generation: holding.generation,
+                };
+            }
+            // A holder's caller gives up on its own thread, which knows nothing of this lock,
+            // so a waiter looks again now and then as well as when the lock is freed.
+            holding = self
+                .freed
+                .wait_timeout(holding, std::time::Duration::from_millis(10))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        let mut holding = self.lock.holding.lock().unwrap_or_else(|e| e.into_inner());
+        if holding.generation == self.generation {
+            holding.holder = None;
+            self.lock.freed.notify_one();
+        }
+    }
+}
+
 fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     // A panic in `commit` poisons this; the state it guards is a plain enum that is valid
     // either way, so poisoning carries no meaning here.
@@ -1113,6 +1199,13 @@ where
 ///   the dataset itself, so a store can be reopened at the same path as soon as it is dropped.
 /// - On wasm there are no threads, and an update runs inline like everything else.
 ///
+/// - **A refused write may leave its thread behind, and only so many may** (ledger #3271). A
+///   write oxigraph cannot stop keeps its thread after its caller gave up, and another takes
+///   the queue ([`replace`](Writer::replace)). Each running update takes one of the
+///   [`max_overdue`](TimeBudget::max_overdue) places as it starts, every caller's, the host's
+///   too ([`Evaluations::start_write`]), so at most that many threads are held this way, beside
+///   the one taking the queue.
+///
 /// - **A job may not queue another on the thread it runs on.** It would wait for a job queued
 ///   behind itself (a host's write forever, an update until its budget ran out), so
 ///   [`submit`](Writer::submit) refuses at once instead.
@@ -1135,6 +1228,11 @@ pub(crate) struct Writer {
 #[cfg(not(target_family = "wasm"))]
 struct WriterThread {
     jobs: std::sync::mpsc::Sender<Job>,
+    /// The queue's receiving end, shared by a thread and the one that replaces it when it is
+    /// stuck on a refused write (ledger #3271), so what was queued behind that write moves.
+    queue: Arc<Mutex<std::sync::mpsc::Receiver<Job>>>,
+    /// Set on a thread that was replaced: it exits after the job it is running.
+    retired: Arc<std::sync::atomic::AtomicBool>,
     stack: usize,
     /// The thread's id: a job running on it that queues another here is refused.
     id: std::thread::ThreadId,
@@ -1179,29 +1277,47 @@ impl Writer {
             ))
             .max(stack);
         let (jobs, queue) = std::sync::mpsc::channel::<Job>();
-        let started = std::thread::Builder::new()
-            .name(WRITER_THREAD_NAME.to_string())
-            .stack_size(size)
-            .spawn(move || {
-                for job in queue {
-                    job();
-                }
-            })
-            .map_err(|e| {
-                Error::Unavailable(format!(
-                    "could not start a {} MiB thread to run this store's writes on: {e}",
-                    size >> 20
-                ))
-            })?;
-        let id = started.thread().id();
+        let queue = Arc::new(Mutex::new(queue));
+        let (id, retired) = start_writer_thread(size, &queue)?;
         jobs.send(job)
             .map_err(|_| Error::Endpoint("internal: a new store writer thread ended".into()))?;
         *slot = Some(WriterThread {
             jobs,
+            queue,
+            retired,
             stack: size,
             id,
         });
         Ok(())
+    }
+
+    /// Give the writer's queue to a new thread when the current one is running a write whose
+    /// caller gave up (ledger #3271): oxigraph may not stop it for as long as its evaluation
+    /// takes, and every write queued behind it would wait that long. The stuck thread finishes
+    /// that write, which cannot commit, and exits. A write's thread changes only here and when
+    /// the stack grows, so commits still come from one thread at a time (ledger #1127).
+    ///
+    /// `running` names the thread while the write runs, and the job empties it, under this same
+    /// lock, as the evaluation ends. ★ Held throughout, so there are two orders and no third:
+    /// the write ended first and there is nothing to replace, or it cannot end until the thread
+    /// is marked retired, and so it can never reach the queue again and take a job beside its
+    /// replacement.
+    fn replace(&self, running: &Mutex<Option<std::thread::ThreadId>>) {
+        let running = running.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(stuck) = *running else { return };
+        let mut slot = self.thread.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(current) = slot.as_mut() else { return };
+        if current.id != stuck {
+            return;
+        }
+        // If no thread can be started the queue stays with the stuck one, as before.
+        if let Ok((id, retired)) = start_writer_thread(current.stack, &current.queue) {
+            current
+                .retired
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            current.id = id;
+            current.retired = retired;
+        }
     }
 
     /// Run `work` on the writer thread and wait for its answer, with no deadline: the door
@@ -1236,6 +1352,37 @@ impl Writer {
         let slot = self.thread.lock().unwrap_or_else(|e| e.into_inner());
         slot.as_ref().map(|current| current.stack)
     }
+}
+
+/// Start a writer thread of `size` taking jobs from `queue`, until the queue closes (the
+/// store is gone) or the thread is retired (replaced while stuck, [`Writer::replace`]).
+#[cfg(not(target_family = "wasm"))]
+fn start_writer_thread(
+    size: usize,
+    queue: &Arc<Mutex<std::sync::mpsc::Receiver<Job>>>,
+) -> Result<(std::thread::ThreadId, Arc<std::sync::atomic::AtomicBool>)> {
+    let retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (queue, done) = (Arc::clone(queue), Arc::clone(&retired));
+    let started = std::thread::Builder::new()
+        .name(WRITER_THREAD_NAME.to_string())
+        .stack_size(size)
+        .spawn(move || loop {
+            // The receiver is locked only while waiting, never while a job runs, so a thread
+            // stuck in a job leaves the queue to the one that replaced it.
+            let job = queue.lock().unwrap_or_else(|e| e.into_inner()).recv();
+            let Ok(job) = job else { return };
+            job();
+            if done.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+        })
+        .map_err(|e| {
+            Error::Unavailable(format!(
+                "could not start a {} MiB thread to run this store's writes on: {e}",
+                size >> 20
+            ))
+        })?;
+    Ok((started.thread().id(), retired))
 }
 
 /// The name of a store's writer thread, which a host can see in a profile or a panic message.
@@ -1289,8 +1436,8 @@ where
     let (budget, write) = (deadline.budget, deadline.write);
     let started = std::time::Instant::now();
     // ★ A read reserves its slot BEFORE it starts (ledger #1427); see `Evaluations`. An update
-    // runs on the store's one writer thread, which bounds updates to one core already, so it
-    // takes no slot; it is still refused while the cap is filled by overdue work.
+    // takes no read slot; it is refused here while the cap is filled by overdue work, and takes
+    // its place among the running updates when its job starts (`Evaluations::start_write`).
     let slot = if writer.is_none() {
         evaluations.reserve(&limits, &caller, budget, deadline.work.as_deref())?;
         true
@@ -1313,14 +1460,43 @@ where
         state: Arc::clone(&deadline.state),
         slot,
         caller: caller.clone(),
+        write: false,
+        ran: false,
     };
+    // The writer thread the job is running on, once it runs: a refused write's thread is
+    // replaced (ledger #3271).
+    let running_on: Arc<Mutex<Option<std::thread::ThreadId>>> = Arc::default();
+    let running = Arc::clone(&running_on);
+    let on_writer = writer.is_some();
     let body = move || {
-        let hold = hold;
+        let mut hold = hold;
+        // ★ Here and not at admission (ledger #3271): a write admitted while the writer was
+        // healthy can reach its turn after the writes ahead of it were refused and left their
+        // threads pinned.
+        if on_writer {
+            match hold.evaluations.start_write(&limits, &deadline.state) {
+                Ok(true) => hold.write = true,
+                Ok(false) => return,
+                Err(refusal) => {
+                    let _ = tx.send(Ok(Err(refusal)));
+                    return;
+                }
+            }
+        }
         // A write can wait in the writer's queue past its caller's budget: then the caller has
         // already been answered and counted it overdue, and running it would only be work
         // whose commit `settle` refuses. `hold` leaves the count when it drops.
-        if *lock(&deadline.state) == State::Abandoned {
-            return;
+        {
+            let state = lock(&deadline.state);
+            if *state == State::Abandoned {
+                return;
+            }
+            // Under the state lock, so a caller that gives up sees it either way.
+            if on_writer {
+                *running.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(std::thread::current().id());
+                hold.ran = true;
+            }
         }
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&deadline)));
         {
@@ -1328,6 +1504,9 @@ where
             if *state != State::Abandoned {
                 *state = State::Settled;
             }
+            // Under the state lock too: a caller that gives up before this counted the write
+            // as pinned, and one after it finds nothing to replace (`Writer::replace`).
+            *running.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         // The slot is free before the caller hears, so a caller that asks again at once
         // never finds its own last evaluation still holding it.
@@ -1361,8 +1540,19 @@ where
                     *state = State::Abandoned;
                     // Counted under the state lock, so the worker's `Hold` sees `Abandoned`
                     // only once the count holds it.
-                    evaluations.abandoned(&caller, slot);
+                    let pinned = running_on
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some();
+                    evaluations.abandoned(&caller, slot, pinned);
                     token.cancel();
+                    drop(state);
+                    // ★ A write oxigraph does not stop keeps its thread (ledger #3271): the
+                    // queue behind it moves to another, and its write lock is taken over by
+                    // the next writer (`WriteLock`). It can never commit.
+                    if let Some(writer) = writer {
+                        writer.replace(&running_on);
+                    }
                     return Err(timeout(
                         budget,
                         write,
@@ -1414,10 +1604,18 @@ where
 ///   principal) may hold at most its share ([`Limits::share`]), so one caller leaves the
 ///   others room.
 ///
-/// Updates hold no slot (they run on the store's one writer thread) but are counted overdue
-/// against their caller and the shared pool like reads, and refused at once on the same
-/// terms. The STORE-WIDE at-once refusal reads only overdue READS, the evaluations that hold
-/// slots: an overdue update holds no core of the cap's, so it never refuses the host's read.
+/// Updates hold no slot but are counted overdue against their caller and the shared pool like
+/// reads, and refused at once on the same terms. The STORE-WIDE at-once refusal reads only
+/// overdue READS, the evaluations that hold slots: an overdue update holds no read slot, so it
+/// never refuses the host's read.
+///
+/// ★ **The running updates have a cap of their own** (ledger #3271), the same number, and no
+/// caller is exempt from it. The host's reserve and its freedom from the shares do not reach
+/// it: they say whose reads go first, and this says how many threads refused updates can hold.
+/// While that many running updates are overdue a new one is refused as its job starts
+/// ([`writers_full`]), not made to wait: an update oxigraph cannot stop can run for far longer
+/// than a budget, so waiting would only spend the budget and then refuse it anyway, as the
+/// overdue reads' refusal already reasons.
 #[derive(Debug, Default)]
 // On wasm an evaluation runs inline, so nothing waits on `changed` or reads `running`.
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
@@ -1438,6 +1636,10 @@ struct Counts {
     overdue: usize,
     /// The reads among `overdue`, each of which holds a slot.
     overdue_reads: usize,
+    /// Updates running on a writer thread, everyone's, the host's too: at most `cap.max`.
+    writes: usize,
+    /// The updates among `writes` whose callers gave up, each holding its thread.
+    overdue_writes: usize,
     /// Every caller but the host, together: what [`Limits::pool`] bounds.
     shared: Tally,
     /// Each caller but the host: what [`Limits::share`] bounds. Keyed by principal, `None`
@@ -1556,6 +1758,33 @@ impl Evaluations {
         }
     }
 
+    /// Take a running update's place, on the writer thread as its job starts. `Ok(false)` when
+    /// its caller gave up while it waited, and a refusal while the cap is full of overdue
+    /// updates. It waits only for updates still inside their budgets, which overlap only when
+    /// the writer moved to a larger stack.
+    #[cfg(not(target_family = "wasm"))]
+    fn start_write(&self, limits: &Limits, state: &Mutex<State>) -> Result<bool> {
+        loop {
+            {
+                let mut counts = self.counts();
+                if counts.overdue_writes >= limits.cap.max {
+                    return Err(writers_full(&counts, limits));
+                }
+                if counts.writes < limits.cap.max {
+                    counts.writes += 1;
+                    return Ok(true);
+                }
+                // Its own caller can give up between the look below and this wait, so look
+                // again now and then, as `WriteLock::take` does.
+                drop(self.changed.wait_timeout(counts, Duration::from_millis(10)));
+            }
+            // Outside the counts: the lock order is state, then counts.
+            if *lock(state) == State::Abandoned {
+                return Ok(false);
+            }
+        }
+    }
+
     /// Take a slot for `caller`'s read, waiting at most `budget` for one. Refused at once while
     /// what it may use is filled by overdue evaluations, and when no slot came free within the
     /// budget.
@@ -1590,15 +1819,18 @@ impl Evaluations {
         }
     }
 
-    /// `caller` gave up on its evaluation (a read when `read`), which is still running (or
-    /// queued).
+    /// `caller` gave up on its evaluation (a read when `read`, an update running on a writer
+    /// thread when `pinned`), which is still running (or queued).
     #[cfg(not(target_family = "wasm"))]
-    fn abandoned(&self, caller: &Caller, read: bool) {
+    fn abandoned(&self, caller: &Caller, read: bool, pinned: bool) {
         {
             let mut counts = self.counts();
             counts.overdue += 1;
             if read {
                 counts.overdue_reads += 1;
+            }
+            if pinned {
+                counts.overdue_writes += 1;
             }
             counts.adjust(caller, |t| t.overdue += 1);
         }
@@ -1656,6 +1888,21 @@ fn at_the_cap(
             limits.shares()
         ),
     })
+}
+
+/// The refusal of an update while the cap is full of updates still running after their callers
+/// gave up (ledger #3271). The same for every caller: the host has no reserve here.
+#[cfg(not(target_family = "wasm"))]
+fn writers_full(counts: &Counts, limits: &Limits) -> Error {
+    Error::Unavailable(format!(
+        "Retry shortly. {} SPARQL updates on this store are still running after their callers' \
+         time budgets ran out (the most it allows is {}); oxigraph cannot always stop one \
+         partway, so this update was refused before it started rather than given another \
+         thread. Nothing was written. {}",
+        counts.overdue_writes,
+        limits.cap.max,
+        limits.cap.origin()
+    ))
 }
 
 /// The refusal when no slot `caller` may use came free within its `budget`.
@@ -1770,6 +2017,10 @@ struct Hold {
     state: Arc<Mutex<State>>,
     slot: bool,
     caller: Caller,
+    /// Holds a running update's place ([`Evaluations::start_write`]).
+    write: bool,
+    /// Started on a writer thread: if its caller gave up, it was counted as pinned.
+    ran: bool,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1790,6 +2041,12 @@ impl Drop for Hold {
                 if slot {
                     counts.overdue_reads = counts.overdue_reads.saturating_sub(1);
                 }
+                if self.ran {
+                    counts.overdue_writes = counts.overdue_writes.saturating_sub(1);
+                }
+            }
+            if self.write {
+                counts.writes = counts.writes.saturating_sub(1);
             }
             counts.adjust(&self.caller, |t| {
                 if slot {
@@ -3235,6 +3492,409 @@ mod tests {
         .unwrap();
         assert_eq!(got, 7);
         assert_eq!(overdue.overdue(), 0);
+    }
+
+    #[test]
+    fn review_host_refused_writes_are_bounded_by_the_overdue_cap() {
+        let evaluations = Arc::new(Evaluations::default());
+        let writer = Writer::default();
+        let active = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(WriteLock::default());
+        let mut releases = Vec::new();
+        let mut outcomes = Vec::new();
+        for _ in 0..3 {
+            let (release, wait) = std::sync::mpsc::channel();
+            releases.push(release);
+            let active = Arc::clone(&active);
+            let writes = Arc::clone(&writes);
+            outcomes.push(run(
+                "q",
+                true,
+                Duration::from_millis(100),
+                &evaluations,
+                Admission {
+                    limits: Limits::only_the_cap(1),
+                    caller: Caller::Host,
+                },
+                Some(&writer),
+                move |deadline| {
+                    let _guard = writes.lock_for(deadline);
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _ = wait.recv_timeout(Duration::from_secs(10));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            ));
+        }
+        let pinned = active.load(Ordering::SeqCst);
+        let overdue = evaluations.overdue();
+        for release in releases {
+            let _ = release.send(());
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while evaluations.overdue() != 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(pinned <= 1, "cap=1 but {pinned} separate writer threads are pinned; overdue={overdue}; answers={outcomes:?}");
+    }
+
+    #[test]
+    fn a_taken_over_guard_releases_nothing_when_it_drops() {
+        let writes = Arc::new(WriteLock::default());
+        let first = Deadline::never();
+        let old = writes.lock_for(&first);
+        *lock(&first.state) = State::Abandoned;
+        let next = writes.lock();
+        drop(old);
+        assert!(writes.holding.lock().unwrap().holder.is_some());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = Arc::clone(&writes);
+        let waiter = std::thread::spawn(move || {
+            let _guard = other.lock();
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(next);
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn abandonment_and_commit_are_mutually_exclusive() {
+        let deadline = Arc::new(Deadline::never());
+        let committing = Arc::clone(&deadline);
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let commit = std::thread::spawn(move || {
+            committing.settle(|| {
+                entered.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            deadline.state.try_lock().is_err(),
+            "commit must retain the state mutex"
+        );
+        release.send(()).unwrap();
+        commit.join().unwrap().unwrap();
+        assert!(*lock(&deadline.state) == State::Settled);
+        *lock(&deadline.state) = State::Abandoned;
+        assert!(matches!(
+            deadline.settle::<()>(|| panic!("abandoned commit ran")),
+            Err(Error::Timeout(_))
+        ));
+        assert!(*lock(&deadline.state) == State::Abandoned);
+    }
+
+    #[test]
+    fn a_replaced_writer_keeps_queued_jobs_in_order_with_their_replies() {
+        let writer = Writer::default();
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        writer
+            .submit(
+                crate::limits::STACK_BASE,
+                Box::new(move || {
+                    started.send(std::thread::current().id()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }),
+            )
+            .unwrap();
+        let stuck = started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut answers = Vec::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        for index in 0..20 {
+            let (answer, received) = std::sync::mpsc::channel();
+            answers.push(received);
+            let order = Arc::clone(&order);
+            writer
+                .submit(
+                    crate::limits::STACK_BASE,
+                    Box::new(move || {
+                        order.lock().unwrap().push(index);
+                        answer.send(index).unwrap();
+                    }),
+                )
+                .unwrap();
+        }
+        writer.replace(&Mutex::new(Some(stuck)));
+        for (index, received) in answers.into_iter().enumerate() {
+            assert_eq!(
+                received.recv_timeout(Duration::from_secs(5)).unwrap(),
+                index
+            );
+        }
+        assert_eq!(*order.lock().unwrap(), (0..20).collect::<Vec<_>>());
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn a_panicking_guard_releases_the_hold() {
+        let writes = WriteLock::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = writes.lock();
+            panic!("guard unwind");
+        }));
+        assert!(result.is_err());
+        assert!(writes.holding.lock().unwrap().holder.is_none());
+        let _guard = writes.lock();
+    }
+
+    /// Queue a job that reports the thread it ran on.
+    fn thread_of_next_job(writer: &Writer) -> std::sync::mpsc::Receiver<std::thread::ThreadId> {
+        let (answer, received) = std::sync::mpsc::channel();
+        writer
+            .submit(
+                crate::limits::STACK_BASE,
+                Box::new(move || answer.send(std::thread::current().id()).unwrap()),
+            )
+            .unwrap();
+        received
+    }
+
+    /// One of the two orders `Writer::replace` allows: the write is still running, so its
+    /// thread is retired first and never takes another job, before or after the write ends.
+    #[test]
+    fn a_retired_writer_takes_no_job_after_its_stuck_one() {
+        let writer = Writer::default();
+        let (started, on) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        writer
+            .submit(
+                crate::limits::STACK_BASE,
+                Box::new(move || {
+                    started.send(std::thread::current().id()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                }),
+            )
+            .unwrap();
+        let stuck = on.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before: Vec<_> = (0..8).map(|_| thread_of_next_job(&writer)).collect();
+        writer.replace(&Mutex::new(Some(stuck)));
+        release.send(()).unwrap();
+        let after: Vec<_> = (0..8).map(|_| thread_of_next_job(&writer)).collect();
+        let threads: Vec<_> = before
+            .into_iter()
+            .chain(after)
+            .map(|job| job.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        assert!(!threads.contains(&stuck), "a retired thread took a job");
+        assert!(threads.iter().all(|thread| *thread == threads[0]));
+    }
+
+    /// The other order: the write ended before its caller got to `replace`, so the thread is
+    /// not stuck and keeps the queue, and no second thread takes jobs beside it.
+    #[test]
+    fn a_write_that_ended_first_leaves_its_thread_on_the_queue() {
+        let writer = Writer::default();
+        let first = thread_of_next_job(&writer)
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        writer.replace(&Mutex::new(None));
+        for _ in 0..8 {
+            let next = thread_of_next_job(&writer)
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(next, first, "a thread that was not stuck was replaced");
+        }
+    }
+
+    /// An update under `limits` for the host, whose work ends when `wait` hears or closes.
+    fn host_update(
+        text: &str,
+        budget: Duration,
+        evaluations: &Arc<Evaluations>,
+        writer: &Writer,
+        limits: Limits,
+        wait: std::sync::mpsc::Receiver<()>,
+    ) -> Result<std::thread::ThreadId> {
+        run(
+            text,
+            true,
+            budget,
+            evaluations,
+            Admission {
+                limits,
+                caller: Caller::Host,
+            },
+            Some(writer),
+            move |_| {
+                let _ = wait.recv_timeout(Duration::from_secs(10));
+                Ok(std::thread::current().id())
+            },
+        )
+    }
+
+    /// ★ At the cap the host's next update is refused in plain words, before it starts, and
+    /// writes are served again as soon as the pinned one ends.
+    #[test]
+    fn a_write_at_the_writer_cap_is_refused_naming_the_cap_and_the_writer_recovers() {
+        let evaluations = counter();
+        let writer = Writer::default();
+        let limits = Limits::only_the_cap(1);
+        let short = Duration::from_millis(100);
+        let (release, wait) = std::sync::mpsc::channel();
+        let pinned = host_update("q", short, &evaluations, &writer, limits, wait);
+        assert!(matches!(pinned, Err(Error::Timeout(_))), "{pinned:?}");
+        let ran = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&ran);
+        let refused = run(
+            "q",
+            true,
+            Duration::from_secs(5),
+            &evaluations,
+            Admission {
+                limits,
+                caller: Caller::Host,
+            },
+            Some(&writer),
+            move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        let Err(Error::Unavailable(message)) = &refused else {
+            panic!("{refused:?}");
+        };
+        for words in [
+            "Retry shortly. 1 SPARQL updates",
+            "still running",
+            "the most it allows is 1",
+            "Nothing was written.",
+            "The cap of 1 was set by the host",
+            "TimeBudget::with_max_overdue",
+        ] {
+            assert!(message.contains(words), "{words}: {message}");
+        }
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "a refused update ran");
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while evaluations.overdue() != 0 {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (closed, wait) = std::sync::mpsc::channel();
+        drop(closed);
+        let next = host_update(
+            "q",
+            Duration::from_secs(5),
+            &evaluations,
+            &writer,
+            limits,
+            wait,
+        );
+        assert!(next.is_ok(), "{next:?}");
+        let counts = evaluations.counts();
+        assert_eq!((counts.writes, counts.overdue_writes), (0, 0));
+    }
+
+    /// A write admitted while the writer was healthy, whose turn comes after the write ahead of
+    /// it was refused and pinned: the check is at its start, so it does not become a second one.
+    #[test]
+    fn a_write_queued_before_the_cap_filled_is_refused_at_its_turn() {
+        let evaluations = counter();
+        let writer = Arc::new(Writer::default());
+        let limits = Limits::only_the_cap(1);
+        let (release, wait) = std::sync::mpsc::channel();
+        let first = {
+            let (evaluations, writer) = (Arc::clone(&evaluations), Arc::clone(&writer));
+            std::thread::spawn(move || {
+                host_update(
+                    "q",
+                    Duration::from_millis(200),
+                    &evaluations,
+                    &writer,
+                    limits,
+                    wait,
+                )
+            })
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        while evaluations.counts().writes != 1 {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (_held, wait) = std::sync::mpsc::channel();
+        let queued = host_update(
+            "q",
+            Duration::from_secs(5),
+            &evaluations,
+            &writer,
+            limits,
+            wait,
+        );
+        assert!(
+            matches!(&queued, Err(Error::Unavailable(m)) if m.contains("the most it allows is 1")),
+            "{queued:?}"
+        );
+        assert_eq!(evaluations.counts().writes, 1, "a second write ran");
+        assert!(matches!(first.join().unwrap(), Err(Error::Timeout(_))));
+        release.send(()).unwrap();
+    }
+
+    /// The one way two healthy writes overlap is a move to a larger stack: at a cap of 1 the
+    /// larger one waits for the first, and is not refused, since nothing is overdue.
+    #[test]
+    fn a_write_on_a_larger_stack_waits_for_a_healthy_one_at_the_cap() {
+        let evaluations = counter();
+        let writer = Arc::new(Writer::default());
+        let limits = Limits::only_the_cap(1);
+        let (release, wait) = std::sync::mpsc::channel();
+        let first = {
+            let (evaluations, writer) = (Arc::clone(&evaluations), Arc::clone(&writer));
+            std::thread::spawn(move || {
+                host_update(
+                    "q",
+                    Duration::from_secs(30),
+                    &evaluations,
+                    &writer,
+                    limits,
+                    wait,
+                )
+            })
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        while evaluations.counts().writes != 1 {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let ran = Arc::new(AtomicUsize::new(0));
+        let larger = {
+            let (evaluations, writer, seen) = (
+                Arc::clone(&evaluations),
+                Arc::clone(&writer),
+                Arc::clone(&ran),
+            );
+            std::thread::spawn(move || {
+                run(
+                    &"q".repeat(64 << 10),
+                    true,
+                    Duration::from_secs(30),
+                    &evaluations,
+                    Admission {
+                        limits,
+                        caller: Caller::Host,
+                    },
+                    Some(&writer),
+                    move |_| {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "two writes ran at a cap of 1"
+        );
+        release.send(()).unwrap();
+        assert!(first.join().unwrap().is_ok());
+        assert_eq!(larger.join().unwrap(), Ok(()));
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
     #[test]

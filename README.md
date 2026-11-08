@@ -1194,8 +1194,11 @@ two into one shared module):
    `TimeBudget::with_max_overdue` raises it (ledger #1500), because the default is 2 on a
    machine under 12 cores and 4 on an 18-core laptop (in 0.2.23, 1 under 8 cores), and the
    same refusal reads like two
-   different failures. Updates run on the store's one writer thread,
-   so they hold at most one more core. Through 0.2.20 the cap was checked against the overdue
+   different failures. Updates take no read slot, but a refused update oxigraph cannot stop
+   keeps its writer thread while another takes the queue, so at most `TimeBudget::max_overdue`
+   updates run at once, the host's included. While that many are overdue a new update is
+   refused with `Error::Unavailable`, naming the cap, rather than given another thread
+   (ledger #3271). Through 0.2.20 the cap was checked against the overdue
    count alone, which rises only at a timeout, so eight requests arriving together at a cap
    of 1 all started and left eight cores pinned (`tests/overdue_cap_in_flight.rs`).
 4. ★ **No one caller can fill the cap, and the host always has room** (**since 0.2.24**,
@@ -1279,8 +1282,10 @@ budget grant is never REQUIRED, so it appears in no endpoint's declared `require
   The caller is answered at the budget and the cores are capped, but the core is not
   released until oxigraph's loop ends. The real fix is upstream: `spareval` checking its
   token in those loops.
-- **An overdue update keeps the write lock** until its worker ends, so other writes wait (and
-  time out) behind it. It still commits nothing.
+- **An overdue update keeps a thread, not the writer** (ledger #3271): the next write takes
+  over its write lock and the queue moves to another thread, on RocksDB. It still commits
+  nothing. ⚠ On the in-memory backend oxigraph admits one transaction at a time, so a write
+  behind it still waits until its evaluation ends.
 - **`urn:iki:store:load` is not budgeted**: it parses RDF, not SPARQL, and is linear.
 - **Memory is not budgeted here** — the answer's SIZE is, in the next section (0.2.9).
 - **On wasm there are no threads**, so an evaluation runs inline: only the algebra bounds
