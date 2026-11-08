@@ -857,8 +857,9 @@ impl DurableStore {
     /// next reads a quad. A number that STAYS up is a query shape oxigraph cannot stop
     /// partway (see [`crate::budget`]), holding a core each. At most
     /// [`TimeBudget::max_overdue`] reads run at once, so at most that many overdue reads hold
-    /// cores; updates count here too (the one on the writer thread, and any whose callers gave
-    /// up while they waited in its queue, which hold no core). While every slot is held by an
+    /// cores; updates count here too (those still running, at most that many again, each
+    /// holding a writer thread, and any whose callers gave up while they waited in its queue,
+    /// which hold no core). While every slot is held by an
     /// overdue read the store refuses new evaluations until one ends (ledger #1427); and one
     /// caller holds at most its share, every caller but the host at most the cap less the
     /// host's reserve (ledger #1002, [`TimeBudget::with_caller_share`],

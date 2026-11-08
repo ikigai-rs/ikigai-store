@@ -56,7 +56,9 @@ Followed by reading the source:
   (`an_escape_refusal_names_graphs_and_never_data`), `tests/service_egress.rs`
   (`the_refusal_says_where_remote_data_comes_in_instead`), `tests/shared_writer.rs`
   (`the_raw_write_refusal_names_the_declaration_and_the_way_out`), and `tests/timeout_wording.rs`
-  and `tests/overdue_cap_wording.rs`, which hold the time-budget refusals.
+  and `tests/overdue_cap_wording.rs`, which hold the time-budget refusals, and
+  `a_write_at_the_writer_cap_is_refused_naming_the_cap_and_the_writer_recovers` in
+  `src/budget.rs`, which holds the refusal at the cap on running updates.
 - **No automated accessibility checker, browser or assistive technology has been used on this
   output.**
 
