@@ -19,7 +19,10 @@ being a warm-up cost.
 > scoped content store). No behavior changes in this crate, which never calls
 > `ContentStore::put` or `put_replay`; it is a minor because core's types are in this crate's
 > API, so a consumer moves to `ikigai-core = "0.3.0"` and `ikigai-store = "0.4.0"` together.
-> Incremental load and streamed query answers are still pending.
+> Since then, a behavior change in `urn:iki:store:graph-update`: a `DELETE` naming another
+> graph or the default graph, and a `WHERE` reading the default graph, are refused rather than
+> applied as no-ops (ledger #1612, below). Incremental load and streamed query answers are
+> still pending.
 
 ```rust
 use ikigai_core::Kernel;
@@ -228,6 +231,8 @@ transaction. So the shapes that defeat a syntactic check are handled by construc
 | `INSERT DATA { GRAPH <other> { … } }`, `WITH <other> … USING <G> …`, `COPY`/`MOVE`/`ADD … TO <other>` | **refused** |
 | `CREATE GRAPH <other>` | **refused** — no quad, but it registers a graph |
 | `WITH <other> …`, `USING <other>`, `USING NAMED <other>`, `… WHERE { GRAPH <other> { … } }` (an `EXISTS` or a sub-select included), `COPY`/`MOVE`/`ADD <other> TO <G>` | **refused by name**, before evaluation — it reads another graph (**since 0.2.24**, ledger #1606; 0.2.23 applies it as a no-op) |
+| `DELETE DATA { GRAPH <other> { … } }`, `DELETE { GRAPH <other> { … } } WHERE …`, `WITH <other> DELETE … USING <G> …`, a `DELETE` of the default graph | **refused by name**, before evaluation — it would remove nothing (**unreleased, after 0.3.3**, ledger #1612; 0.3.3 answers `-0`) |
+| `… WHERE { ?s ?p ?o }` with no `GRAPH` block, `WITH <G>` or `USING <G>` (`COPY DEFAULT TO <G>` included) | **refused**, before evaluation — it reads the empty default graph (**unreleased, after 0.3.3**, ledger #1612; 0.3.3 answers `+0 -0`, and `COPY DEFAULT TO <G>` empties `G`) |
 | `DROP ALL`, `CLEAR ALL`, `DELETE WHERE { GRAPH ?g { … } }` | applied to `G` alone — the private copy held only `G`, and emptying `G` is within a grant over `G` |
 | `… WHERE { GRAPH ?g { … } }` | applied — `?g` can bind `G` and nothing else |
 
@@ -244,10 +249,22 @@ emptied `G`. Each looked like success. Now a constant graph other than `G` in `W
 `USING NAMED`, or a `GRAPH` block anywhere in a `WHERE` refuses the update with
 `InvalidArgument` on `content`, naming every such graph and where it appeared, before anything
 is evaluated: the write-side twin of the scoped reads' refusal of `GRAPH <other>` (0.2.22,
-ledger #388). Two things are still not refused, because they name no graph: `GRAPH ?g`, which
-binds `G` alone, and a pattern outside any `GRAPH` block, which reads the private copy's empty
-default graph and matches nothing — wrap it in `GRAPH <G> { … }` or say `USING <G>` (or
-`WITH <G>`). A caller without the read grant is refused on the grant first, as before.
+ledger #388). `GRAPH ?g` is not refused: it names no graph and binds `G` alone. A caller
+without the read grant is refused on the grant first, as before.
+
+★ **So is a `WHERE` that reads the default graph, and a `DELETE` that names another graph**
+(**unreleased, after 0.3.3**, ledger #1612). A pattern outside any `GRAPH` block, with no
+`WITH <G>` or `USING <G>` to make `G` its default graph, reads the private copy's default
+graph, which is empty: `INSERT { GRAPH <G> { … } } WHERE { ?s ?p ?o }` answered `+0 -0`, and
+`COPY DEFAULT TO <G>` emptied `G`. It is refused, saying to wrap the pattern in
+`GRAPH <G> { … }` or begin with `WITH <G>`. (A scoped READ treats `G` as the default graph
+instead; the update door refuses, so that reading can still be chosen later without changing
+an update anyone has seen applied.) And a `DELETE DATA` quad or `DELETE` template in another
+graph or the default graph removed nothing from the private copy and answered `-0`, including
+`WITH <other> DELETE … USING <G>`, where `USING` takes the `WHERE` and `WITH` is left naming
+the templates. It is refused by name; a write-only caller's `DELETE DATA` reaches this
+refusal too, which is decided on the text and says nothing about the data. Still not refused:
+`CLEAR`/`DROP` of another graph or `DEFAULT`, which answer `+0 -0`.
 
 ★ **And an update with a `WHERE` needs the READ grant too** (ledger #751). A `WHERE`
 reads the graph it matches against, so a caller holding only the write grant could once

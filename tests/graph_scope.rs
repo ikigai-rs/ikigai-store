@@ -292,7 +292,8 @@ fn holds_subject(kernel: &Kernel, graph: &str, subject: &str) -> bool {
 ///
 /// The four rows that name another graph to READ (`GRAPH <other>`, `USING`, `USING NAMED`,
 /// `WITH`) applied as no-ops until ledger #1606 and are refused by name before evaluation
-/// now; the assertions after the outcome hold either way.
+/// now, and so is the row that reads the default graph by naming nothing (ledger #1612); the
+/// assertions after the outcome hold either way.
 #[test]
 fn a_narrow_footprint_reads_and_writes_nothing_outside_the_graph() {
     let copied = |from: &str| {
@@ -314,7 +315,7 @@ fn a_narrow_footprint_reads_and_writes_nothing_outside_the_graph() {
             copied(&format!("USING <{OTHER}>")),
             "refused",
         ),
-        ("the default graph, named by nothing", copied(""), "applied"),
+        ("the default graph, named by nothing", copied(""), "refused"),
         (
             "USING NAMED <other> with a variable graph",
             format!(

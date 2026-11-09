@@ -262,96 +262,134 @@ pub(crate) fn graphs_outside(query: &Query, set: &[NamedNode]) -> Vec<NamedNode>
 /// [`graphs_outside`] runs over a query, and `confine::graphs_read` over an update's `WHERE`
 /// (ledger #1606).
 pub(crate) fn pattern_graphs(pattern: &GraphPattern, out: &mut BTreeSet<NamedNode>) {
-    match pattern {
-        GraphPattern::Graph { name, inner } => {
-            if let NamedNodePattern::NamedNode(graph) = name {
-                out.insert(graph.clone());
-            }
-            pattern_graphs(inner, out);
+    walk(pattern, &mut |node| {
+        if let GraphPattern::Graph {
+            name: NamedNodePattern::NamedNode(graph),
+            ..
+        } = node
+        {
+            out.insert(graph.clone());
         }
+        true
+    });
+}
+
+/// Whether `pattern` matches a triple pattern or a path OUTSIDE every `GRAPH` block, `EXISTS`
+/// and sub-selects included: whether it reads the dataset's default graph (ledger #1612). A
+/// `GRAPH ?g` block counts as a named graph, and so does everything inside it.
+pub(crate) fn reads_the_default_graph(pattern: &GraphPattern) -> bool {
+    let mut reads = false;
+    walk(pattern, &mut |node| match node {
+        GraphPattern::Graph { .. } => false,
+        // A SERVICE is refused at the door before this runs, and reads a remote dataset.
+        GraphPattern::Service { .. } => false,
+        GraphPattern::Bgp { patterns } => {
+            reads |= !patterns.is_empty();
+            false
+        }
+        GraphPattern::Path { .. } => {
+            reads = true;
+            false
+        }
+        _ => !reads,
+    });
+    reads
+}
+
+/// Visit every node of `pattern`, `EXISTS` included in every expression position, descending
+/// below a node only while `visit` answers `true` for it.
+fn walk<'a>(pattern: &'a GraphPattern, visit: &mut impl FnMut(&'a GraphPattern) -> bool) {
+    if !visit(pattern) {
+        return;
+    }
+    match pattern {
+        GraphPattern::Graph { inner, .. } => walk(inner, visit),
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
         // A SERVICE is refused at the door before this runs; its inner pattern is walked
         // anyway so the walk stays a statement about the algebra and not about call order.
-        GraphPattern::Service { inner, .. } => pattern_graphs(inner, out),
+        GraphPattern::Service { inner, .. } => walk(inner, visit),
         GraphPattern::Join { left, right }
         | GraphPattern::Lateral { left, right }
         | GraphPattern::Union { left, right }
         | GraphPattern::Minus { left, right } => {
-            pattern_graphs(left, out);
-            pattern_graphs(right, out);
+            walk(left, visit);
+            walk(right, visit);
         }
         GraphPattern::LeftJoin {
             left,
             right,
             expression,
         } => {
-            pattern_graphs(left, out);
-            pattern_graphs(right, out);
+            walk(left, visit);
+            walk(right, visit);
             if let Some(expression) = expression {
-                expression_graphs(expression, out);
+                expression_walk(expression, visit);
             }
         }
         GraphPattern::Filter { expr, inner } => {
-            expression_graphs(expr, out);
-            pattern_graphs(inner, out);
+            expression_walk(expr, visit);
+            walk(inner, visit);
         }
         GraphPattern::Extend {
             inner, expression, ..
         } => {
-            expression_graphs(expression, out);
-            pattern_graphs(inner, out);
+            expression_walk(expression, visit);
+            walk(inner, visit);
         }
         GraphPattern::OrderBy { inner, expression } => {
             for order in expression {
                 match order {
-                    OrderExpression::Asc(e) | OrderExpression::Desc(e) => expression_graphs(e, out),
+                    OrderExpression::Asc(e) | OrderExpression::Desc(e) => expression_walk(e, visit),
                 }
             }
-            pattern_graphs(inner, out);
+            walk(inner, visit);
         }
         GraphPattern::Group {
             inner, aggregates, ..
         } => {
             for (_, aggregate) in aggregates {
                 match aggregate {
-                    AggregateExpression::FunctionCall { expr, .. } => expression_graphs(expr, out),
+                    AggregateExpression::FunctionCall { expr, .. } => expression_walk(expr, visit),
                     AggregateExpression::CountSolutions { .. } => {}
                 }
             }
-            pattern_graphs(inner, out);
+            walk(inner, visit);
         }
         GraphPattern::Project { inner, .. }
         | GraphPattern::Distinct { inner }
         | GraphPattern::Reduced { inner }
-        | GraphPattern::Slice { inner, .. } => pattern_graphs(inner, out),
+        | GraphPattern::Slice { inner, .. } => walk(inner, visit),
     }
 }
 
-fn expression_graphs(expression: &Expression, out: &mut BTreeSet<NamedNode>) {
+fn expression_walk<'a>(
+    expression: &'a Expression,
+    visit: &mut impl FnMut(&'a GraphPattern) -> bool,
+) {
     match expression {
         Expression::NamedNode(_)
         | Expression::Literal(_)
         | Expression::Variable(_)
         | Expression::Bound(_) => {}
-        Expression::Exists(pattern) => pattern_graphs(pattern, out),
+        Expression::Exists(pattern) => walk(pattern, visit),
         Expression::In(e, members) => {
-            expression_graphs(e, out);
+            expression_walk(e, visit);
             for member in members {
-                expression_graphs(member, out);
+                expression_walk(member, visit);
             }
         }
         Expression::Coalesce(args) | Expression::FunctionCall(_, args) => {
             for arg in args {
-                expression_graphs(arg, out);
+                expression_walk(arg, visit);
             }
         }
         Expression::If(a, b, c) => {
-            expression_graphs(a, out);
-            expression_graphs(b, out);
-            expression_graphs(c, out);
+            expression_walk(a, visit);
+            expression_walk(b, visit);
+            expression_walk(c, visit);
         }
         Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
-            expression_graphs(e, out)
+            expression_walk(e, visit)
         }
         Expression::Or(a, b)
         | Expression::And(a, b)
@@ -365,8 +403,8 @@ fn expression_graphs(expression: &Expression, out: &mut BTreeSet<NamedNode>) {
         | Expression::Subtract(a, b)
         | Expression::Multiply(a, b)
         | Expression::Divide(a, b) => {
-            expression_graphs(a, out);
-            expression_graphs(b, out);
+            expression_walk(a, visit);
+            expression_walk(b, visit);
         }
     }
 }
