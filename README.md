@@ -558,6 +558,8 @@ type bypasses the read boundary entirely.
 
 `urn:iki:store:info` counts the whole store under the broad `urn:cap:store:read`, so a tenant
 holding only `urn:cap:store:read:graph:<G>` could not ask how large its own graph is.
+The whole-store count scans within the caller's time budget (which `budget=` may lower);
+expiration refuses the answer with `Timeout`, never a partial count.
 `urn:iki:store:graph-info` answers under exactly that grant:
 
 ```text
