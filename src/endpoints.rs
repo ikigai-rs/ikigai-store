@@ -1006,17 +1006,26 @@ impl Endpoint for InfoEndpoint {
         self.store.serving()?;
         match inv.request.verb {
             Verb::Source => {
-                // ⚠ `Store::len()` is a FULL SCAN, not metadata: measured 2.4 µs empty,
-                // 7.3 ms at 100k quads, 72 ms at 1M (see docs/design/handle-model.md).
-                // That is affordable here only because this face is cacheable under the
-                // write threads on a covered store, so the scan is paid once per write
-                // rather than once per read. On a SHARED store it is paid every time —
-                // another cost of handing out the handle, and stated in the output.
+                let requested = crate::budget::inline_bound(inv, "budget")?;
+                let budget = crate::budget::effective_budget(
+                    requested,
+                    self.store.time_budget().for_capability(inv.capability),
+                )?;
+                let store = Arc::clone(&self.store);
+                // Counting is a full scan, including on shared stores where every read
+                // counts again. Check between quads so an expired scan stops promptly.
                 let quads = self
                     .store
-                    .dataset()
-                    .len()
-                    .map_err(|e| Error::Endpoint(format!("counting quads: {e}")))?;
+                    .evaluate("", false, inv.capability, requested, move |deadline| {
+                        let mut quads: u64 = 0;
+                        for quad in store.snapshot_iter() {
+                            deadline.check()?;
+                            quad.map_err(|e| Error::Endpoint(format!("counting quads: {e}")))?;
+                            quads += 1;
+                        }
+                        Ok(quads)
+                    })
+                    .map_err(|e| scan_timeout(e, "counting quads", budget))?;
                 // ★ This is whole-dataset PROVENANCE — did the handle leave this crate —
                 // and not a caching verdict, which is why it reads `is_sole_writer` and
                 // not `read_is_covered`: an operator asking this face wants to know what
@@ -1075,11 +1084,14 @@ impl Endpoint for InfoEndpoint {
                  was handed out at construction, so this face and the broad query faces \
                  are never cached). A `sharer writes:` line, when present, names the \
                  graphs the host declared that handle's holder may write — every OTHER \
-                 named graph is one whose scoped reads are cached under that promise.",
+                 named graph is one whose scoped reads are cached under that promise. \
+                 Counting scans the whole store within the caller's time budget; a count \
+                 past that budget is refused with nothing answered.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
             .requires(CAP_READ)
+            .input(budget_arg())
             .output("text/plain")
     }
 }
@@ -1282,7 +1294,7 @@ fn granted_graphs(inv: &Invocation<'_>) -> Vec<NamedNode> {
 /// rewrite is to being refused before it sends one.
 ///
 /// ⚠ **A count is a scan.** oxigraph keeps no per-graph size, so this walks `G`'s quads (as
-/// `Store::len` walks every quad for `info`). It runs within the caller's time budget, and it
+/// `info` walks every quad in the store). It runs within the caller's time budget, and it
 /// is cacheable under the three write threads when the graph is covered, so on an owned store
 /// the scan is paid once per write rather than once per read.
 ///
