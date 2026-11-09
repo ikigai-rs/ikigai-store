@@ -207,7 +207,9 @@
 //! kernel cuts the thread named after a mutating request's target, so a read that
 //! depends on [`UPDATE_THREAD`], [`LOAD_THREAD`] and [`GRAPH_UPDATE_THREAD`] is
 //! invalidated by every write the kernel can see — and under `DurableStore::open` there
-//! are no others. ⚠ **Three writing IRIs means three threads**: adding a write door
+//! are no others. A read confined to named graphs swaps [`GRAPH_UPDATE_THREAD`] for each
+//! graph's [`graph_thread`], so a write to one graph leaves another graph's cached reads
+//! alone. ⚠ **Three writing IRIs means three threads**: adding a write door
 //! without adding its thread leaves every cacheable read serving stale bytes after a
 //! write through it, silently, on the branch that looks like success.
 //!
@@ -294,8 +296,8 @@ pub mod store;
 pub use budget::{AnswerBudget, EvaluationBudget, TimeBudget};
 pub use config::StoreConfig;
 pub use endpoints::{
-    cap_read_graph, cap_write_graph, space, CAP_READ, CAP_READ_ANY, CAP_READ_GRAPH, CAP_WRITE,
-    CAP_WRITE_GRAPH, GRAPH_UPDATE_THREAD, LOAD_THREAD, UPDATE_THREAD,
+    cap_read_graph, cap_write_graph, graph_thread, space, CAP_READ, CAP_READ_ANY, CAP_READ_GRAPH,
+    CAP_WRITE, CAP_WRITE_GRAPH, GRAPH_UPDATE_THREAD, LOAD_THREAD, UPDATE_THREAD,
 };
 pub use store::{
     Backing, DeclaredTransaction, DurableStore, GraphFingerprint, QuadIter, SharedWriter,
