@@ -341,12 +341,12 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # item with any number of dependents in ONE pattern rather than a `UNION` branch each, which ran
 # out of algebra budget past 250 and then fell back to a whole-graph copy. A patch: no public
 # API moves; the only behavior change is that such an update copies less.
-# ★ 0.4.0 MOVES TO IKIGAI-CORE 0.3.0, the scoped content store (ledger #2965; the core 0.3.0 cascade,
-# wave 2, ledger #3040): ikigai-core and ikigai-vocab 0.3.0, ikigai-rdf 0.5.0, and ikigai-conformance
-# 0.14.0 in the test graph. A MINOR, not a patch: core's types (`Endpoint`, `Invocation`,
-# `Representation`, `Kernel`) are in this crate's API, so a consumer on core 0.2 cannot link 0.4.0.
-# This crate never calls `ContentStore::put` or `put_replay`, so nothing moves to `put_for`.
-version = "0.4.0"
+# ★ 0.5.0: per-graph freshness (ledger #3322). A read confined to named graphs hangs on each graph's
+# own thread instead of the global graph-update thread, and a new resource, store-graph-written, is
+# how a scoped write cuts that thread. A MINOR, not a patch: the new resource joins every consumer's
+# served catalog (ikigai-ledger and gonk pin those lists in their tests), and a host that does not
+# route the name refuses scoped writes. Tested against ledger and gonk main on 2026-11-10.
+version = "0.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
