@@ -1,4 +1,4 @@
-//! The fifteen resources this crate binds, under the namespace it owns.
+//! The sixteen resources this crate binds, under the namespace it owns.
 //!
 //! ```text
 //! urn:iki:store:select           Source  SPARQL SELECT            urn:cap:store:read
@@ -16,6 +16,8 @@
 //! urn:iki:store:update           Sink    SPARQL UPDATE, all of it urn:cap:store:write
 //! urn:iki:store:graph-update     Sink    SPARQL UPDATE, one graph urn:cap:store:write:graph:<iri>
 //! urn:iki:store:load             Sink    bulk-load an RDF doc     urn:cap:store:write
+//! urn:iki:store:graph-written:{graph}
+//!                                Sink    cut one graph's thread   urn:cap:store:write:graph:<iri>
 //! ```
 //!
 //! **Two doors in each direction, wide and narrow.** [`CAP_WRITE`] is `DROP ALL`, which
@@ -111,7 +113,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ikigai_core::{
     ArgRef, ArgSpec, Body, Description, Endpoint, EndpointSpace, Error, Exact, FailureClass,
-    Invocation, ReprType, Representation, Result, Verb,
+    Invocation, Iri, ReprType, Representation, Request, Result, UriTemplate, Verb,
 };
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::{
@@ -251,9 +253,10 @@ pub fn cap_read_graph(graph: &str) -> String {
 /// code — it is the target IRI. A cacheable read declares both this and [`LOAD_THREAD`].
 ///
 /// ⚠ **A consumer does not need to depend on these threads itself, and doing so changes
-/// nothing** (ledger #150). Every cacheable read this crate answers already declares all
-/// three ([`UPDATE_THREAD`], [`LOAD_THREAD`], [`GRAPH_UPDATE_THREAD`]), and the kernel carries
-/// a sub-request's threads up to whatever issued it, so a consumer endpoint that reads through
+/// nothing** (ledger #150). Every cacheable read this crate answers already declares the
+/// threads of every write that can change it ([`UPDATE_THREAD`], [`LOAD_THREAD`], and
+/// [`GRAPH_UPDATE_THREAD`] or the [`graph_thread`]s it read), and the kernel carries a
+/// sub-request's threads up to whatever issued it, so a consumer endpoint that reads through
 /// the store and answers `.cacheable()` is invalidated by every store write with no
 /// `depends_on` of its own. `ikigai-ledger` found its own such calls decorative by ablation,
 /// and `tests/consumer_threads.rs` pins it here: a composite naming no thread is cached, then
@@ -275,13 +278,69 @@ pub const LOAD_THREAD: &str = "urn:iki:store:load";
 
 /// The golden thread `urn:iki:store:graph-update` cuts on success.
 ///
-/// ★ **A third writing IRI means a third thread, and a reader must depend on all
-/// three.** Adding a write door without adding its thread would have left every
-/// cacheable read serving stale bytes after a scoped write — silently, on the branch
-/// that looks like success. `a_scoped_write_invalidates_a_cached_read` is the test that
-/// keeps it true; the reason an endpoint cannot simply cut [`UPDATE_THREAD`] instead is
-/// on [`LOAD_THREAD`].
+/// ★ **A third writing IRI means a third thread.** Adding a write door without adding its
+/// thread would have left every cacheable read serving stale bytes after a scoped write —
+/// silently, on the branch that looks like success. `a_scoped_write_invalidates_a_cached_read`
+/// is the test that keeps it true; the reason an endpoint cannot simply cut [`UPDATE_THREAD`]
+/// instead is on [`LOAD_THREAD`].
+///
+/// Every scoped write cuts this, whichever graph it wrote, so only a read that is NOT confined
+/// to named graphs depends on it (ledger #3322). A confined read depends on each
+/// [`graph_thread`] it read instead, which is what lets a write to one graph leave another
+/// graph's cached reads alone.
 pub const GRAPH_UPDATE_THREAD: &str = "urn:iki:store:graph-update";
+
+/// Where each graph's own thread lives; the rest of the IRI is the graph, encoded.
+const GRAPH_THREAD_PREFIX: &str = "urn:iki:store:graph-written:";
+
+/// The golden thread a write confined to `graph` cuts (ledger #3322), and the one a read
+/// confined to `graph` depends on, beside [`UPDATE_THREAD`] and [`LOAD_THREAD`], which a
+/// broad update and a load cut for every graph.
+///
+/// The graph is percent-encoded, every byte but ASCII letters, digits and `-._~`, so two
+/// graph names can never share a thread and any graph name makes a valid IRI.
+///
+/// ```
+/// assert_eq!(
+///     ikigai_store::graph_thread("urn:g/a"),
+///     "urn:iki:store:graph-written:urn%3Ag%2Fa"
+/// );
+/// ```
+///
+/// ⚠ **The kernel only cuts a thread named after a mutating request's target**, and the
+/// scoped door's target is the same IRI for every graph, so its per-graph thread is cut by a
+/// sub-request to a resource of this name. See `announce_graph_write`.
+pub fn graph_thread(graph: &str) -> String {
+    let mut thread = String::with_capacity(GRAPH_THREAD_PREFIX.len() + graph.len());
+    thread.push_str(GRAPH_THREAD_PREFIX);
+    for byte in graph.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            thread.push(char::from(byte));
+        } else {
+            thread.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    thread
+}
+
+/// The graph a [`graph_thread`] suffix names, or `None` for a suffix that function would not
+/// have written, so one graph has exactly one spelling of its thread.
+fn graph_of_thread_suffix(encoded: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(encoded.len());
+    let mut rest = encoded.as_bytes();
+    while let Some((&first, tail)) = rest.split_first() {
+        if first == b'%' {
+            let digits = std::str::from_utf8(tail.get(..2)?).ok()?;
+            bytes.push(u8::from_str_radix(digits, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(first);
+            rest = tail;
+        }
+    }
+    let graph = String::from_utf8(bytes).ok()?;
+    (graph_thread(&graph).strip_prefix(GRAPH_THREAD_PREFIX) == Some(encoded)).then_some(graph)
+}
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_ANY_URI: &str = "http://www.w3.org/2001/XMLSchema#anyURI";
@@ -307,7 +366,7 @@ const LOAD_FORMATS: [&str; 5] = [
     "application/rdf+xml",
 ];
 
-/// Bind this store's fifteen resources into a space.
+/// Bind this store's sixteen resources into a space.
 ///
 /// The store is moved in: this space and the endpoints in it are the only holders of the
 /// dataset unless the caller took a handle at construction (see
@@ -384,10 +443,15 @@ pub fn space(store: DurableStore) -> EndpointSpace {
             },
         )
         .bind(Exact::new("urn:iki:store:load"), LoadEndpoint { store })
+        .bind(
+            UriTemplate::parse(format!("{GRAPH_THREAD_PREFIX}{{graph}}"))
+                .expect("the template is a literal with one trailing variable"),
+            GraphWrittenEndpoint,
+        )
 }
 
-/// Cacheable under all three write threads when this read is covered; `Expiry::Always`
-/// when an invisible writer may have changed what it read.
+/// Cacheable under the threads of every write that can change this read when it is covered;
+/// `Expiry::Always` when an invisible writer may have changed what it read.
 ///
 /// ★ This is the one place the coverage decision has teeth. `ikigai-sparql` documents
 /// why a thread that is right on some writes and wrong on others is worse than no
@@ -421,26 +485,48 @@ fn with_freshness(
             .iter()
             .all(|graph| store.read_is_covered(Some(graph.as_str()))),
     };
-    covered_by(rep, store, covered)
+    cached_under(rep, store, covered, graphs)
 }
 
-/// The three threads, or nothing — factored out because `urn:iki:store:graphs` reaches
-/// the same decision a different way: its universe is a SET of graphs, so it asks
-/// [`DurableStore::read_is_covered`] once per graph and is covered only if every answer
-/// was yes. One place still holds which threads a cacheable read depends on, so a fourth
-/// write door cannot be added to one path and forgotten on the other.
+/// A read that is not confined to named graphs: cacheable under all three write threads.
+/// Factored out because `urn:iki:store:graphs` reaches the coverage decision a different
+/// way: its universe is a SET of graphs, so it asks [`DurableStore::read_is_covered`] once
+/// per graph and is covered only if every answer was yes. A scoped write can add a name to
+/// that list, so it hangs on [`GRAPH_UPDATE_THREAD`] like any other unconfined read.
+fn covered_by(rep: Representation, store: &DurableStore, covered: bool) -> Representation {
+    cached_under(rep, store, covered, None)
+}
+
+/// The threads, or nothing. The one place that holds which threads a cacheable read depends
+/// on, so a fourth write door cannot be added to one path and forgotten on the other.
+///
+/// ★ `Some(graphs)` swaps [`GRAPH_UPDATE_THREAD`], which every scoped write cuts, for each
+/// [`graph_thread`] the read covers (ledger #3322). [`UPDATE_THREAD`] and [`LOAD_THREAD`]
+/// stay on every read, because a broad update or a load can write any graph and neither
+/// says which. Passing `Some` for a read that was not confined to those graphs is the
+/// silent staleness [`with_freshness`] warns about.
 ///
 /// ⚠ The final say goes through [`DurableStore::commit_to_caching`], which records that
 /// this dataset now has a cached read before re-checking for a second space — the half
 /// of the handshake that lets a late `space()` refuse instead of going stale under it.
-fn covered_by(rep: Representation, store: &DurableStore, covered: bool) -> Representation {
-    if store.commit_to_caching(covered) {
-        rep.cacheable()
-            .depends_on(UPDATE_THREAD)
-            .depends_on(LOAD_THREAD)
-            .depends_on(GRAPH_UPDATE_THREAD)
-    } else {
-        rep
+fn cached_under(
+    rep: Representation,
+    store: &DurableStore,
+    covered: bool,
+    graphs: Option<&[NamedNode]>,
+) -> Representation {
+    if !store.commit_to_caching(covered) {
+        return rep;
+    }
+    let rep = rep
+        .cacheable()
+        .depends_on(UPDATE_THREAD)
+        .depends_on(LOAD_THREAD);
+    match graphs {
+        None => rep.depends_on(GRAPH_UPDATE_THREAD),
+        Some(graphs) => graphs.iter().fold(rep, |rep, graph| {
+            rep.depends_on(graph_thread(graph.as_str()))
+        }),
     }
 }
 
@@ -1295,7 +1381,7 @@ fn granted_graphs(inv: &Invocation<'_>) -> Vec<NamedNode> {
 ///
 /// ⚠ **A count is a scan.** oxigraph keeps no per-graph size, so this walks `G`'s quads (as
 /// `info` walks every quad in the store). It runs within the caller's time budget, and it
-/// is cacheable under the three write threads when the graph is covered, so on an owned store
+/// is cacheable under the graph's own thread and the two broad write threads when the graph is covered, so on an owned store
 /// the scan is paid once per write rather than once per read.
 ///
 /// ⚠ **[`CAP_READ`] does not satisfy this door**, for the reason the scoped query doors give:
@@ -1972,6 +2058,18 @@ impl Endpoint for GraphUpdateEndpoint {
                 // caller's grants, before anything is evaluated, so whether it is refused
                 // says nothing about what `G` holds. `src/confine.rs` has the argument.
                 let may_read = may_read_graph(inv, &target);
+                // ★ Before anything is applied: a write the kernel could not announce would
+                // leave cached reads of `G` stale, so it is refused while it still changes
+                // nothing (ledger #3322). See `announce_graph_write`.
+                announce_graph_write(inv, &target).await.map_err(|e| {
+                    Error::Endpoint(format!(
+                        "issue this write from a shallower call, or bind \
+                         `{GRAPH_THREAD_PREFIX}{{graph}}` where the write is resolved: writing \
+                         graph <{}> was refused and nothing was applied, because cached reads \
+                         of that graph could not be invalidated afterward ({e})",
+                        target.as_str()
+                    ))
+                })?;
                 // ★ Parsed and evaluated on a stack sized for the update (ledger #915);
                 // `confine::parse` refuses one past the bounds first. See `src/limits.rs`.
                 // ★ Within the caller's time budget, applied only while the caller is still
@@ -1983,23 +2081,20 @@ impl Endpoint for GraphUpdateEndpoint {
                 // other, refused-or-not would say how large `G` is. `confine::scoped_update`.
                 let max_copy = may_read.then(|| self.store.max_scoped_copy_quads());
                 let requested = crate::budget::inline_bound(inv, "budget")?;
-                let applied = self.store.evaluate(
-                    update,
-                    true,
-                    inv.capability,
-                    requested,
-                    move |deadline| {
-                        let target = scope;
-                        // ★ `DROP`/`CLEAR`/`CREATE GRAPH <G>` would tell a write-only caller
-                        // whether `G` exists (ledger #761): silenced. `src/confine.rs`.
-                        let unreadable = if may_read {
-                            crate::confine::Unreadable::None
-                        } else {
-                            crate::confine::Unreadable::Graph(&target)
-                        };
-                        let parsed = crate::confine::parse(&text, deadline, unreadable)?;
-                        if crate::confine::reads_the_dataset(&parsed.prepared) && !may_read {
-                            return Err(Error::Denied(format!(
+                let applied =
+                    self.store
+                        .evaluate(update, true, inv.capability, requested, move |deadline| {
+                            let target = scope;
+                            // ★ `DROP`/`CLEAR`/`CREATE GRAPH <G>` would tell a write-only caller
+                            // whether `G` exists (ledger #761): silenced. `src/confine.rs`.
+                            let unreadable = if may_read {
+                                crate::confine::Unreadable::None
+                            } else {
+                                crate::confine::Unreadable::Graph(&target)
+                            };
+                            let parsed = crate::confine::parse(&text, deadline, unreadable)?;
+                            if crate::confine::reads_the_dataset(&parsed.prepared) && !may_read {
+                                return Err(Error::Denied(format!(
                                 "this update has a `WHERE` clause, which reads graph <{}>, and \
                              reading it needs the grant `{}` (or `{CAP_READ}`), which this \
                              capability does not hold. Nothing was evaluated. A write grant \
@@ -2008,30 +2103,41 @@ impl Endpoint for GraphUpdateEndpoint {
                                 target.as_str(),
                                 cap_read_graph(target.as_str()),
                             )));
-                        }
-                        // ★ A constant graph other than `G` in `WITH`, `USING`, `USING NAMED`
-                        // or a `GRAPH` block of the `WHERE` is refused by name, not applied as
-                        // `+0 -0` (ledger #1606): the private copy holds `G` alone, so it would
-                        // match nothing. On the text, after the read-grant check, so a
-                        // write-only caller is refused on the grant as before.
-                        crate::confine::reads_outside(&parsed.reads, &target)?;
-                        // ★ …and so is a `WHERE` that reads the default graph, which the
-                        // private copy leaves empty, and a `DELETE` naming another graph or the
-                        // default graph, which removes nothing there (ledger #1612). On the
-                        // text too.
-                        crate::confine::reads_default_outside(parsed.reads_default, &target)?;
-                        crate::confine::deletes_outside(&parsed.deletes, &target)?;
-                        let _writes = store.write_lock_for(deadline);
-                        crate::confine::scoped_update(
-                            store.dataset(),
-                            &target,
-                            parsed.prepared,
-                            &parsed.footprint,
-                            max_copy,
-                            deadline,
-                        )
-                    },
-                )?;
+                            }
+                            // ★ A constant graph other than `G` in `WITH`, `USING`, `USING NAMED`
+                            // or a `GRAPH` block of the `WHERE` is refused by name, not applied as
+                            // `+0 -0` (ledger #1606): the private copy holds `G` alone, so it would
+                            // match nothing. On the text, after the read-grant check, so a
+                            // write-only caller is refused on the grant as before.
+                            crate::confine::reads_outside(&parsed.reads, &target)?;
+                            // ★ …and so is a `WHERE` that reads the default graph, which the
+                            // private copy leaves empty, and a `DELETE` naming another graph or the
+                            // default graph, which removes nothing there (ledger #1612). On the
+                            // text too.
+                            crate::confine::reads_default_outside(parsed.reads_default, &target)?;
+                            crate::confine::deletes_outside(&parsed.deletes, &target)?;
+                            let _writes = store.write_lock_for(deadline);
+                            crate::confine::scoped_update(
+                                store.dataset(),
+                                &target,
+                                parsed.prepared,
+                                &parsed.footprint,
+                                max_copy,
+                                deadline,
+                            )
+                        });
+                // ★ After the commit, and on failure too, as the kernel cuts a write that ran
+                // and failed (ledger #1105). The request before the write cleared the same
+                // depth, grant and name, so this reaches the same resource.
+                let cut = announce_graph_write(inv, &target).await;
+                let applied = applied?;
+                cut.map_err(|e| {
+                    Error::Endpoint(format!(
+                        "graph <{}> was written, but cached reads of it could not be \
+                         invalidated and may be stale until the next write to it: {e}",
+                        target.as_str()
+                    ))
+                })?;
                 // ⚠ The counts only for a caller that may read `G`: `+0` after an
                 // `INSERT DATA` says the quad was already there, which is a read.
                 Ok(plain(if may_read {
@@ -2075,7 +2181,10 @@ impl Endpoint for GraphUpdateEndpoint {
                  `CLEAR`, `DROP` and `CREATE` need the write grant alone, and a caller who \
                  cannot read the graph is not told the quad counts, nor whether the graph \
                  exists (its `DROP`, `CLEAR` and `CREATE` run as `SILENT`). `LOAD` is \
-                 refused. Cuts the golden thread `urn:iki:store:graph-update`.",
+                 refused. Cuts the golden thread `urn:iki:store:graph-update`, which reads \
+                 of the whole dataset depend on, and this graph's own thread \
+                 `urn:iki:store:graph-written:<encoded IRI>`, which reads confined to named \
+                 graphs depend on, so cached reads of other graphs stay cached.",
             )
             .verb(Verb::Sink)
             .verb(Verb::Meta)
@@ -2101,6 +2210,93 @@ impl Endpoint for GraphUpdateEndpoint {
                     .class(XSD_ANY_URI),
             )
             .input(budget_arg())
+            .output("text/plain")
+    }
+}
+
+/// Cut `graph`'s own thread by resolving the [`GraphWrittenEndpoint`] named after it.
+///
+/// ★ **Why a sub-request.** The kernel cuts the thread named after a mutating request's
+/// target and offers an endpoint no other way, short of `urn:kernel:cut` and a capability
+/// this crate has no business holding. The sub-request runs under the caller's own
+/// capability, which just passed the same grant check.
+///
+/// ⚠ Called twice per write, and the first call is what makes the second safe: every
+/// refusal it can meet (the nesting budget, a name carved out of the resolution chain, a
+/// floor) is decided before dispatch and comes out the same both times. So a write that
+/// could not be announced is refused before it changes anything, instead of committing and
+/// leaving cached reads of the graph stale.
+///
+/// A detached invocation has no kernel and so no cache: nothing to invalidate.
+async fn announce_graph_write(inv: &Invocation<'_>, graph: &NamedNode) -> Result<()> {
+    let thread =
+        Iri::parse(graph_thread(graph.as_str())).map_err(|e| Error::Endpoint(e.to_string()))?;
+    match inv.issue(Request::new(Verb::Sink, thread)).await {
+        Err(Error::Endpoint(detail)) if detail == "sub-requests require a kernel context" => Ok(()),
+        other => other.map(drop),
+    }
+}
+
+/// `urn:iki:store:graph-written:{graph}`: a Sink that does nothing but be written to, so the
+/// kernel cuts the [`graph_thread`] named after it.
+///
+/// It changes no data, and it needs the grant that writes the graph. ⚠ The kernel still cuts
+/// the target of a write that ran and failed (ledger #1105), so a caller holding a write grant
+/// for some OTHER graph, refused here, costs this graph's readers one recomputation. Anyone
+/// holding a scoped write grant could already do that to every read in the store.
+#[derive(Clone)]
+struct GraphWrittenEndpoint;
+
+#[async_trait]
+impl Endpoint for GraphWrittenEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        match inv.request.verb {
+            Verb::Sink => {
+                let encoded = inv.bindings.get("graph").unwrap_or_default();
+                let graph =
+                    graph_of_thread_suffix(encoded).ok_or_else(|| Error::InvalidArgument {
+                        name: "graph".to_string(),
+                        detail: format!(
+                            "`{encoded}` is not a percent-encoded graph IRI. Build this \
+                             resource's name with `ikigai_store::graph_thread`"
+                        ),
+                    })?;
+                let scope = cap_write_graph(&graph);
+                if !inv.capability.allows(&scope) {
+                    return Err(Error::Denied(format!(
+                        "invalidating cached reads of graph <{graph}> needs the grant \
+                         `{scope}`, which this capability does not hold"
+                    )));
+                }
+                Ok(plain(format!("invalidated <{graph}>\n")))
+            }
+            other => Err(unsupported("store-graph-written", other)),
+        }
+    }
+
+    fn name(&self) -> &str {
+        "store-graph-written"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("store-graph-written")
+            .title("Invalidate cached reads of one named graph")
+            .summary(
+                "Cut the golden thread of the graph named in this IRI, percent-encoded, so \
+                 cached reads confined to that graph recompute. Changes no data. \
+                 `urn:iki:store:graph-update` does this itself after every write; a caller \
+                 needs this resource directly only to refresh those reads without writing. \
+                 Needs the write grant for that graph.",
+            )
+            .verb(Verb::Sink)
+            .verb(Verb::Meta)
+            .requires(CAP_WRITE_GRAPH)
+            .input(
+                ArgSpec::new("graph")
+                    .binding()
+                    .summary("The graph IRI, percent-encoded as `graph_thread` encodes it.")
+                    .class(XSD_STRING),
+            )
             .output("text/plain")
     }
 }

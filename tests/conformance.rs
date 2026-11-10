@@ -1,4 +1,4 @@
-//! The module recipe as one test: `ikigai-conformance` walks the fifteen resources
+//! The module recipe as one test: `ikigai-conformance` walks the sixteen resources
 //! [`ikigai_store::space`] binds and reports every violation at once, and holds that
 //! space to the naming rule for an instance-built constructor.
 //!
@@ -142,6 +142,11 @@ fn walk(suite: Suite, store: DurableStore) -> String {
     // Live answers cannot be compared across independent calls. Every other
     // unprobed result is a coverage gap, including a missing body_space.
     for unprobed in report.unprobed.iter() {
+        // A mutating action with no `content` is never fired under root, and this Sink has
+        // none to take. `tests/graph_freshness.rs` fires it and reads its receipt.
+        if unprobed.endpoint == "store-graph-written" && unprobed.check == Check::Outputs {
+            continue;
+        }
         assert!(
             unprobed.check == Check::Bodies
                 && report.declared.live.contains(&unprobed.endpoint)
@@ -220,6 +225,10 @@ fn fixtures() -> Suite {
             Fixture::new("store-graph-update", Verb::Sink)
                 .arg("content", SCOPED_UPDATE)
                 .arg("graph", SCOPED_GRAPH),
+        )
+        .fixture(
+            Fixture::new("store-graph-written", Verb::Sink)
+                .binding("graph", "urn%3Aexample%3Aconformance%3Agraph"),
         )
         // REQUIRED on the three Sinks as well as the reads: each drop is a firing, and
         // this store is in-memory and the test's own (see the module docs).

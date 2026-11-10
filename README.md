@@ -716,6 +716,18 @@ kernel cuts the thread named after a mutating request's target, so a read depend
 `urn:iki:store:update` and `urn:iki:store:load` is invalidated by every write the kernel
 can see — and under `DurableStore::open` there are no others.
 
+**Freshness is per graph where the read is.** A read confined to named graphs (the
+`graph-*` query doors and `urn:iki:store:graph-info`) depends on those graphs' own threads
+(`ikigai_store::graph_thread`) plus the update and load threads. A write through
+`urn:iki:store:graph-update` cuts only its own graph's thread and the door's thread, so
+cached reads of other graphs stay cached. A broad update or a load still recomputes every
+read, because either can write any graph, and a read that is not confined to named graphs
+(the broad query doors, `urn:iki:store:graphs`) still recomputes after every write. The
+door cuts a graph's thread through a sub-request to
+`urn:iki:store:graph-written:<percent-encoded IRI>`, so that resource has to be reachable
+wherever writes are resolved; a scoped write that cannot reach it is refused with nothing
+applied rather than left to go stale.
+
 ⚠ **Handing out the `Arc<Store>` hands out a writer the kernel cannot see.** That is not
 held by prose: it is held by the constructors.
 

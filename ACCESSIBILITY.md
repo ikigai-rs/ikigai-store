@@ -21,7 +21,8 @@ conformance claim. Adapted from the
   `urn:iki:store:graphs` (the graphs a caller may read, one IRI per line),
   `urn:iki:store:graph-info`, and the one-line receipts of the writing doors
   (`updated`, `updated <graph>: +<added> -<removed> quads`, `loaded <media type>: +<added>
-  quads`, and without the numbers for a caller that may not read).
+  quads`, and without the numbers for a caller that may not read), and
+  `urn:iki:store:graph-written:…`'s `invalidated <graph>`.
 - **Query answers and dumps**: SPARQL result sets and graphs in the syntaxes each door declares,
   and `urn:iki:store:dump`'s N-Quads. They are data for programs that people also read.
 - **Error and refusal messages**: the `Denied`, `InvalidArgument`, `Timeout`, `OverBudget` and
@@ -62,6 +63,8 @@ Followed by reading the source:
   and `tests/overdue_cap_wording.rs`, which hold the time-budget refusals, and
   `a_write_at_the_writer_cap_is_refused_naming_the_cap_and_the_writer_recovers` in
   `src/budget.rs`, which holds the refusal at the cap on running updates.
+  `tests/graph_freshness.rs` holds the refusals of `urn:iki:store:graph-written:…` and of a
+  scoped write whose cached reads could not be invalidated.
 - **No automated accessibility checker, browser or assistive technology has been used on this
   output.**
 
@@ -101,3 +104,4 @@ technology, if you are comfortable sharing them. Anything security-sensitive goe
 |---|---|
 | 2026-10-31 | First version. |
 | 2026-11-07 | Removed internal work-item numbers from refusals and moved the actions first in budget, copy-bound, and dump refusals. |
+| 2026-11-09 | Added the `urn:iki:store:graph-written:…` receipt and refusals, and the scoped write's refusal when cached reads could not be invalidated. |
