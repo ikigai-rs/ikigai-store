@@ -1,0 +1,11 @@
+[package]
+name = "empty-transfer-reproduction"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+oxigraph = { version = "=0.5.13", default-features = false }
+spargebra = "=0.4.8"
+
+[workspace]

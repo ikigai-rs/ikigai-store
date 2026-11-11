@@ -543,6 +543,46 @@ fn deepest(text: &[u8]) -> std::result::Result<Depth, usize> {
     Ok(deepest)
 }
 
+/// Candidate positions outside brackets, strings, IRIs, and comments. Ambiguous `<`
+/// tokens keep every possible reading, just as in the nesting check. A caller must use
+/// the SPARQL parser to validate candidates; this scan is not a second SPARQL grammar.
+pub(crate) fn top_level_positions(
+    text: &str,
+    interesting: impl Fn(usize) -> bool,
+) -> Result<Vec<usize>> {
+    let mut readings = vec![Reading {
+        lex: Lex::Code,
+        skip: 0,
+        open: Vec::new(),
+        terms: 0,
+        last: b'(',
+        bangs: 0,
+    }];
+    let mut forks = Vec::new();
+    let mut positions = Vec::new();
+    for (at, &byte) in text.as_bytes().iter().enumerate() {
+        if interesting(at)
+            && readings
+                .iter()
+                .any(|r| r.lex == Lex::Code && r.skip == 0 && r.open.is_empty())
+        {
+            positions.push(at);
+        }
+        for reading in &mut readings {
+            step(reading, text.as_bytes(), at, byte, &mut forks);
+        }
+        readings.append(&mut forks);
+        if readings.len() > 1 {
+            readings.sort_unstable();
+            readings.dedup();
+            if readings.len() > MAX_SCAN_BRANCHES {
+                return Err(refuse_ambiguous("content", MAX_SCAN_BRANCHES));
+            }
+        }
+    }
+    Ok(positions)
+}
+
 fn step(reading: &mut Reading, text: &[u8], at: usize, byte: u8, forks: &mut Vec<Reading>) {
     if reading.skip > 0 {
         reading.skip -= 1;
