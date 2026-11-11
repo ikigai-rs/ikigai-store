@@ -158,6 +158,12 @@ results term shape (`{"type":"uri","value":"urn:…"}`, or `"literal"` with `dat
 `xml:lang`) names anything else — the same shape a row comes back in, so a value read out
 of one query binds into the next unchanged.
 
+With RDF 1.2 results support enabled (`rdf-12`), a directional language-tagged literal
+also carries `"its:dir":"ltr"` or `"its:dir":"rtl"` beside `xml:lang`.
+`sparql::bindings_json` preserves that direction. A `bindings=` direction that is invalid
+or unsupported by the build is refused as `InvalidArgument`, rather than changed into an
+ordinary language-tagged literal.
+
 ⚠ **Every bound variable must appear in the query's projection.** `SELECT ?s WHERE { ?s
 ?p ?o }` cannot bind `o`; `SELECT *` can, and ASK, CONSTRUCT and DESCRIBE have no
 projection to widen and accept any variable in the pattern. That is oxigraph's rule and
