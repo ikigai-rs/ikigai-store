@@ -1962,11 +1962,24 @@ enum DatasetOpen {
 /// the one a HOST passed to [`DurableStore::open`] (and the `open_shared*` forms, which
 /// call it); no endpoint opens a store, and no request names a path. ⚠ The dataset's own
 /// files are then read and written by RocksDB, in C++, which no lint sees.
+///
+/// ★ **RocksDB is opened at the directory's CANONICAL path, never the spelling it was given**
+/// (ledger #3431). One writer per directory holds across processes by a POSIX advisory lock
+/// on `LOCK`, but POSIX locks belong to a process, so a second open in the SAME process is
+/// refused only by RocksDB's own registry of held lock files, and that registry is keyed on
+/// the path STRING. Opened as given, `db/`, `db/.`, `db/../db` and a symlink to `db` were each
+/// a second read-write handle on a directory this process already held: two writers over one
+/// dataset, neither seeing the other's writes, and every cached read on either stale. The
+/// canonical path resolves all of them to one string, so the second open is refused as the
+/// first spelling always was (`tests/one_writer_per_directory.rs`). ⚠ It cannot see a
+/// directory reached through two different mounts (a bind mount): those are two paths to the
+/// operating system as well.
 #[cfg(all(feature = "persistent", not(target_family = "wasm")))]
-#[allow(clippy::disallowed_methods)] // ambient: fs: creates only the dataset directory the host passed to DurableStore::open, then opens that same directory as the RocksDB dataset
+#[allow(clippy::disallowed_methods)] // ambient: fs: creates only the dataset directory the host passed to DurableStore::open, resolves that same directory's canonical path, then opens it as the RocksDB dataset
 fn create_and_open_dataset(path: &Path) -> std::result::Result<Store, DatasetOpen> {
     std::fs::create_dir_all(path).map_err(DatasetOpen::Create)?;
-    Store::open(path).map_err(DatasetOpen::Open)
+    let canonical = std::fs::canonicalize(path).map_err(DatasetOpen::Create)?;
+    Store::open(canonical).map_err(DatasetOpen::Open)
 }
 
 /// Whether a RocksDB error string is the one-writer-per-directory refusal.
