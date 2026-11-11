@@ -268,6 +268,13 @@ fn unicode_preprocessed_transfers_follow_the_parsers_enabled_features() {
         assert!(update(&k, text).is_err());
         assert!(graphs(&k).is_empty());
     }
+    let k = kernel();
+    // Invalid Unicode escapes are legal in a comment. Their lookahead must not hide
+    // the transfer on the next line when global preprocessing is on.
+    let text =
+        "CREATE GRAPH <urn:empty>; # \\u00\\u000a '''\n COPY <urn:empty> TO <urn:destination>";
+    update(&k, text).unwrap();
+    assert!(graphs(&k).contains("urn:destination"));
 }
 
 #[test]

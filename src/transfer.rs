@@ -11,6 +11,7 @@ use ikigai_core::{Error, Result};
 use spargebra::term::GraphNamePattern;
 use spargebra::{GraphUpdateOperation, SparqlParser, Update};
 use std::borrow::Cow;
+use std::collections::VecDeque;
 
 const OPERATIONS: &[&[u8]] = &[
     b"LOAD", b"CLEAR", b"DROP", b"ADD", b"MOVE", b"COPY", b"CREATE", b"INSERT", b"DELETE", b"WITH",
@@ -29,7 +30,7 @@ pub(crate) fn register_destinations(
     update: &mut Update,
     deadline: &Deadline,
 ) -> Result<()> {
-    let (scan, offsets) = scan_text(text);
+    let (scan, unicode) = scan_text(text);
     // Most updates need no extra scan or parse.
     if !scan.as_bytes().windows(3).any(|s| {
         s.eq_ignore_ascii_case(b"ADD")
@@ -41,7 +42,18 @@ pub(crate) fn register_destinations(
     let positions = crate::limits::top_level_positions(&scan, |at| {
         scan.as_bytes()[at] == b';' || keyword(scan.as_bytes(), at).is_some()
     })?;
-    let raw = |at: usize| offsets.as_ref().map_or(at, |offsets| offsets[at]);
+    let parse = |part: &str| {
+        // The text has already been preprocessed once. Shield each remaining backslash
+        // so the parser's preprocessing restores it rather than decoding it again.
+        let shielded;
+        let part = if unicode {
+            shielded = part.replace('\\', "\\u005c");
+            &shielded
+        } else {
+            part
+        };
+        SparqlParser::new().parse_update(part)
+    };
     // The parser accepts a prologue by itself. Prefix names that happen to contain an
     // operation keyword cannot end a valid prologue, so they cannot become operations.
     let mut start = None;
@@ -50,16 +62,13 @@ pub(crate) fn register_destinations(
             continue;
         }
         deadline.check()?;
-        if SparqlParser::new()
-            .parse_update(&text[..raw(at)])
-            .is_ok_and(|prefix| prefix.operations.is_empty())
-        {
+        if parse(&scan[..at]).is_ok_and(|prefix| prefix.operations.is_empty()) {
             start = Some(at);
             break;
         }
     }
     let Some(start) = start else { return Ok(()) };
-    let prologue = &text[..raw(start)];
+    let prologue = &scan[..start];
     let mut cursor = start;
     let mut index = 0;
     let mut additions = Vec::new();
@@ -70,9 +79,8 @@ pub(crate) fn register_destinations(
         .chain(std::iter::once(scan.len()))
     {
         deadline.check()?;
-        let segment = &text[raw(cursor)..raw(end)];
-        let Ok(operation) = SparqlParser::new().parse_update(&format!("{prologue}{segment}"))
-        else {
+        let segment = &scan[cursor..end];
+        let Ok(operation) = parse(&format!("{prologue}{segment}")) else {
             // A conservative lexical reading may suggest a semicolon that is actually
             // inside an expression or literal. Only the parser may split an operation.
             continue;
@@ -154,41 +162,59 @@ fn skip_space_and_comments(mut text: &str) -> &str {
     }
 }
 
-/// Feature unification may enable spargebra's global Unicode preprocessing. Scan the
-/// same text it sees, but map boundaries back to the original: reparsing already decoded
-/// text could decode a newly produced backslash a second time.
-fn scan_text(text: &str) -> (Cow<'_, str>, Option<Vec<usize>>) {
+/// Feature unification may enable spargebra's global Unicode preprocessing. Match its
+/// character lookahead, including invalid escapes in comments: those are valid SPARQL
+/// and must not turn into different operation boundaries. Like spargebra's
+/// UnescapeUnicodeCharIterator, an invalid escape buffers the characters it looked at;
+/// a buffered backslash still takes its lookahead from the underlying input iterator.
+fn scan_text(text: &str) -> (Cow<'_, str>, bool) {
     if !(text.contains("\\u") || text.contains("\\U"))
         || SparqlParser::new().parse_update("\\u0043LEAR ALL").is_err()
     {
-        return (Cow::Borrowed(text), None);
+        return (Cow::Borrowed(text), false);
     }
     let mut decoded = String::with_capacity(text.len());
-    let mut offsets = Vec::with_capacity(text.len() + 1);
-    let mut at = 0;
-    while at < text.len() {
-        let rest = &text[at..];
-        let width = if rest.starts_with("\\u") {
-            6
-        } else if rest.starts_with("\\U") {
-            10
-        } else {
-            0
+    let mut input = text.chars();
+    let mut buffered = VecDeque::new();
+    while let Some(c) = buffered.pop_front().or_else(|| input.next()) {
+        if c != '\\' {
+            decoded.push(c);
+            continue;
+        }
+        let Some(next) = input.next() else {
+            decoded.push('\\');
+            continue;
         };
-        let escaped = (width > 0)
-            .then(|| rest.get(2..width))
+        buffered.push_back(next);
+        let width = match next {
+            'u' => 4,
+            'U' => 8,
+            _ => 0,
+        };
+        if width == 0 {
+            decoded.push('\\');
+            continue;
+        }
+        let mut complete = true;
+        for _ in 0..width {
+            if let Some(c) = input.next() {
+                buffered.push_back(c);
+            } else {
+                complete = false;
+                break;
+            }
+        }
+        let hex: String = buffered.iter().skip(1).collect();
+        let escaped = complete
+            .then(|| u32::from_str_radix(&hex, 16).ok())
             .flatten()
-            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
             .and_then(char::from_u32);
-        let c = escaped.unwrap_or_else(|| rest.chars().next().unwrap());
-        offsets.extend(std::iter::repeat_n(at, c.len_utf8()));
-        decoded.push(c);
-        at += if escaped.is_some() {
-            width
+        if let Some(c) = escaped {
+            buffered.clear();
+            decoded.push(c);
         } else {
-            c.len_utf8()
-        };
+            decoded.push('\\');
+        }
     }
-    offsets.push(text.len());
-    (Cow::Owned(decoded), Some(offsets))
+    (Cow::Owned(decoded), true)
 }
