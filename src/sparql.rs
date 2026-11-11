@@ -196,6 +196,11 @@ pub fn term(value: &Term) -> String {
 /// query does not mention is therefore *refused* rather than silently ignored — see
 /// [`crate::endpoints`] for why refusing is the right half of that choice.
 ///
+/// Directional language-tagged literals use `its:dir` (`ltr` or `rtl`) beside `xml:lang`
+/// when the engine's RDF 1.2 results support is enabled. If only the RDF model supports
+/// directions (through dependency feature unification), serialization panics instead of
+/// silently discarding the direction; enable `ikigai-store/rdf-12` for full support.
+///
 /// ⚠ **An RDF-star quoted triple panics.** It has no term object in the shape above, and
 /// the endpoint that parses this argument could not rebuild one, so there is nothing
 /// honest to emit; see `term_to_json` for why that arm exists at all and why it is a
@@ -227,6 +232,11 @@ fn term_to_json(term: &Term) -> serde_json::Value {
         Term::NamedNode(n) => json!({"type": "uri", "value": n.as_str()}),
         Term::BlankNode(b) => json!({"type": "bnode", "value": b.as_str()}),
         Term::Literal(l) => match (l.language(), l.datatype()) {
+            (Some(_), dt)
+                if dt.as_str() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#dirLangString" =>
+            {
+                directional_literal_json(l)
+            }
             (Some(tag), _) => json!({"type": "literal", "value": l.value(), "xml:lang": tag}),
             (None, dt) if dt.as_str() == XSD_STRING => {
                 json!({"type": "literal", "value": l.value()})
@@ -280,6 +290,33 @@ fn term_to_json(term: &Term) -> serde_json::Value {
     }
 }
 
+/// Use the engine's serializer for RDF 1.2 terms without referring to feature-gated APIs:
+/// a consumer can enable RDF 1.2 by unification without enabling our `rdf-12` feature.
+fn directional_literal_json(literal: &Literal) -> serde_json::Value {
+    use oxigraph::model::Variable;
+    use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
+
+    let variable = Variable::new_unchecked("value");
+    let mut serializer = QueryResultsSerializer::from_format(QueryResultsFormat::Json)
+        .serialize_solutions_to_writer(Vec::new(), vec![variable.clone()])
+        .expect("writing JSON to a Vec cannot fail");
+    serializer
+        .serialize([(variable.as_ref(), literal.as_ref())])
+        .expect("writing JSON to a Vec cannot fail");
+    let bytes = serializer
+        .finish()
+        .expect("writing JSON to a Vec cannot fail");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("the results serializer writes valid JSON");
+    let term = json["results"]["bindings"][0]["value"].take();
+    assert!(
+        term.get("its:dir").is_some(),
+        "ikigai-store: `bindings` cannot carry {literal} in this build; enable \
+         `ikigai-store/rdf-12` so the results serializer supports base directions"
+    );
+    term
+}
+
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 const XSD_DOUBLE: &str = "http://www.w3.org/2001/XMLSchema#double";
@@ -298,6 +335,7 @@ const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 /// | `{"type":"uri","value":"urn:…"}` | an IRI |
 /// | `{"type":"literal","value":"…","datatype":"…"}` | a typed literal |
 /// | `{"type":"literal","value":"…","xml:lang":"en"}` | a language-tagged literal |
+/// | `{"type":"literal","value":"…","xml:lang":"ar","its:dir":"rtl"}` | a directional literal, with RDF 1.2 results support; refused otherwise |
 ///
 /// Everything else is **refused with the reason**, never coerced:
 /// - `null` — an unbound variable is not a binding. A query that should match anything
@@ -367,6 +405,9 @@ fn object_to_term(name: &str, object: serde_json::Map<String, serde_json::Value>
     })?;
     let lexical = string("value")
         .ok_or_else(|| bad(format!("`{name}` is a `{kind}` term with no `value`")))?;
+    if object.contains_key("its:dir") {
+        return directional_binding(name, object);
+    }
     match kind.as_str() {
         "uri" | "iri" => Ok(named_node(&lexical, "bindings")
             .map_err(|e| bad(format!("`{name}`: {e}")))?
@@ -398,6 +439,56 @@ fn object_to_term(name: &str, object: serde_json::Map<String, serde_json::Value>
             "`{name}` has type `{other}`; one of `uri`, `literal`"
         ))),
     }
+}
+
+/// Let the same parser used for query answers validate and reconstruct a directional term.
+/// In a build without RDF 1.2 it refuses the direction instead of losing it. Keeping this
+/// independent of our feature flag also handles features unified by a downstream consumer.
+fn directional_binding(
+    name: &str,
+    mut object: serde_json::Map<String, serde_json::Value>,
+) -> Result<Term> {
+    use oxigraph::sparql::results::{
+        QueryResultsFormat, QueryResultsParser, SliceQueryResultsParserOutput,
+    };
+    let invalid = |reason: &str| {
+        bad(format!(
+            "`{name}`: {reason}; use a directional language-tagged literal supported by this build"
+        ))
+    };
+    if !matches!(
+        object.get("type").and_then(|v| v.as_str()),
+        Some("literal" | "typed-literal")
+    ) {
+        return Err(invalid("`its:dir` requires a literal"));
+    }
+    if object.contains_key("datatype") {
+        return Err(invalid(
+            "`its:dir` requires `xml:lang` instead of `datatype`",
+        ));
+    }
+    object.insert("type".to_string(), serde_json::json!("literal"));
+    if !object.contains_key("xml:lang") {
+        if let Some(lang) = object.remove("lang") {
+            object.insert("xml:lang".to_string(), lang);
+        }
+    }
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "head": {"vars": ["value"]},
+        "results": {"bindings": [{"value": object}]}
+    }))
+    .expect("serializing a JSON value cannot fail");
+    let parsed = QueryResultsParser::from_format(QueryResultsFormat::Json)
+        .for_slice(&bytes)
+        .map_err(|e| invalid(&e.to_string()))?;
+    let SliceQueryResultsParserOutput::Solutions(mut solutions) = parsed else {
+        unreachable!("the constructed results document contains solutions");
+    };
+    let solution = solutions
+        .next()
+        .expect("the constructed results document contains one row")
+        .map_err(|e| invalid(&e.to_string()))?;
+    Ok(solution.get("value").expect("the row binds value").clone())
 }
 
 fn xsd(iri: &str) -> NamedNode {

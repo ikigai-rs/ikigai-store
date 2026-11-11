@@ -65,6 +65,9 @@ Followed by reading the source:
   `src/budget.rs`, which holds the refusal at the cap on running updates.
   `tests/graph_freshness.rs` holds the refusals of `urn:iki:store:graph-written:…` and of a
   scoped write whose cached reads could not be invalidated.
+- `tests/directional_bindings.rs` checks that invalid literal directions are refused as
+  `InvalidArgument` on `bindings`, naming the bound variable and giving a remedy. It also
+  checks that supported directions survive serialization and query binding.
 - **No automated accessibility checker, browser or assistive technology has been used on this
   output.**
 
@@ -105,3 +108,4 @@ technology, if you are comfortable sharing them. Anything security-sensitive goe
 | 2026-10-31 | First version. |
 | 2026-11-07 | Removed internal work-item numbers from refusals and moved the actions first in budget, copy-bound, and dump refusals. |
 | 2026-11-09 | Added the `urn:iki:store:graph-written:…` receipt and refusals, and the scoped write's refusal when cached reads could not be invalidated. |
+| 2026-11-11 | Added direction-preserving bindings and refusals of invalid or unsupported literal directions. |
