@@ -27,7 +27,7 @@ cargo test --test directional_bindings
 cargo test --all-features --test directional_bindings
 ```
 
-## Unfixed: an empty transfer source leaves the destination graph absent
+## Fixed locally: an empty transfer source leaves the destination graph absent upstream
 
 These requests succeed, but `urn:destination` is absent afterward:
 
@@ -44,23 +44,39 @@ The [COPY](https://www.w3.org/TR/sparql11-update/#copy),
 is created if it does not exist. This store records empty graphs, so the distinction is
 observable through `graphs`, `graph-info`, `GRAPH <urn:destination> {}`, and a later CREATE.
 
-Run the three expected-to-fail reproductions explicitly:
+Run the three regression tests:
 
 ```sh
-cargo test --test update_answers empty_source -- --ignored --nocapture
+cargo test --test update_answers empty_source
 ```
 
-They are marked ignored with the defect named in each reason. Green CI does **not** mean this
-defect is fixed. Each reproduction checks both named and default empty sources and both absent
-and existing destinations, collecting missing registrations before failing.
+All three tests are active. Each checks both named and default empty sources and both absent
+and existing destinations, including destination contents and source registration.
 
 The cause is the `spargebra` parser's lowering of these operations: COPY becomes DROP SILENT
 plus INSERT/WHERE, MOVE adds a source DROP, and ADD becomes INSERT/WHERE. None creates an empty
 destination. An INSERT/WHERE with no solutions correctly creates no graph. By the time
 `confine::parse` receives the algebra, it cannot distinguish a transfer from an explicitly
-written primitive sequence. Repair requires preserving that distinction in the parser; guessing
-from the lowered sequence would change valid INSERT/WHERE behavior. This audit does not vendor
-the parser or add a second SPARQL text parser. Observed with spargebra 0.4.8 and oxigraph 0.5.13.
+written primitive sequence. Guessing from the lowered sequence would change valid INSERT/WHERE
+behavior. The local workaround identifies transfers from the original syntax: the existing
+bounded lexical scan proposes top-level boundaries, and spargebra validates the prologue and
+each operation and resolves its IRIs. The original AST is retained, including blank-node
+identities. Only a nonidentity transfer to a named graph receives a CREATE SILENT immediately
+after its lowered insertion. That CREATE executes in the same transaction, before any later
+operation, and participates in scoped escape checks. Explicit INSERT/WHERE is unchanged.
+
+Reproduced before the fix on 2026-11-11 with the current releases, spargebra 0.4.8 and oxigraph
+0.5.13. A [standalone reproduction](../reproductions/empty-transfer/src/main.rs), independent
+of this store, still fails against those releases. The [upstream issue draft](upstream-empty-transfer.md)
+is text for Brian to post; no upstream issue was filed. No dependency or package version changed.
+
+Additional regressions check operation order, rollback, self-transfers, lexical boundaries,
+prefix and base resolution, parser Unicode feature unification, and empty scoped escapes.
+The Unicode preprocessing path can be exercised explicitly with:
+
+```sh
+cargo test --features spargebra/standard-unicode-escaping --test update_answers
+```
 
 ## Other checks
 

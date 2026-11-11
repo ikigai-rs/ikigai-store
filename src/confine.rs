@@ -232,8 +232,9 @@ pub(crate) fn parse(
             detail: format!("not a SPARQL update: {e}"),
         })?;
     crate::service::refuse_load(&parsed, "content")?;
-    silence_graph_management(&mut parsed, unreadable);
     crate::budget::check_update(&parsed, "content")?;
+    crate::transfer::register_destinations(update, &mut parsed, deadline)?;
+    silence_graph_management(&mut parsed, unreadable);
     // ★ No `SERVICE` in a `WHERE`, refused by name, on an evaluator that refuses one itself in
     // every build (ledger #1083, `src/service.rs`).
     crate::service::refuse_service_in_update(&parsed, "content")?;

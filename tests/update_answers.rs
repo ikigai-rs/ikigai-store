@@ -50,9 +50,7 @@ fn quads(reader: &SnapshotReader) -> BTreeSet<String> {
         .collect()
 }
 
-// These are executable defect reproductions, not passing conformance claims. The parser
-// lowers these operations before this crate sees them and omits destination registration.
-// Run with: cargo test --test update_answers empty_source -- --ignored --nocapture
+// A transfer must register its destination even when there are no triples to insert.
 fn empty_source(operation: &str) {
     let mut missing = Vec::new();
     for source in ["GRAPH <urn:empty>", "DEFAULT"] {
@@ -81,6 +79,10 @@ fn empty_source(operation: &str) {
                 assert!(ask(&k, "ASK { GRAPH <urn:destination> {} }"));
             }
             assert_eq!(
+                ask(&k, "ASK { GRAPH <urn:destination> { ?s ?p ?o } }"),
+                destination_exists && operation == "ADD"
+            );
+            assert_eq!(
                 graphs(&k).contains("urn:empty"),
                 source != "DEFAULT" && operation != "MOVE"
             );
@@ -93,19 +95,179 @@ fn empty_source(operation: &str) {
 }
 
 #[test]
-#[ignore = "known defect: COPY of an empty source does not register its destination"]
 fn copy_empty_source_registers_destination() {
     empty_source("COPY");
 }
 #[test]
-#[ignore = "known defect: MOVE of an empty source does not register its destination"]
 fn move_empty_source_registers_destination() {
     empty_source("MOVE");
 }
 #[test]
-#[ignore = "known defect: ADD of an empty source does not register its destination"]
 fn add_empty_source_registers_destination() {
     empty_source("ADD");
+}
+
+#[test]
+fn empty_transfer_creation_happens_in_operation_order_and_rolls_back_on_failure() {
+    for operation in ["COPY", "MOVE", "ADD"] {
+        let k = kernel();
+        update(&k, "CREATE GRAPH <urn:empty>").unwrap();
+        // The CREATE must observe the graph registered by the preceding transfer.
+        assert!(update(
+            &k,
+            &format!(
+                "{operation} <urn:empty> TO <urn:destination>; CREATE GRAPH <urn:destination>"
+            )
+        )
+        .is_err());
+        assert_eq!(graphs(&k), BTreeSet::from(["urn:empty".to_owned()]));
+        update(
+            &k,
+            &format!("{operation} <urn:empty> TO <urn:destination>; DROP GRAPH <urn:destination>"),
+        )
+        .unwrap();
+        assert!(!graphs(&k).contains("urn:destination"));
+    }
+    let k = kernel();
+    update(&k, "CREATE GRAPH <urn:a>; COPY <urn:a> TO <urn:b>; MOVE <urn:b> TO <urn:c>; ADD <urn:c> TO <urn:d>").unwrap();
+    assert_eq!(
+        graphs(&k),
+        BTreeSet::from(["urn:a".to_owned(), "urn:c".to_owned(), "urn:d".to_owned()])
+    );
+}
+
+#[test]
+fn explicit_insert_where_and_drop_insert_do_not_register_empty_destinations() {
+    let k = kernel();
+    update(
+        &k,
+        "CREATE GRAPH <urn:empty>; CREATE GRAPH <urn:destination>",
+    )
+    .unwrap();
+    update(&k, "DROP SILENT GRAPH <urn:destination>; INSERT { GRAPH <urn:destination> { ?s ?p ?o } } WHERE { GRAPH <urn:empty> { ?s ?p ?o } }").unwrap();
+    assert_eq!(graphs(&k), BTreeSet::from(["urn:empty".to_owned()]));
+    update(
+        &k,
+        "INSERT { GRAPH <urn:destination> { ?s ?p ?o } } WHERE { GRAPH <urn:empty> { ?s ?p ?o } }",
+    )
+    .unwrap();
+    assert!(!graphs(&k).contains("urn:destination"));
+    // Words in literals, IRIs, comments, and prefixed names are not transfer syntax.
+    update(
+        &k,
+        r#"PREFIX COPY: <urn:>
+        INSERT DATA { GRAPH <urn:g> {
+            _:a COPY:p "COPY DEFAULT TO <urn:fake>; # '";
+                COPY:q '''ADD DEFAULT TO <urn:fake>; " "" #''';
+                COPY:r <urn:MOVE;ADD> .
+        } }; # COPY DEFAULT TO <urn:fake>
+        INSERT { GRAPH <urn:fake> { ?s ?p ?o } } WHERE { GRAPH <urn:empty> { ?s ?p ?o } }
+    "#,
+    )
+    .unwrap();
+    assert!(!graphs(&k).contains("urn:fake"));
+}
+
+#[test]
+fn transfers_resolve_prefixes_relative_iris_comments_and_escaped_names() {
+    for operation in ["cOpY", "mOvE", "aDd"] {
+        let k = kernel();
+        update(
+            &k,
+            &format!(
+                r"BASE <http://example.org/>
+            PREFIX g: <graphs/>
+            CREATE GRAPH g:empty;
+            {operation} # transfer an empty graph
+                SILENT GRAPH g:empty TO GRAPH g:dest\;ination;
+            COPY <graphs/dest;ination> TO <final>
+        "
+            ),
+        )
+        .unwrap();
+        assert!(graphs(&k).contains("http://example.org/graphs/dest;ination"));
+        assert!(graphs(&k).contains("http://example.org/final"));
+    }
+}
+
+#[test]
+fn empty_self_transfers_remain_identity_for_absent_and_registered_graphs() {
+    for operation in ["COPY", "MOVE", "ADD"] {
+        for present in [false, true] {
+            let k = kernel();
+            if present {
+                update(&k, "CREATE GRAPH <urn:g>").unwrap();
+            }
+            update(
+                &k,
+                &format!("{operation} <urn:g> TO <urn:g>; {operation} DEFAULT TO DEFAULT"),
+            )
+            .unwrap();
+            assert_eq!(graphs(&k).contains("urn:g"), present);
+        }
+    }
+}
+
+#[test]
+fn scoped_empty_transfers_cannot_create_a_graph_outside_the_scope() {
+    for operation in ["COPY", "MOVE", "ADD"] {
+        let k = kernel();
+        update(&k, "CREATE GRAPH <urn:g>").unwrap();
+        let result = scoped_update(&k, &format!("{operation} <urn:g> TO <urn:outside>"));
+        assert!(result.is_err(), "{operation}: {result:?}");
+        assert_eq!(graphs(&k), BTreeSet::from(["urn:g".to_owned()]));
+    }
+}
+
+#[test]
+fn transfer_boundaries_do_not_split_expressions_or_change_blank_node_identity() {
+    let k = kernel();
+    update(
+        &k,
+        r#"
+        CREATE GRAPH <urn:empty>;
+        INSERT DATA { GRAPH <urn:a> { _:a <urn:p> "COPY; ADD; MOVE" } };
+        INSERT { GRAPH <urn:unused> { ?s ?p ?o } }
+        WHERE { GRAPH <urn:empty> { ?s ?p ?o } FILTER(?o<';COPY;>') };
+        COPY <urn:a> TO <urn:b>;
+        COPY <urn:empty> TO <urn:destination>;
+        INSERT DATA { GRAPH <urn:c> { _:c <urn:p> 2 } }
+    "#,
+    )
+    .unwrap();
+    assert!(ask(
+        &k,
+        r#"ASK {
+        GRAPH <urn:a> { ?b <urn:p> "COPY; ADD; MOVE" }
+        GRAPH <urn:b> { ?b <urn:p> "COPY; ADD; MOVE" }
+        GRAPH <urn:c> { ?c <urn:p> 2 }
+        FILTER(isBlank(?b) && isBlank(?c) && ?b != ?c)
+    }"#
+    ));
+    assert!(graphs(&k).contains("urn:destination"));
+    assert!(!graphs(&k).contains("urn:unused"));
+}
+
+#[test]
+fn unicode_preprocessed_transfers_follow_the_parsers_enabled_features() {
+    let text = r"CREATE GRAPH <urn:é>\u003b \u0043OPY <urn:é> TO <urn:d\u0065st>";
+    let k = kernel();
+    if spargebra::SparqlParser::new().parse_update(text).is_ok() {
+        update(&k, text).unwrap();
+        assert_eq!(
+            graphs(&k),
+            BTreeSet::from(["urn:é".to_owned(), "urn:dest".to_owned()])
+        );
+        // Decoding a backslash must not preprocess subsequent characters twice.
+        update(
+            &k,
+            r"CREATE GRAPH <urn:\u005cu0061>; COPY <urn:\u005cu0061> TO <urn:d\u005cu0062>",
+        )
+        .unwrap();
+    } else {
+        assert!(update(&k, text).is_err());
+        assert!(graphs(&k).is_empty());
+    }
 }
 
 #[test]

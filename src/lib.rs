@@ -292,6 +292,7 @@ pub(crate) mod scope;
 pub mod service;
 pub mod sparql;
 pub mod store;
+mod transfer;
 
 pub use budget::{AnswerBudget, EvaluationBudget, TimeBudget};
 pub use config::StoreConfig;
