@@ -121,7 +121,7 @@ use oxigraph::model::{
 };
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
 use oxigraph::sparql::QueryResults;
-use oxigraph::store::{StorageError, Store};
+use oxigraph::store::StorageError;
 
 use crate::budget::{too_large, AnswerBound, AnswerBudget, CappedWriter, Deadline, Measure};
 use crate::scope::GraphSet;
@@ -321,22 +321,6 @@ pub fn graph_thread(graph: &str) -> String {
         }
     }
     thread
-}
-
-/// The golden thread every `as-of=` read of `graph` depends on (ledger #3731), and the ONLY
-/// one: no write can change a past answer, so no write cuts it. A host that
-/// [purges](DurableStore::purge_history) or [compacts](DurableStore::compact_history)
-/// `graph`'s history cuts it (`Kernel::cut`), so a cached past answer goes with the history
-/// it was folded from.
-///
-/// ```
-/// assert_eq!(
-///     ikigai_store::history_thread("urn:g/a"),
-///     "urn:iki:store:graph-history:urn%3Ag%2Fa"
-/// );
-/// ```
-pub fn history_thread(graph: &str) -> String {
-    graph_thread(graph).replacen(GRAPH_THREAD_PREFIX, "urn:iki:store:graph-history:", 1)
 }
 
 /// The graph a [`graph_thread`] suffix names, or `None` for a suffix that function would not
@@ -605,12 +589,6 @@ impl Endpoint for QueryEndpoint {
                     return self.reissue_canonical(inv, set).await;
                 }
                 let target = target.map(|set| set.graphs().to_vec());
-                // ★ `as-of=T` answers the graphs as their history folds at T (ledger #3731,
-                // `src/history.rs`), under the same grants as a live read: checked above.
-                let past = match optional_inline_str(inv, "as-of")? {
-                    None => None,
-                    Some(text) => Some(self.as_of(text, target.as_deref())?),
-                };
                 // ★ Bounded before the parser sees a byte (ledger #915): a stack overflow
                 // in the recursive parser or evaluator aborts the whole host.
                 crate::limits::check_sparql(query, "query")?;
@@ -633,7 +611,6 @@ impl Endpoint for QueryEndpoint {
                 let this = self.clone();
                 let text = query.to_string();
                 let confined = target.clone();
-                let is_past = past.is_some();
                 let requested = crate::budget::inline_bound(inv, "budget")?;
                 // ★ …and within this caller's answer SIZE (ledger #970): rows (triples for a
                 // graph) and serialized bytes, counted while serializing and refused past the
@@ -732,7 +709,7 @@ impl Endpoint for QueryEndpoint {
                             prepared = prepared.substitute_variable(variable, term);
                         }
                         let results = prepared
-                            .on_store(past.as_ref().unwrap_or(this.store.dataset()))
+                            .on_store(this.store.dataset())
                             .execute()
                             .map_err(|e| this.query_error(e, &bound, &hidden))?;
 
@@ -761,24 +738,11 @@ impl Endpoint for QueryEndpoint {
                         }
                     },
                 )?;
-                let rep = Representation::new(
-                    ReprType::new(&media).with_param("charset", "utf-8"),
-                    bytes,
-                );
-                if is_past {
-                    // ★ A pure function of a history no write can reach any more: cacheable
-                    // until its history is purged or compacted, and no write cuts that.
-                    return Ok(if self.store.commit_to_caching(true) {
-                        let graphs = target.as_deref().unwrap_or_default();
-                        graphs.iter().fold(rep.cacheable(), |rep, graph| {
-                            rep.depends_on(history_thread(graph.as_str()))
-                        })
-                    } else {
-                        rep
-                    });
-                }
                 Ok(with_freshness(
-                    rep,
+                    Representation::new(
+                        ReprType::new(&media).with_param("charset", "utf-8"),
+                        bytes,
+                    ),
                     &self.store,
                     // `target` is `Some` exactly when `confine` ran, so this is the
                     // read's real universe and not a restatement of the IRI.
@@ -893,83 +857,11 @@ impl Endpoint for QueryEndpoint {
                 self.graph_shaped,
             ))
             .input(answer_bytes_arg(self.store.answer_budget()));
-        let desc = if self.scoped {
-            desc.input(
-                ArgSpec::new("as-of")
-                    .summary(
-                        "Read the graphs as they were at this time, in milliseconds since                          the Unix epoch, rather than as they are now. The time must be in the                          past, and every graph named must have history reaching back to it:                          history is kept from a graph's first write through                          `urn:iki:store:graph-update` and restarts after a broad update or a                          load. A past answer cannot change, so it is cacheable forever.",
-                    )
-                    .class(XSD_STRING)
-                    .optional(),
-            )
-        } else {
-            desc
-        };
         outputs.iter().fold(desc, |desc, media| desc.output(*media))
     }
 }
 
 impl QueryEndpoint {
-    /// The dataset `as-of=` names: every graph of `target`, folded from its history at the
-    /// time given, in a private in-memory store. Refused, naming why, for a broad form, a
-    /// time that is not a past millisecond, a graph a writer outside this store may write,
-    /// and a graph whose history does not reach back to the time.
-    fn as_of(&self, text: &str, target: Option<&[NamedNode]>) -> Result<Store> {
-        let Some(target) = target else {
-            return Err(Error::InvalidArgument {
-                name: "as-of".to_string(),
-                detail: format!(
-                    "`{}` reads the store as it is now. A past read is of named graphs: use                      `urn:iki:store:graph-{}` with `graph=` and `as-of=`",
-                    self.iri(),
-                    self.form
-                ),
-            });
-        };
-        let at: u64 = text.trim().parse().map_err(|_| Error::InvalidArgument {
-            name: "as-of".to_string(),
-            detail: format!(
-                "`{text}` is not a time. Give milliseconds since the Unix epoch, as a whole                  number, for example `as-of=1763200000000`"
-            ),
-        })?;
-        let past = Store::new().map_err(|e| Error::Endpoint(format!("as-of: {e}")))?;
-        for graph in target {
-            if !self.store.read_is_covered(Some(graph.as_str())) {
-                return Err(Error::InvalidArgument {
-                    name: "as-of".to_string(),
-                    detail: format!(
-                        "graph <{}> has no history this store can answer from, because a                          writer outside this store may write it. Read it without `as-of`",
-                        graph.as_str()
-                    ),
-                });
-            }
-            let quads = self
-                .store
-                .history()
-                .as_of(graph.as_str(), at)
-                .map_err(|why| Error::InvalidArgument {
-                    name: "as-of".to_string(),
-                    detail: match why {
-                        crate::history::Unanswerable::NotPast { now } => format!(
-                            "`as-of={at}` is not in the past: the store's time is {now}. A                              read as of now can still change, so give an earlier time, or read                              without `as-of`"
-                        ),
-                        crate::history::Unanswerable::NotKept => format!(
-                            "graph <{}> has no history at {at}: it is kept from a graph's                              first write through `urn:iki:store:graph-update`, restarts after a                              broad update or a load, and ends where it was purged or                              compacted",
-                            graph.as_str()
-                        ),
-                    },
-                })?;
-            let mut txn = past
-                .start_transaction()
-                .map_err(|e| Error::Endpoint(format!("as-of: {e}")))?;
-            for quad in &quads {
-                txn.insert(quad.as_ref());
-            }
-            txn.commit()
-                .map_err(|e| Error::Endpoint(format!("as-of: {e}")))?;
-        }
-        Ok(past)
-    }
-
     /// This endpoint's IRI, for a refusal that has to name it.
     fn iri(&self) -> String {
         if self.scoped {
@@ -2043,9 +1935,6 @@ impl Endpoint for UpdateEndpoint {
                             )));
                         }
                         let _writes = store.write_lock_for(deadline);
-                        // ★ A broad update can write any graph and does not say which: every
-                        // graph's history breaks here (ledger #3731, `src/history.rs`).
-                        store.history().break_all();
                         // ★ On a transaction this crate commits, not `on_store(…).execute()`,
                         // which commits inside oxigraph: the commit has to be the deadline's.
                         let mut transaction = store.dataset().start_transaction().map_err(|e| {
@@ -2228,23 +2117,14 @@ impl Endpoint for GraphUpdateEndpoint {
                             crate::confine::reads_default_outside(parsed.reads_default, &target)?;
                             crate::confine::deletes_outside(&parsed.deletes, &target)?;
                             let _writes = store.write_lock_for(deadline);
-                            let applied = crate::confine::scoped_update(
+                            crate::confine::scoped_update(
                                 store.dataset(),
                                 &target,
                                 parsed.prepared,
                                 &parsed.footprint,
                                 max_copy,
                                 deadline,
-                            )?;
-                            // ★ Recorded under the write lock, after the commit, so the log's
-                            // order is the commits' order (ledger #3731, `src/history.rs`).
-                            store.history().record(
-                                &target,
-                                applied.added_quads.clone(),
-                                applied.removed_quads.clone(),
-                                || crate::history::graph_contents(store.dataset(), &target),
-                            );
-                            Ok(applied)
+                            )
                         });
                 // ★ After the commit, and on failure too, as the kernel cuts a write that ran
                 // and failed (ledger #1105). The request before the write cleared the same

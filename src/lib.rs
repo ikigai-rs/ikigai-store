@@ -287,7 +287,6 @@ pub mod config;
 pub(crate) mod confine;
 pub mod depth;
 pub mod endpoints;
-mod history;
 pub mod limits;
 pub(crate) mod scope;
 pub mod service;
@@ -298,8 +297,8 @@ mod transfer;
 pub use budget::{AnswerBudget, EvaluationBudget, TimeBudget};
 pub use config::StoreConfig;
 pub use endpoints::{
-    cap_read_graph, cap_write_graph, graph_thread, history_thread, space, CAP_READ, CAP_READ_ANY,
-    CAP_READ_GRAPH, CAP_WRITE, CAP_WRITE_GRAPH, GRAPH_UPDATE_THREAD, LOAD_THREAD, UPDATE_THREAD,
+    cap_read_graph, cap_write_graph, graph_thread, space, CAP_READ, CAP_READ_ANY, CAP_READ_GRAPH,
+    CAP_WRITE, CAP_WRITE_GRAPH, GRAPH_UPDATE_THREAD, LOAD_THREAD, UPDATE_THREAD,
 };
 pub use store::{
     Backing, DeclaredTransaction, DurableStore, GraphFingerprint, QuadIter, SharedWriter,
