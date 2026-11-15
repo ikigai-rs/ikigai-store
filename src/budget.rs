@@ -3142,41 +3142,29 @@ mod tests {
 
     #[test]
     fn a_commit_after_the_caller_gave_up_does_not_happen() {
-        let overdue = counter();
+        let deadline = Arc::new(Deadline::never());
+        let worker_deadline = Arc::clone(&deadline);
         let committed = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&committed);
-        let (done, finished) = std::sync::mpsc::channel::<Result<()>>();
-        let err = run(
-            "q",
-            true,
-            Duration::from_millis(50),
-            &overdue,
-            Admission {
-                limits: Limits::only_the_cap(4),
-                caller: Caller::Unnamed,
-            },
-            None,
-            move |deadline| {
-                // Slow work that does not stop for the token, then a commit. It runs until its
-                // caller HAS given up, which is when the token is cancelled, so the commit is
-                // attempted after that on any machine; a fixed 300 ms sleep raced a caller
-                // stalled past it (ledger #1685). Bounded, so a regression cannot hang the run.
-                let token = deadline.token();
-                let started = Instant::now();
-                while !token.is_cancelled() && started.elapsed() < Duration::from_secs(10) {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                let outcome = deadline.settle(|| {
-                    seen.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                });
-                let _ = done.send(outcome.clone());
-                outcome
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::Timeout(_)));
-        let outcome = finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (gave_up, abandoned) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // Noncooperative work tries to commit only after its caller has given up.
+            // Start it directly: run() may correctly skip work whose caller times out
+            // before the worker starts, dropping the old test's result sender without
+            // ever exercising settle(). Neither thread's scheduling controls this test.
+            abandoned.recv().unwrap();
+            worker_deadline.settle(|| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        // The timeout path makes abandonment final under this mutex, then cancels the
+        // token. Reproduce that transition without racing worker startup against a timer;
+        // the timeout and queued-work tests exercise the dispatcher's transition itself.
+        *lock(&deadline.state) = State::Abandoned;
+        deadline.token.cancel();
+        gave_up.send(()).unwrap();
+        let outcome = worker.join().unwrap();
         assert!(matches!(outcome, Err(Error::Timeout(m)) if m.contains("Nothing was written")));
         assert_eq!(committed.load(Ordering::SeqCst), 0);
     }
