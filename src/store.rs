@@ -272,6 +272,9 @@ pub struct DurableStore {
     /// #1127): a write committed on a freshly spawned thread degrades RocksDB's memtable. See
     /// `budget::Writer`.
     writer: Arc<crate::budget::Writer>,
+    /// Every named graph's history, shared by every clone, for `as-of=` reads (ledger
+    /// #3731). See `src/history.rs`.
+    history: Arc<crate::history::History>,
 }
 
 /// One bound space's place in [`DurableStore::spaces`]. Decrements on drop, so the count
@@ -320,6 +323,7 @@ impl DurableStore {
             max_load_bytes: crate::limits::MAX_LOAD_BYTES,
             max_scoped_copy_quads: crate::limits::MAX_SCOPED_COPY_QUADS,
             writer: Arc::default(),
+            history: Arc::default(),
         })
     }
 
@@ -376,6 +380,7 @@ impl DurableStore {
             max_load_bytes: crate::limits::MAX_LOAD_BYTES,
             max_scoped_copy_quads: crate::limits::MAX_SCOPED_COPY_QUADS,
             writer: Arc::default(),
+            history: Arc::default(),
         })
     }
 
@@ -899,6 +904,37 @@ impl DurableStore {
         )
     }
 
+    /// The named graphs' history, for this crate's endpoints (ledger #3731).
+    pub(crate) fn history(&self) -> &crate::history::History {
+        &self.history
+    }
+
+    /// **Purge** `graph`'s history: every as-of read of it is refused from now on, until a
+    /// write through `urn:iki:store:graph-update` starts a new history with that graph's
+    /// contents at the time. The graph's live contents are untouched; erasing them is a
+    /// write (`DROP GRAPH`), and a write is recorded. Answers whether there was a history to
+    /// purge. See `docs/design/as-of-reads.md`.
+    ///
+    /// ⚠ An as-of answer a kernel already cached is not recalled by this: it was cacheable
+    /// forever, and a host purging for erasure clears its caches as well.
+    pub fn purge_history(&self, graph: &str) -> bool {
+        self.history.purge(graph)
+    }
+
+    /// **Compact** `graph`'s history: fold every write recorded at or before `before`
+    /// (milliseconds since the Unix epoch) into one base at `before`. Reads as of `before`
+    /// or later answer exactly as they did; reads as of an earlier time are refused. The
+    /// retention bound a host applies. See `docs/design/as-of-reads.md`.
+    pub fn compact_history(&self, graph: &str, before: u64) {
+        self.history.compact(graph, before)
+    }
+
+    /// How many entries `graph`'s history holds: one per write recorded since its last
+    /// base, plus that base. What [`compact_history`](Self::compact_history) bounds.
+    pub fn history_entries(&self, graph: &str) -> usize {
+        self.history.entries(graph)
+    }
+
     /// The dataset, for this crate's endpoints. Deliberately **not** `pub`: see the
     /// type docs for why handing this out is a constructor-level decision.
     pub(crate) fn dataset(&self) -> &Store {
@@ -974,6 +1010,9 @@ impl DurableStore {
             .call(crate::limits::STACK_BASE, move || {
                 // Taken ON the writer thread, as `SharedWriter::write` takes it: see there.
                 let _writes = store.write_lock();
+                // ★ A load can write any graph and does not say which: every graph's
+                // history breaks here (ledger #3731, `src/history.rs`).
+                store.history.break_all();
                 work(&store)
             })
             .and_then(|outcome| outcome)

@@ -198,6 +198,9 @@ use oxigraph::store::{Store, Transaction};
 pub(crate) struct Applied {
     pub added: usize,
     pub removed: usize,
+    /// The quads themselves, for the graph's history (ledger #3731).
+    pub added_quads: Vec<Quad>,
+    pub removed_quads: Vec<Quad>,
 }
 
 /// Parse a SPARQL update, refusing one that does not parse by the argument's name.
@@ -1262,6 +1265,8 @@ pub(crate) fn scoped_update(
     Ok(Applied {
         added: added.len(),
         removed: removed.len(),
+        added_quads: added.into_iter().cloned().collect(),
+        removed_quads: removed.into_iter().cloned().collect(),
     })
 }
 
