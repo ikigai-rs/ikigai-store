@@ -346,7 +346,7 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # how a scoped write cuts that thread. A MINOR, not a patch: the new resource joins every consumer's
 # served catalog (ikigai-ledger and gonk pin those lists in their tests), and a host that does not
 # route the name refuses scoped writes. Tested against ledger and gonk main on 2026-11-10.
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -419,14 +419,17 @@ async-trait = "0.1"
 # ★ 0.3.0 is the scoped content store (ledger #2965): held content is scoped to whoever delivered
 # it, a principal-less hold is root's, and `ContentStore::put`/`put_replay` are root-only. This crate
 # calls neither. `"0.2.1"` was `<0.3.0`, so the core 0.3.0 cascade (ledger #3040) moved it.
-# ⚠ `"0.3.0"` is `<0.4.0` in turn: move it when core 0.4 publishes.
-ikigai-core = "0.3.0"
+# ★ 0.4.0 is core 0.4.0 (scope opacity, structured denials; the cascade, ledger #3933, epic #3893).
+# `"0.3.0"` was `<0.4.0`, so it could never reach 0.4 on its own.
+# ⚠ `"0.4.0"` is `<0.5.0` in turn: move it when core 0.5 publishes.
+ikigai-core = "0.4.0"
 # Runtime-free Stream::unfold for one-quad-at-a-time durable dump bodies, also on wasm.
 futures = "0.3"
 # 0.2.7 included the RDF/XML parseType fixes required by the shared depth scan; 0.3.0 is
 # the same API on ikigai-core 0.2 (the core 0.2.0 sweep, ledger #2342). 0.5.0 is its release on
-# ikigai-core 0.3, so one core links (the core 0.3.0 cascade, ledger #3040).
-ikigai-rdf = "0.5.0"
+# ikigai-core 0.3, so one core links (the core 0.3.0 cascade, ledger #3040). 0.6.0 is its release
+# on core 0.4.0 (scope opacity, structured denials; the cascade, ledger #3933), so one core links.
+ikigai-rdf = "0.6.0"
 # In-memory store by default; `persistent` turns the RocksDB backend back on. Oxigraph
 # itself gates `oxrocksdb-sys` out of wasm by target, so the feature pulls in nothing
 # there — and this crate's durable constructors are gated off wasm too, so `persistent`
@@ -510,11 +513,13 @@ oxigraph = { version = "0.5.1", default-features = false, features = ["js"] }
 # 0.12.0 adds BODIES and BODY-INPUTS by default; tests share the kernel's space
 # with the suite so deterministic body contracts are probed, not skipped.
 # 0.14.0 is conformance on ikigai-core 0.3.0, so the test build links one core (ledger #3040).
-ikigai-conformance = "0.14.0"
+# 0.15.0 is conformance on core 0.4.0 (scope opacity, structured denials; the cascade, ledger #3933).
+ikigai-conformance = "0.15.0"
 # `TurtleRenderer` for the `Meta` face the kernel routes. 0.2.0 is the streams release
 # (ledger #2261), matching core above; the old `"0.1"` meant `<0.2.0` under 0.x rules.
 # 0.3.0 matches core 0.3.0 (the scoped content store, ledger #2965).
-ikigai-vocab = "0.3.0"
+# 0.4.0 matches core 0.4.0 (scope opacity, structured denials; the cascade, ledger #3933).
+ikigai-vocab = "0.4.0"
 
 # The peak-memory harness for `urn:iki:store:dump` (ledger #1732): it measures a RocksDB store, so
 # it needs `persistent`. ⚠ `required-features` hides a target from `--all-targets` unless the
