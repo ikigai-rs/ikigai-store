@@ -917,23 +917,26 @@ impl QueryEndpoint {
         } else {
             ""
         };
-        Err(Error::Denied(format!(
-            "reading {} through `{}` needs {} {}, which this capability does not hold. \
+        Err(Error::Denied(
+            format!(
+                "reading {} through `{}` needs {} {}, which this capability does not hold. \
              Every graph a scoped read names must be granted: the read is refused rather \
              than answered over the graphs that are, because a narrower dataset than the one \
              asked for returns rows that look right and are not. A grant names exactly one \
              graph; holding `{CAP_READ}` does not imply it, and is instead the authority for \
              `urn:iki:store:{}` over the whole dataset.{comma}",
-            graphs.join(", "),
-            self.iri(),
-            if tokens.len() == 1 {
-                "the grant"
-            } else {
-                "the grants"
-            },
-            tokens.join(", "),
-            self.form,
-        )))
+                graphs.join(", "),
+                self.iri(),
+                if tokens.len() == 1 {
+                    "the grant"
+                } else {
+                    "the grants"
+                },
+                tokens.join(", "),
+                self.form,
+            )
+            .into(),
+        ))
     }
 
     /// Answer a non-canonical `graph=` spelling by resolving the canonical one.
@@ -1409,13 +1412,16 @@ impl Endpoint for GraphInfoEndpoint {
                 // `urn:cap:store:read:graph:`, and this is where it must name THIS graph.
                 let scope = cap_read_graph(target.as_str());
                 if !inv.capability.allows(&scope) {
-                    return Err(Error::Denied(format!(
+                    return Err(Error::Denied(
+                        format!(
                         "counting graph <{}> through `urn:iki:store:graph-info` needs the grant \
                          `{scope}`, which this capability does not hold. A grant names exactly \
                          one graph; holding `{CAP_READ}` does not imply it, and is instead the \
                          authority for `urn:iki:store:info` over the whole dataset",
                         target.as_str()
-                    )));
+                    )
+                        .into(),
+                    ));
                 }
                 let requested = crate::budget::inline_bound(inv, "budget")?;
                 let budget = crate::budget::effective_budget(
@@ -1926,13 +1932,16 @@ impl Endpoint for UpdateEndpoint {
                         let parsed = crate::confine::parse(&text, deadline, unreadable)?;
                         let prepared = parsed.prepared;
                         if crate::confine::reads_the_dataset(&prepared) && !may_read {
-                            return Err(Error::Denied(format!(
+                            return Err(Error::Denied(
+                                format!(
                                 "this update has a `WHERE` clause, which reads the dataset, and \
                              reading it through `urn:iki:store:update` needs `{CAP_READ}` as well \
                              as `{CAP_WRITE}`; this capability does not hold it. Nothing was \
                              evaluated. The write grant alone covers updates that read nothing: \
                              `INSERT DATA`, `DELETE DATA`, `CLEAR`, `DROP`, `CREATE`"
-                            )));
+                            )
+                                .into(),
+                            ));
                         }
                         let _writes = store.write_lock_for(deadline);
                         // ★ On a transaction this crate commits, not `on_store(…).execute()`,
@@ -2044,13 +2053,16 @@ impl Endpoint for GraphUpdateEndpoint {
                 // scope was not the enforced one.
                 let scope = cap_write_graph(target.as_str());
                 if !inv.capability.allows(&scope) {
-                    return Err(Error::Denied(format!(
+                    return Err(Error::Denied(
+                        format!(
                         "writing graph <{}> through `urn:iki:store:graph-update` needs the grant \
                          `{scope}`, which this capability does not hold. A grant names exactly \
                          one graph; holding `urn:cap:store:write` does not imply it, and is \
                          instead the authority for `urn:iki:store:update` over the whole dataset",
                         target.as_str()
-                    )));
+                    )
+                        .into(),
+                    ));
                 }
 
                 // ★ The READ half (ledger #751): a `WHERE` reads `G`, so an update with one
@@ -2094,7 +2106,8 @@ impl Endpoint for GraphUpdateEndpoint {
                             };
                             let parsed = crate::confine::parse(&text, deadline, unreadable)?;
                             if crate::confine::reads_the_dataset(&parsed.prepared) && !may_read {
-                                return Err(Error::Denied(format!(
+                                return Err(Error::Denied(
+                                    format!(
                                 "this update has a `WHERE` clause, which reads graph <{}>, and \
                              reading it needs the grant `{}` (or `{CAP_READ}`), which this \
                              capability does not hold. Nothing was evaluated. A write grant \
@@ -2102,7 +2115,9 @@ impl Endpoint for GraphUpdateEndpoint {
                              `DELETE DATA`, `CLEAR`, `DROP`, `CREATE`",
                                 target.as_str(),
                                 cap_read_graph(target.as_str()),
-                            )));
+                            )
+                                    .into(),
+                                ));
                             }
                             // ★ A constant graph other than `G` in `WITH`, `USING`, `USING NAMED`
                             // or a `GRAPH` block of the `WHERE` is refused by name, not applied as
@@ -2263,10 +2278,13 @@ impl Endpoint for GraphWrittenEndpoint {
                     })?;
                 let scope = cap_write_graph(&graph);
                 if !inv.capability.allows(&scope) {
-                    return Err(Error::Denied(format!(
-                        "invalidating cached reads of graph <{graph}> needs the grant \
+                    return Err(Error::Denied(
+                        format!(
+                            "invalidating cached reads of graph <{graph}> needs the grant \
                          `{scope}`, which this capability does not hold"
-                    )));
+                        )
+                        .into(),
+                    ));
                 }
                 Ok(plain(format!("invalidated <{graph}>\n")))
             }

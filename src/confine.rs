@@ -1355,22 +1355,28 @@ fn escaped_quad(graph: &NamedNode, quad: &Quad) -> Error {
         GraphName::DefaultGraph => "the DEFAULT graph".to_string(),
         other => format!("graph {other}"),
     };
-    Error::Denied(format!(
+    Error::Denied(
+        format!(
         "this write is scoped to graph <{}> and the update would have written {where_it_went}. \
          Nothing was applied. A statement with no `GRAPH` block goes to the default graph, \
          which is not the scoped graph — wrap it in `GRAPH <{}> {{ … }}`, or hold \
          `urn:cap:store:write` and use `urn:iki:store:update`",
         graph.as_str(),
         graph.as_str(),
-    ))
+    )
+        .into(),
+    )
 }
 
 fn escaped_graph(graph: &NamedNode, created: &str) -> Error {
-    Error::Denied(format!(
+    Error::Denied(
+        format!(
         "this write is scoped to graph <{}> and the update created graph {created}. Nothing was \
          applied. Creating or dropping another graph needs `urn:cap:store:write`",
         graph.as_str(),
-    ))
+    )
+        .into(),
+    )
 }
 
 fn storage(e: impl std::fmt::Display) -> Error {
