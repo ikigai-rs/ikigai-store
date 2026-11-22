@@ -288,6 +288,7 @@ pub(crate) mod confine;
 pub mod depth;
 pub mod endpoints;
 pub mod limits;
+mod now;
 pub(crate) mod scope;
 pub mod service;
 pub mod sparql;
