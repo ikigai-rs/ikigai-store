@@ -77,7 +77,8 @@
 //! `DELETE DATA` quad or `DELETE` template in another graph or the default graph removed
 //! nothing ([`deletes_outside`]), `WITH <other> DELETE … USING <G>` included: with `USING`
 //! present the parser keeps `WITH` in the templates alone. Both on the text, before evaluation.
-//! `CLEAR`/`DROP` of another graph or `DEFAULT` still answer `+0 -0`.
+//! So is a `CLEAR` or `DROP` of another graph or `DEFAULT` (ledger #4022): without `SILENT` it
+//! failed saying an existing graph did not exist, and with it answered `+0 -0`.
 //!
 //! # ★ …and a WRITE grant alone cannot read even `G` (ledger #751)
 //!
@@ -183,7 +184,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use ikigai_core::{Error, Result};
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use spargebra::algebra::{
-    AggregateExpression, Expression, GraphPattern, OrderExpression, PropertyPathExpression,
+    AggregateExpression, Expression, GraphPattern, GraphTarget, OrderExpression,
+    PropertyPathExpression,
 };
 use spargebra::term::{
     GraphNamePattern, GroundTerm, GroundTermPattern, NamedNodePattern, TermPattern, Variable,
@@ -430,10 +432,11 @@ pub(crate) fn reads_default_outside(reads_default: bool, graph: &NamedNode) -> R
 /// `DELETE DATA` quad and of each `DELETE` template, the default graph included. `WITH <g>` is
 /// already in a template as its graph (spargebra injects it, `USING` or not). A `GRAPH ?g`
 /// template names nothing until evaluation, and the private copy keeps it inside the scope.
+/// The target of a `CLEAR` or `DROP` naming a graph or `DEFAULT` too (ledger #4022).
 /// `None` is the default graph.
 pub(crate) fn graphs_deleted(update: &Update) -> BTreeSet<Option<NamedNode>> {
     let mut deletes = BTreeSet::new();
-    for operation in &update.operations {
+    for (index, operation) in update.operations.iter().enumerate() {
         match operation {
             GraphUpdateOperation::DeleteData { data } => {
                 deletes.extend(data.iter().map(|quad| match &quad.graph_name {
@@ -454,10 +457,58 @@ pub(crate) fn graphs_deleted(update: &Update) -> BTreeSet<Option<NamedNode>> {
                     }
                 }
             }
+            // ★ `CLEAR`/`DROP` of a named graph or `DEFAULT` (ledger #4022): the private copy
+            // holds no other graph, so without `SILENT` one failed saying an existing graph
+            // did not exist, and with it answered `-0`. `NAMED` and `ALL` reach the scoped
+            // graph alone, which is within the grant.
+            // ★ `CLEAR`/`DROP` of a named graph or `DEFAULT` (ledger #4022): the private copy
+            // holds no other graph, so without `SILENT` one failed saying an existing graph
+            // did not exist, and with it answered `-0`. `NAMED` and `ALL` reach the scoped
+            // graph alone, which is within the grant. The `DROP SILENT` that opens the
+            // parser's rewrite of `COPY`/`MOVE … TO <dest>` is left out: an escape to `dest` is
+            // refused on its effect by [`scoped_update`], as it always was.
+            GraphUpdateOperation::Clear { graph, .. }
+            | GraphUpdateOperation::Drop { graph, .. }
+                if !opens_a_transfer(update, index) =>
+            {
+                match graph {
+                    GraphTarget::NamedNode(node) => {
+                        deletes.insert(Some(node.clone()));
+                    }
+                    GraphTarget::DefaultGraph => {
+                        deletes.insert(None);
+                    }
+                    GraphTarget::NamedGraphs | GraphTarget::AllGraphs => {}
+                }
+            }
             _ => {}
         }
     }
     deletes
+}
+
+/// Whether operation `index` is the `DROP SILENT <dest>` spargebra puts before the copy when it
+/// rewrites `COPY` or `MOVE … TO <dest>`: the next operation inserts `?s ?p ?o` into `dest`.
+fn opens_a_transfer(update: &Update, index: usize) -> bool {
+    let Some(GraphUpdateOperation::Drop {
+        silent: true,
+        graph,
+    }) = update.operations.get(index)
+    else {
+        return false;
+    };
+    let Some(GraphUpdateOperation::DeleteInsert { delete, insert, .. }) =
+        update.operations.get(index + 1)
+    else {
+        return false;
+    };
+    delete.is_empty()
+        && insert.len() == 1
+        && match (graph, &insert[0].graph_name) {
+            (GraphTarget::NamedNode(dest), GraphNamePattern::NamedNode(to)) => dest == to,
+            (GraphTarget::DefaultGraph, GraphNamePattern::DefaultGraph) => true,
+            _ => false,
+        }
 }
 
 /// Refuse a scoped update that names a graph other than `graph`, or the default graph, to
@@ -488,8 +539,9 @@ pub(crate) fn deletes_outside(
     Err(Error::InvalidArgument {
         name: "content".to_string(),
         detail: format!(
-            "this update deletes from {} (in `DELETE DATA` or a `DELETE` template, where \
-             `WITH` names the graph too), which {} not this write's graph, `graph={g}`. \
+            "this update deletes from {} (in `DELETE DATA`, a `DELETE` template, where \
+             `WITH` names the graph too, or a `CLEAR` or `DROP`), which {} not this write's \
+             graph, `graph={g}`. \
              `urn:iki:store:graph-update` can change that one graph and nothing else, so the \
              delete would remove nothing; the update is refused rather than applied, because \
              `-0` looks exactly like a delete with nothing to remove. Nothing was applied: the \
@@ -1119,7 +1171,6 @@ impl Unreadable<'_> {
 /// asked `graph-ask`, and the error tells it its update named nothing. `DEFAULT`, `NAMED` and
 /// `ALL` targets are untouched — they cannot fail, so they were never an oracle.
 fn silence_graph_management(update: &mut spargebra::Update, unreadable: Unreadable<'_>) {
-    use spargebra::algebra::GraphTarget;
     use spargebra::GraphUpdateOperation::{Clear, Create, Drop};
     for operation in &mut update.operations {
         match operation {
