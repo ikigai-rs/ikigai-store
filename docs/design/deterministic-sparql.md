@@ -59,8 +59,8 @@ in strict mappings unless their implementations are explicitly known to be pure.
 to enforce each consumer's existing SERVICE rules independently of classification. Review
 other order sensitivities before promising portability across plans or engines, including
 MIN/MAX with incomparable or tied RDF terms and floating-point accumulation in SUM/AVG.
-[SPARQL 1.1 §§14, 16.4, 17.6, 18.5.1](https://www.w3.org/TR/sparql11-query/#BasicFederatedQuery)
-[SPARQL 1.2 §§14, 16.4, 17.6, 18.6.1](https://www.w3.org/TR/2026/WD-sparql12-query-20261119/#BasicFederatedQuery)
+[SPARQL 1.1 §§14, 16.4, 17.6, 18.5.1](https://www.w3.org/TR/sparql11-query/#basic-federated-query)
+[SPARQL 1.2 §§14, 16.4, 17.6, 18.6.1](https://www.w3.org/TR/2026/WD-sparql12-query-20261119/#basic-federated-query)
 
 ## One parsed-algebra traversal
 
