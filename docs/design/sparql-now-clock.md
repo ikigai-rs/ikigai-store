@@ -1,8 +1,10 @@
 # SPARQL `NOW()` and the kernel clock
 
-Ledger #2203. Status: **design note; proposed, not implemented.** The store's behavior does not
-change in this PR. It adds `tests/sparql_now_clock.rs`, which pins today's behavior and holds
-a small proof of the recommended rewrite.
+Ledger #2203. **Option A implemented for 0.6.2 (ledger #4284).** The query and update doors
+rewrite `NOW()` to the invocation's instant when one is available. Without a clock, evaluation
+still uses the wall clock. All queries that call `NOW()` remain uncached, including inside
+pinned corridors. The tables and analysis below record the original design spike.
+The integration tests now exercise the implemented behavior through the real doors.
 
 ## The claim, and what held
 

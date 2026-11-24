@@ -226,6 +226,7 @@ pub(crate) fn parse(
     update: &str,
     deadline: &Deadline,
     unreadable: Unreadable<'_>,
+    now: Option<ikigai_core::Time>,
 ) -> Result<Parsed> {
     crate::limits::check_sparql(update, "content")?;
     // ★ Parsed by the parser oxigraph uses, and measured before oxigraph plans it: the
@@ -248,6 +249,9 @@ pub(crate) fn parse(
     let reads = graphs_read(&parsed);
     let reads_default = reads_default_graph(&parsed);
     let deletes = graphs_deleted(&parsed);
+    if let Some(now) = now {
+        crate::now::pin_update(&mut parsed, now);
+    }
     Ok(Parsed {
         prepared: crate::service::evaluator()
             .with_cancellation_token(deadline.token())
@@ -1493,7 +1497,7 @@ mod tests {
     }
 
     fn parse_one(update: &str) -> Parsed {
-        parse(update, &Deadline::never(), Unreadable::None)
+        parse(update, &Deadline::never(), Unreadable::None, None)
             .unwrap_or_else(|e| panic!("`{update}` does not parse: {e}"))
     }
 

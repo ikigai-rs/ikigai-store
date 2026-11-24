@@ -1,110 +1,226 @@
-//! Whether a parsed query calls SPARQL `NOW()` (ledger #3989).
+//! Pin SPARQL `NOW()` to the invocation's instant when it has one (ledger #4284).
 //!
-//! A query's answer is cacheable under the store's write threads only if it is a pure function
-//! of the data. `NOW()` breaks that: the evaluator reads the wall clock (`oxsdatatypes` calls
-//! `SystemTime::now()`, and neither the kernel's clock nor a pinned corridor's instant reaches
-//! it, ledger #2203), so a cached answer would keep serving the first instant until some write
-//! cut a thread. The query doors answer such a query uncacheable.
+//! Detect calls on the parsed algebra, so a comment, literal, or IRI mentioning `NOW()`
+//! does not affect caching. Query answers remain uncached even with an invocation instant
+//! because the store cannot distinguish a pinned corridor from a live clock.
 //!
-//! ★ **Detected on the parsed algebra, never on the text.** A string search would miss nothing
-//! but would also flag `"NOW()"` in a literal, a comment, or an IRI, and would be one more
-//! parser that disagrees with spargebra's.
-//!
-//! ⚠ **Exhaustive over `spargebra`'s algebra on purpose**, for the reason `src/scope.rs` gives:
-//! a new pattern or expression variant is a compile error here, never a place `NOW()` could
-//! hide. The only feature-gated variants in spargebra 0.4.7 are in `Function` (only `Now` is
-//! matched, and every call's arguments are walked) and `GraphPattern::Lateral`, gated on
-//! `sep-0006`, which this crate's manifest enables itself. Runs after `budget::check_query`, so
-//! the recursion is bounded, on the sized SPARQL thread.
+//! The pattern and expression matches are exhaustive on purpose: a new variant is a compile
+//! error, never a place `NOW()` could hide. Both doors run the walk after the budget check,
+//! so recursion is bounded, on the sized SPARQL thread.
 
+use ikigai_core::Time;
+use oxigraph::model::{vocab::xsd, Literal};
 use spargebra::algebra::{
     AggregateExpression, Expression, Function, GraphPattern, OrderExpression,
 };
-use spargebra::Query;
+use spargebra::{GraphUpdateOperation, Query, Update};
 
-/// Whether `query` calls `NOW()` anywhere: a projection, `BIND`, `FILTER`, `OPTIONAL`'s
-/// condition, `ORDER BY`, an aggregate, `EXISTS`, or any of these inside a subquery.
-pub(crate) fn calls_now(query: &Query) -> bool {
+/// Rewrite all calls when a clock is available, and report whether the original query
+/// called `NOW()` for the cache decision. With no clock, leave evaluation to Oxigraph.
+pub(crate) fn pin_query(query: &mut Query, time: Option<Time>) -> bool {
     let pattern = match query {
         Query::Select { pattern, .. }
         | Query::Construct { pattern, .. }
         | Query::Describe { pattern, .. }
         | Query::Ask { pattern, .. } => pattern,
     };
-    in_pattern(pattern)
+    let mut walk = NowWalk::new(time);
+    walk.in_pattern(pattern);
+    walk.found
 }
 
-fn in_pattern(pattern: &GraphPattern) -> bool {
-    match pattern {
-        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => false,
-        GraphPattern::Graph { inner, .. }
-        | GraphPattern::Service { inner, .. }
-        | GraphPattern::Project { inner, .. }
-        | GraphPattern::Distinct { inner }
-        | GraphPattern::Reduced { inner }
-        | GraphPattern::Slice { inner, .. } => in_pattern(inner),
-        GraphPattern::Join { left, right }
-        | GraphPattern::Lateral { left, right }
-        | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => in_pattern(left) || in_pattern(right),
-        GraphPattern::LeftJoin {
-            left,
-            right,
-            expression,
-        } => in_pattern(left) || in_pattern(right) || expression.as_ref().is_some_and(in_expr),
-        GraphPattern::Filter { expr, inner } => in_expr(expr) || in_pattern(inner),
-        GraphPattern::Extend {
-            inner, expression, ..
-        } => in_expr(expression) || in_pattern(inner),
-        GraphPattern::OrderBy { inner, expression } => {
-            expression.iter().any(|order| match order {
-                OrderExpression::Asc(e) | OrderExpression::Desc(e) => in_expr(e),
-            }) || in_pattern(inner)
-        }
-        GraphPattern::Group {
-            inner, aggregates, ..
-        } => {
-            aggregates.iter().any(|(_, aggregate)| match aggregate {
-                AggregateExpression::FunctionCall { expr, .. } => in_expr(expr),
-                AggregateExpression::CountSolutions { .. } => false,
-            }) || in_pattern(inner)
+/// Use the same invocation instant for every WHERE in the update request.
+pub(crate) fn pin_update(update: &mut Update, time: Time) {
+    let mut walk = NowWalk::new(Some(time));
+    for operation in &mut update.operations {
+        if let GraphUpdateOperation::DeleteInsert { pattern, .. } = operation {
+            walk.in_pattern(pattern);
         }
     }
 }
 
-fn in_expr(expression: &Expression) -> bool {
-    match expression {
-        Expression::NamedNode(_)
-        | Expression::Literal(_)
-        | Expression::Variable(_)
-        | Expression::Bound(_) => false,
-        Expression::Exists(pattern) => in_pattern(pattern),
-        Expression::FunctionCall(Function::Now, _) => true,
-        Expression::FunctionCall(_, args) | Expression::Coalesce(args) => args.iter().any(in_expr),
-        Expression::In(e, members) => in_expr(e) || members.iter().any(in_expr),
-        Expression::If(a, b, c) => in_expr(a) || in_expr(b) || in_expr(c),
-        Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => in_expr(e),
-        Expression::Or(a, b)
-        | Expression::And(a, b)
-        | Expression::Equal(a, b)
-        | Expression::SameTerm(a, b)
-        | Expression::Greater(a, b)
-        | Expression::GreaterOrEqual(a, b)
-        | Expression::Less(a, b)
-        | Expression::LessOrEqual(a, b)
-        | Expression::Add(a, b)
-        | Expression::Subtract(a, b)
-        | Expression::Multiply(a, b)
-        | Expression::Divide(a, b) => in_expr(a) || in_expr(b),
+struct NowWalk {
+    time: Option<Time>,
+    literal: Option<Literal>,
+    found: bool,
+}
+
+impl NowWalk {
+    fn new(time: Option<Time>) -> Self {
+        Self {
+            time,
+            literal: None,
+            found: false,
+        }
     }
+
+    fn in_pattern(&mut self, pattern: &mut GraphPattern) {
+        match pattern {
+            GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
+            GraphPattern::Join { left, right }
+            | GraphPattern::Lateral { left, right }
+            | GraphPattern::Union { left, right }
+            | GraphPattern::Minus { left, right } => {
+                self.in_pattern(left);
+                self.in_pattern(right);
+            }
+            GraphPattern::LeftJoin {
+                left,
+                right,
+                expression,
+            } => {
+                self.in_pattern(left);
+                self.in_pattern(right);
+                if let Some(e) = expression {
+                    self.in_expression(e);
+                }
+            }
+            GraphPattern::Filter { expr, inner } => {
+                self.in_expression(expr);
+                self.in_pattern(inner);
+            }
+            GraphPattern::Extend {
+                inner, expression, ..
+            } => {
+                self.in_pattern(inner);
+                self.in_expression(expression);
+            }
+            GraphPattern::OrderBy { inner, expression } => {
+                self.in_pattern(inner);
+                for order in expression {
+                    match order {
+                        OrderExpression::Asc(e) | OrderExpression::Desc(e) => self.in_expression(e),
+                    }
+                }
+            }
+            GraphPattern::Group {
+                inner, aggregates, ..
+            } => {
+                self.in_pattern(inner);
+                for (_, aggregate) in aggregates {
+                    match aggregate {
+                        AggregateExpression::FunctionCall { expr, .. } => self.in_expression(expr),
+                        AggregateExpression::CountSolutions { .. } => {}
+                    }
+                }
+            }
+            GraphPattern::Graph { inner, .. }
+            | GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner }
+            | GraphPattern::Slice { inner, .. }
+            | GraphPattern::Service { inner, .. } => self.in_pattern(inner),
+        }
+    }
+
+    fn in_expression(&mut self, expression: &mut Expression) {
+        match expression {
+            Expression::NamedNode(_)
+            | Expression::Literal(_)
+            | Expression::Variable(_)
+            | Expression::Bound(_) => {}
+            Expression::Or(a, b)
+            | Expression::And(a, b)
+            | Expression::Equal(a, b)
+            | Expression::SameTerm(a, b)
+            | Expression::Greater(a, b)
+            | Expression::GreaterOrEqual(a, b)
+            | Expression::Less(a, b)
+            | Expression::LessOrEqual(a, b)
+            | Expression::Add(a, b)
+            | Expression::Subtract(a, b)
+            | Expression::Multiply(a, b)
+            | Expression::Divide(a, b) => {
+                self.in_expression(a);
+                self.in_expression(b);
+            }
+            Expression::UnaryPlus(a) | Expression::UnaryMinus(a) | Expression::Not(a) => {
+                self.in_expression(a)
+            }
+            Expression::In(a, list) => {
+                self.in_expression(a);
+                for e in list {
+                    self.in_expression(e);
+                }
+            }
+            Expression::If(a, b, c) => {
+                self.in_expression(a);
+                self.in_expression(b);
+                self.in_expression(c);
+            }
+            Expression::FunctionCall(Function::Now, _) => {
+                self.found = true;
+                if let Some(time) = self.time {
+                    let literal = self
+                        .literal
+                        .get_or_insert_with(|| date_time_literal(time.as_millis()));
+                    *expression = Expression::Literal(literal.clone());
+                }
+            }
+            Expression::Coalesce(list) | Expression::FunctionCall(_, list) => {
+                for e in list {
+                    self.in_expression(e);
+                }
+            }
+            Expression::Exists(pattern) => self.in_pattern(pattern),
+        }
+    }
+}
+
+/// An `xsd:dateTime` in UTC for `millis` since the Unix epoch, with the fraction only when
+/// there is one.
+fn date_time_literal(millis: u64) -> Literal {
+    let secs = millis / 1000;
+    let frac = millis % 1000;
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    // Days to civil date (proleptic Gregorian), H. Hinnant's algorithm.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let mut lexical = format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    );
+    if frac != 0 {
+        lexical.push_str(&format!(".{frac:03}"));
+    }
+    lexical.push('Z');
+    Literal::new_typed_literal(lexical, xsd::DATE_TIME)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::calls_now;
+    use super::*;
 
     fn calls(text: &str) -> bool {
-        calls_now(&spargebra::SparqlParser::new().parse_query(text).unwrap())
+        let mut parsed = spargebra::SparqlParser::new().parse_query(text).unwrap();
+        let found = pin_query(&mut parsed, Some(Time::from_millis(0)));
+        assert!(
+            !pin_query(&mut parsed, None),
+            "an unreplaced call in {text}"
+        );
+        found
+    }
+
+    #[test]
+    fn the_literal_preserves_epoch_milliseconds_in_utc() {
+        for (millis, lexical) in [
+            (0, "1970-01-01T00:00:00Z"),
+            (951_827_696_007, "2000-02-29T12:34:56.007Z"),
+        ] {
+            let literal = date_time_literal(millis);
+            assert_eq!(literal.value(), lexical);
+            assert_eq!(literal.datatype(), xsd::DATE_TIME);
+        }
     }
 
     #[test]
