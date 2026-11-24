@@ -346,7 +346,10 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # how a scoped write cuts that thread. A MINOR, not a patch: the new resource joins every consumer's
 # served catalog (ikigai-ledger and gonk pin those lists in their tests), and a host that does not
 # route the name refuses scoped writes. Tested against ledger and gonk main on 2026-11-10.
-version = "0.7.0"
+# ★ 0.6.1 adds the text index (ledger #4128) behind the off-by-default `text-index` feature: its resources
+# (graph-text, text-index:graph:{graph} and its rebuild/compact, text-enrollment) are bound only
+# under the feature, so the default served catalog consumers pin is unchanged. Additive, so a patch.
+version = "0.6.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
