@@ -405,7 +405,7 @@ pub fn space(store: DurableStore) -> EndpointSpace {
             },
         );
     }
-    space
+    let space = space
         .bind(
             Exact::new("urn:iki:store:info"),
             InfoEndpoint {
@@ -442,13 +442,26 @@ pub fn space(store: DurableStore) -> EndpointSpace {
                 store: Arc::clone(&store),
             },
         )
-        .bind(Exact::new("urn:iki:store:load"), LoadEndpoint { store })
+        .bind(
+            Exact::new("urn:iki:store:load"),
+            LoadEndpoint {
+                store: Arc::clone(&store),
+            },
+        )
         .bind(
             UriTemplate::parse(format!("{GRAPH_THREAD_PREFIX}{{graph}}"))
                 .expect("the template is a literal with one trailing variable"),
             GraphWrittenEndpoint,
-        )
+        );
+    #[cfg(feature = "text-index")]
+    let space = text_doors::bind(space, &store);
+    #[cfg(not(feature = "text-index"))]
+    drop(store);
+    space
 }
+
+#[cfg(feature = "text-index")]
+mod text_doors;
 
 /// Cacheable under the threads of every write that can change this read when it is covered;
 /// `Expiry::Always` when an invisible writer may have changed what it read.
@@ -2002,6 +2015,9 @@ impl Endpoint for UpdateEndpoint {
                 // dataset before and after scanned all of it twice under the write lock, and a
                 // one-triple update cost 1.4 s at 10M quads and was refused at 1B. oxigraph
                 // reports nothing of what an update changed; `urn:iki:store:info` counts.
+                // ★ A broad update names no difference: every enrolled graph's text index
+                // is stale until rebuilt (ledger #4128).
+                self.store.text_all_stale();
                 Ok(plain("updated\n".to_string()))
             }
             other => Err(unsupported("store-update", other)),
@@ -2157,14 +2173,22 @@ impl Endpoint for GraphUpdateEndpoint {
                             crate::confine::reads_default_outside(parsed.reads_default, &target)?;
                             crate::confine::deletes_outside(&parsed.deletes, &target)?;
                             let _writes = store.write_lock_for(deadline);
-                            crate::confine::scoped_update(
+                            let applied = crate::confine::scoped_update(
                                 store.dataset(),
                                 &target,
                                 parsed.prepared,
                                 &parsed.footprint,
                                 max_copy,
                                 deadline,
-                            )
+                            )?;
+                            // ★ The text index learns the difference this door just
+                            // committed, under the same write lock (ledger #4128).
+                            store.text_apply(
+                                target.as_str(),
+                                &applied.removed_quads,
+                                &applied.added_quads,
+                            );
+                            Ok(applied)
                         });
                 // ★ After the commit, and on failure too, as the kernel cuts a write that ran
                 // and failed (ledger #1105). The request before the write cleared the same
@@ -2440,6 +2464,7 @@ impl Endpoint for LoadEndpoint {
                         .map_err(|e| Error::Endpoint(format!("load: committing: {e}")))?;
                     Ok(added)
                 })?;
+                self.store.text_all_stale();
                 Ok(plain(if may_read {
                     format!("loaded {media}: +{added} quads\n")
                 } else {

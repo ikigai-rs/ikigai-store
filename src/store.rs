@@ -272,6 +272,10 @@ pub struct DurableStore {
     /// #1127): a write committed on a freshly spawned thread degrades RocksDB's memtable. See
     /// `budget::Writer`.
     writer: Arc<crate::budget::Writer>,
+    /// The full-text indexes of the graphs the host enrolled, shared by every clone — see
+    /// [`with_text_index`](Self::with_text_index).
+    #[cfg(feature = "text-index")]
+    text: Option<Arc<crate::text::TextIndexes>>,
 }
 
 /// One bound space's place in [`DurableStore::spaces`]. Decrements on drop, so the count
@@ -320,6 +324,8 @@ impl DurableStore {
             max_load_bytes: crate::limits::MAX_LOAD_BYTES,
             max_scoped_copy_quads: crate::limits::MAX_SCOPED_COPY_QUADS,
             writer: Arc::default(),
+            #[cfg(feature = "text-index")]
+            text: None,
         })
     }
 
@@ -376,6 +382,8 @@ impl DurableStore {
             max_load_bytes: crate::limits::MAX_LOAD_BYTES,
             max_scoped_copy_quads: crate::limits::MAX_SCOPED_COPY_QUADS,
             writer: Arc::default(),
+            #[cfg(feature = "text-index")]
+            text: None,
         })
     }
 
@@ -1007,6 +1015,55 @@ impl DurableStore {
     /// takes over once the update's caller has given up on it (ledger #3271).
     pub(crate) fn write_lock_for(&self, deadline: &Deadline) -> crate::budget::WriteGuard<'_> {
         self.writes.lock_for(deadline)
+    }
+
+    /// Index the literals of the graphs and predicates `enrollment` names, and serve them as
+    /// `urn:iki:store:graph-text` (ledger #4128). Call before [`crate::space`].
+    ///
+    /// A durable store keeps each graph's index in its own subdirectory of
+    /// `<store directory>/text-index`; an in-memory store keeps it in memory. The index is
+    /// derived: a missing one, one of another format or enrollment, or one not closed cleanly
+    /// is rebuilt in the background from the store, and searches of that graph answer "no
+    /// index" until it is ready. Commits do not wait for the disk (no fsync is asked for by
+    /// this crate); an unclean shutdown costs a rebuild, never data.
+    #[cfg(feature = "text-index")]
+    pub fn with_text_index(mut self, enrollment: crate::text::TextEnrollment) -> Result<Self> {
+        let root = match &self.backing {
+            Backing::Memory => None,
+            Backing::Durable(path) => Some(path.join("text-index")),
+        };
+        self.text = Some(
+            crate::text::TextIndexes::open(Arc::clone(&self.store), root, enrollment)
+                .map_err(Error::Endpoint)?,
+        );
+        Ok(self)
+    }
+
+    /// The text indexes, when the host enrolled any.
+    #[cfg(feature = "text-index")]
+    pub(crate) fn text(&self) -> Option<&Arc<crate::text::TextIndexes>> {
+        self.text.as_ref()
+    }
+
+    /// Hand a scoped write's difference to the text index, under the write lock.
+    pub(crate) fn text_apply(
+        &self,
+        _graph: &str,
+        _removed: &[oxigraph::model::Quad],
+        _added: &[oxigraph::model::Quad],
+    ) {
+        #[cfg(feature = "text-index")]
+        if let Some(text) = &self.text {
+            text.apply(_graph, _removed, _added);
+        }
+    }
+
+    /// A broad write computed no difference: every enrolled graph is stale.
+    pub(crate) fn text_all_stale(&self) {
+        #[cfg(feature = "text-index")]
+        if let Some(text) = &self.text {
+            text.all_stale();
+        }
     }
 }
 
