@@ -8,9 +8,9 @@
 //!   text is stored: a hit names the subject, the predicate, the graph and a score, and the
 //!   text itself is read from the store under the caller's grant.
 //! - **Kept current from the scoped write door's own difference**: `graph-update` hands every
-//!   quad it removed and added to [`TextIndexes::apply`], under the store's write lock. A broad
+//!   quad it removed and added to `TextIndexes::apply`, under the store's write lock. A broad
 //!   update or load computes no difference, so it marks every enrolled graph stale and rebuilds
-//!   it in the background ([`TextIndexes::all_stale`]).
+//!   it in the background (`TextIndexes::all_stale`).
 //! - **Derived, never the only copy of anything.** On open, a missing index, another format, a
 //!   different enrollment or a missing clean-close marker marks the graph stale and rebuilds it.
 //!   A stale or building graph answers "no index", so a caller falls back to the scan.
