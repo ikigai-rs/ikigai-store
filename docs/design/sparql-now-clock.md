@@ -105,32 +105,52 @@ statistics timer from the `NOW()` instant. It does not change what the store mus
 caching (below), and the store would adopt it only after an oxigraph release, so A comes first.
 B can replace the rewrite later without changing any answer.
 
-Draft issue text for oxigraph/oxigraph. **Not filed**: filing it is a follow-up item.
+Draft issue text for oxigraph/oxigraph, laid out in its **Feature request** template (which adds the
+`enhancement` label). **Not filed**: filing it is Brian's (anything posted outside ikigai-rs is). A
+search of oxigraph's issues for `NOW()` and `with_now` on 2026-11-24 found no existing request.
 
 > **Title:** Allow the caller to provide the instant `NOW()` returns (`QueryEvaluator::with_now`)
 >
-> `spareval` reads `NOW()` from `oxsdatatypes::DateTime::now()`. The only override is the
-> `custom-now` feature, a process-global `extern fn` that a binary defines once. An embedder
-> that evaluates queries on behalf of callers with different notions of "now" cannot use it:
-> a deterministic replay harness, a test pinned to an instant, or a request evaluated "as of"
-> a past or future instant. The instant also cannot vary per evaluation.
+> **Is your feature request related to a problem? Please describe.**
 >
-> Proposal:
+> `spareval` reads `NOW()` from `oxsdatatypes::DateTime::now()`, eagerly, in
+> `SimpleEvaluator::new` on every evaluation. The only way to change it is the `custom-now`
+> feature: a process-global `extern fn` that the final binary defines once. An embedder that
+> evaluates queries on behalf of callers with different notions of "now" cannot use that. For
+> example: a deterministic replay harness, a test pinned to an instant, or a request evaluated
+> "as of" a past or future instant, all in one process. The instant cannot vary per evaluation,
+> and because Cargo features unify, turning `custom-now` on for one crate turns it on for every
+> crate in the binary.
 >
-> - `QueryEvaluator::with_now(self, now: DateTime) -> Self`. When set, `NOW()` returns `now`
->   for every call in the evaluation, so the per-query rule of SPARQL 1.1 §17.4.5.1 still holds.
->   When not set, behavior is unchanged.
-> - The same on `oxigraph::sparql::SparqlEvaluator`, and on the update evaluator for
->   `DELETE/INSERT … WHERE`.
-> - Read `DateTime::now()` in `SimpleEvaluator::new` only when no instant was given. Today it
->   is read eagerly on every evaluation, which costs a clock read on targets where reading the
->   clock is expensive or unavailable.
+> **Describe the solution you'd like**
+>
+> - `QueryEvaluator::with_now(self, now: DateTime) -> Self`. When set, every `NOW()` in that
+>   evaluation returns `now`, so the per-query rule of SPARQL 1.1 §17.4.5.1 still holds. When
+>   not set, behavior is unchanged.
+> - The same on `oxigraph::sparql::SparqlEvaluator`, and on the update evaluator, so that
+>   `DELETE/INSERT … WHERE` with `BIND(NOW() AS ?t)` writes the given instant.
+> - Read `DateTime::now()` only when no instant was given. Today it is read on every evaluation,
+>   which costs a clock read even for queries that never call `NOW()`, and on targets where
+>   reading the clock is expensive or unavailable.
 > - Optionally, keep the statistics `Timer` on its own clock source, so that a pinned `now`
 >   (or `custom-now`) does not make every measured duration zero.
 >
-> Workaround today: rewrite `Function::Now` in the `spargebra` algebra to an `xsd:dateTime`
-> literal before evaluation. This works, but every embedder needs an exhaustive algebra walk
-> that has to follow each new `spargebra` variant.
+> **Describe alternatives you've considered**
+>
+> - The `custom-now` feature: process-global, one instant source for the whole binary, cannot
+>   vary per evaluation, and it also moves the statistics timer.
+> - Rewriting `Function::Now` in the `spargebra` algebra to an `xsd:dateTime` literal before
+>   evaluation. This works and is what we do today, but every embedder needs an exhaustive walk
+>   of the algebra (queries and updates) that must follow each new `spargebra` variant, and the
+>   evaluator still reads the clock it no longer uses.
+>
+> **Additional context**
+>
+> - SPARQL 1.1 Query, §17.4.5.1 `NOW`: "Returns an XSD dateTime value for the current query
+>   execution. All calls to this function in any one query execution must return the same
+>   value." A caller-supplied instant keeps that rule; it only chooses which value.
+> - We would adopt `with_now` in place of our algebra rewrite, and keep our tests that pin
+>   `NOW()` to an injected instant.
 
 ### C. oxsdatatypes `custom-now` (rejected)
 
