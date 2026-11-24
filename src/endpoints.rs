@@ -629,6 +629,7 @@ impl Endpoint for QueryEndpoint {
                 // stop between rows. `src/budget.rs` has the numbers and the limits.
                 let this = self.clone();
                 let text = query.to_string();
+                let now = inv.now();
                 let confined = target.clone();
                 let requested = crate::budget::inline_bound(inv, "budget")?;
                 // ★ …and within this caller's answer SIZE (ledger #970): rows (triples for a
@@ -651,23 +652,20 @@ impl Endpoint for QueryEndpoint {
                         // ★ Parsed by the parser oxigraph uses, measured, and only then
                         // handed to oxigraph: its planner cannot be cancelled, so the
                         // algebra is bounded before it plans (ledger #964, `src/budget.rs`).
-                        let parsed =
-                            spargebra::SparqlParser::new()
-                                .parse_query(query)
-                                .map_err(|e| Error::InvalidArgument {
-                                    name: "query".to_string(),
-                                    detail: format!("not a SPARQL query: {e}"),
-                                })?;
+                        let mut parsed = spargebra::SparqlParser::new()
+                            .parse_query(query)
+                            .map_err(|e| Error::InvalidArgument {
+                                name: "query".to_string(),
+                                detail: format!("not a SPARQL query: {e}"),
+                            })?;
                         crate::budget::check_query(&parsed, "query")?;
                         // ★ No `SERVICE`, refused by name before evaluation, and an evaluator
                         // that refuses one itself in every build (ledger #1083,
                         // `src/service.rs`): in a host with `oxigraph/http-client` on, a plain
                         // evaluator turns `SERVICE <http://…>` into an ungated request.
                         crate::service::refuse_service(&parsed, "query")?;
-                        // ★ `NOW()` reads the wall clock, so an answer that calls it is not a
-                        // function of the data and is never cached (ledger #3989). Read off
-                        // the parsed algebra, before `parsed` is handed to the evaluator.
-                        let reads_the_clock = crate::now::calls_now(&parsed);
+                        // Detect calls before rewriting so clocked answers stay uncached too.
+                        let reads_the_clock = crate::now::pin_query(&mut parsed, now);
                         // ★ A constant `GRAPH <iri>` outside the set is refused, not answered
                         // empty (ledger #388). `confine` already keeps it unreachable; this is
                         // about telling a caller who mistyped an IRI or left a graph out of
@@ -767,15 +765,10 @@ impl Endpoint for QueryEndpoint {
                     bytes,
                 );
                 if reads_the_clock {
-                    // ★ Uncached whatever the coverage says, and on a pinned chain too: the
-                    // evaluator reads the wall clock, not `inv.now()`, so even an as-of
-                    // read is not a pure function of its context (ledger #2203). Core 0.4
-                    // has no reason more specific than `declared` for `urn:kernel:uncached`;
-                    // the trace note says which.
+                    // Core does not distinguish a pinned corridor from a live clock here.
                     inv.trace_note(
                         NOW_NOTE,
-                        "the query calls NOW(), which reads the wall clock, so its answer is \
-                         never cached",
+                        "the query calls NOW(), so its answer is never cached",
                     );
                     return Ok(rep.with_uncached_reason(UncachedReason::Declared));
                 }
@@ -1957,6 +1950,7 @@ impl Endpoint for UpdateEndpoint {
                 // nothing. See `src/budget.rs`.
                 let store = Arc::clone(&self.store);
                 let text = update.to_string();
+                let now = inv.now();
                 let requested = crate::budget::inline_bound(inv, "budget")?;
                 self.store
                     .evaluate(update, true, inv.capability, requested, move |deadline| {
@@ -1967,7 +1961,7 @@ impl Endpoint for UpdateEndpoint {
                         } else {
                             crate::confine::Unreadable::EveryGraph
                         };
-                        let parsed = crate::confine::parse(&text, deadline, unreadable)?;
+                        let parsed = crate::confine::parse(&text, deadline, unreadable, now)?;
                         let prepared = parsed.prepared;
                         if crate::confine::reads_the_dataset(&prepared) && !may_read {
                             return Err(Error::Denied(
@@ -2129,6 +2123,7 @@ impl Endpoint for GraphUpdateEndpoint {
                 // waiting (ledger #964). See `src/budget.rs`.
                 let store = Arc::clone(&self.store);
                 let text = update.to_string();
+                let now = inv.now();
                 let scope = target.clone();
                 // ★ The copy bound (ledger #146) only for a caller who may read `G`: for any
                 // other, refused-or-not would say how large `G` is. `confine::scoped_update`.
@@ -2145,7 +2140,7 @@ impl Endpoint for GraphUpdateEndpoint {
                             } else {
                                 crate::confine::Unreadable::Graph(&target)
                             };
-                            let parsed = crate::confine::parse(&text, deadline, unreadable)?;
+                            let parsed = crate::confine::parse(&text, deadline, unreadable, now)?;
                             if crate::confine::reads_the_dataset(&parsed.prepared) && !may_read {
                                 return Err(Error::Denied(
                                     format!(

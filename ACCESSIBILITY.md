@@ -30,8 +30,8 @@ conformance claim. Adapted from the
   `src/scope.rs`, `src/service.rs` and `src/depth.rs`, which a host, or a crate that uses this
   one's limits and budget, shows to whoever made the request.
 - **One trace note** (`src/endpoints.rs`, `NOW_NOTE`): a query door answering uncached because the
-  query calls `NOW()` adds `uncached-now` to its trace event, a sentence saying the query reads the
-  wall clock and so its answer is never cached. Untested for wording beyond naming `NOW()`.
+  query calls `NOW()` adds `uncached-now` to its trace event, a sentence saying the query calls
+  `NOW()` and so its answer is never cached. Untested for wording beyond naming `NOW()`.
 - `examples/dump-memory.rs` prints timings to a terminal; it is a measurement, not a shipped
   binary.
 
