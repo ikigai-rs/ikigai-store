@@ -174,6 +174,18 @@ rebuilds the same quads. A store write is never cached, so updates raise no cach
 oxigraph, so it has the same defect. The walk should live where both crates can reach it:
 `ikigai-rdf`, which the store already depends on, or `ikigai-sparql`. That is decision 2.
 
+## Decisions (Brian, 2026-11-24)
+
+- **Option A is accepted:** `NOW()` is rewritten to a literal from `inv.now()` after the store's
+  two parse points. Option B (upstream `with_now`) is still worth filing, and filing it is
+  Brian's; option C stays rejected.
+- **Decision 1 takes the recommendation, (i):** a kernel with no clock keeps `NOW()` on the
+  wall clock, and those answers are uncached.
+- **Decision 3:** ship A with every `NOW()` answer uncached (already true since store PR 101),
+  and enable corridor caching once core has `pinned_now`.
+- **Decision 2 stays open** in its follow-up item. Store PR 101 already added a `NOW()` walk
+  in `src/now.rs` (`calls_now`), which the rewrite should reuse or extend rather than duplicate.
+
 ## Decisions to make
 
 1. **A kernel with no clock.** (i) Keep `NOW()` on the wall clock (recommended for the first
@@ -188,7 +200,7 @@ oxigraph, so it has the same defect. The walk should live where both crates can 
 
 ## Proposed follow-up items
 
-1. **Stop caching an answer whose query uses `NOW()`.** In `QueryEndpoint::invoke`, a query
+1. **Done: store PR 101 (ledger #3989, released in 0.6.1).** Stop caching an answer whose query uses `NOW()`. In `QueryEndpoint::invoke`, a query
    whose algebra contains `Function::Now` is answered without `with_freshness`, so a repeat is
    evaluated again instead of being served a stale instant. This flips
    `a_now_answer_is_cached_like_any_covered_read`. It stands alone, and it fixes the more urgent

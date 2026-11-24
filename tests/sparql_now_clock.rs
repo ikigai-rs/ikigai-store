@@ -1,15 +1,17 @@
 //! What SPARQL `NOW()` reads today, and a proof that the rewrite in
 //! `docs/design/sparql-now-clock.md` (ledger #2203) gives a query the kernel's instant.
 //!
-//! The first three tests pin TODAY's behavior, the facts the note builds on, so a change to any
-//! of them is seen. They are not the behavior the note wants:
+//! The first two tests pin TODAY's behavior, the facts the note builds on, so a change to either
+//! is seen. They are not the behavior the note wants:
 //!
 //! 1. A kernel built with `with_clock(FixedClock)` does not reach `NOW()`: the evaluator reads
 //!    the wall clock (`oxsdatatypes` calls `SystemTime::now()`, and `spareval` has no way to be
 //!    handed an instant).
 //! 2. Nor does a temporal corridor's pinned instant (`Scope::with_named_at`).
-//! 3. The answer to a `NOW()` query is cached like any other covered read, so a repeat is served
-//!    the first wall-clock instant until a write cuts a thread.
+//!
+//! (A third fact the note started from, that a `NOW()` answer was cached like any covered read,
+//! no longer holds: store PR 101, ledger #3989, stopped caching it, and
+//! `tests/sparql_now_uncached.rs` pins that.)
 //!
 //! The last test is the proof. It rewrites every `NOW()` in the parsed query to an
 //! `xsd:dateTime` literal taken from the kernel's clock, then sends the rewritten text
@@ -27,7 +29,6 @@ use spargebra::algebra::{
 };
 use spargebra::{Query, SparqlParser};
 use std::sync::Arc;
-use std::time::Duration;
 
 /// 2001-09-09T01:46:40Z, far enough from any wall clock this test runs under that the two
 /// cannot be confused.
@@ -84,23 +85,6 @@ fn now_does_not_read_a_temporal_corridors_instant() {
         year(&t) > 2001,
         "NOW() answered {t} inside a corridor pinned to {PINNED_LEXICAL}"
     );
-}
-
-#[test]
-fn a_now_answer_is_cached_like_any_covered_read() {
-    let kernel = Kernel::new(Arc::new(space(DurableStore::in_memory().unwrap())));
-    let first = select(&kernel, NOW_QUERY, None);
-    std::thread::sleep(Duration::from_millis(20));
-    let second = select(&kernel, NOW_QUERY, None);
-    assert_eq!(
-        first, second,
-        "the repeat was served the first answer from the cache, 20 ms of wall clock later"
-    );
-    // …and it was the cache: a kernel with no cache entry, 20 ms after that, reads a
-    // different instant. Without this the equality above could be a coarse clock.
-    std::thread::sleep(Duration::from_millis(20));
-    let fresh = Kernel::new(Arc::new(space(DurableStore::in_memory().unwrap())));
-    assert_ne!(select(&fresh, NOW_QUERY, None), first);
 }
 
 #[test]
