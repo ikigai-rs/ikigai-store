@@ -288,10 +288,13 @@ pub(crate) mod confine;
 pub mod depth;
 pub mod endpoints;
 pub mod limits;
+mod now;
 pub(crate) mod scope;
 pub mod service;
 pub mod sparql;
 pub mod store;
+#[cfg(feature = "text-index")]
+pub mod text;
 mod transfer;
 
 pub use budget::{AnswerBudget, EvaluationBudget, TimeBudget};
@@ -304,3 +307,5 @@ pub use store::{
     Backing, DeclaredTransaction, DurableStore, GraphFingerprint, QuadIter, SharedWriter,
     SharerWrites, SnapshotReader, StorageError, Store, Transaction, UndeclaredGraph,
 };
+#[cfg(feature = "text-index")]
+pub use text::{TextEnrollment, TextHit, TextQuery};

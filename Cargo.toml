@@ -346,7 +346,10 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # how a scoped write cuts that thread. A MINOR, not a patch: the new resource joins every consumer's
 # served catalog (ikigai-ledger and gonk pin those lists in their tests), and a host that does not
 # route the name refuses scoped writes. Tested against ledger and gonk main on 2026-11-10.
-version = "0.6.0"
+# ★ 0.6.1 adds the text index (ledger #4128) behind the off-by-default `text-index` feature: its resources
+# (graph-text, text-index:graph:{graph} and its rebuild/compact, text-enrollment) are bound only
+# under the feature, so the default served catalog consumers pin is unchanged. Additive, so a patch.
+version = "0.6.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -399,6 +402,10 @@ rdf-12 = ["oxigraph/rdf-12"]
 # relied on there being no HTTP client. They now test the evaluator this crate builds instead,
 # which refuses in every build.
 http-client = ["oxigraph/http-client"]
+# A full-text index over the graphs and predicates the host enrolls, served as
+# `urn:iki:store:graph-text` (ledger #4128). Off by default: tantivy brings its own tree, and
+# the browser build keeps the scan.
+text-index = ["dep:tantivy"]
 
 [dependencies]
 async-trait = "0.1"
@@ -479,6 +486,7 @@ serde = { version = "1", features = ["derive"] }
 # here.
 serde_json = "1"
 toml = "0.8"
+tantivy = { version = "0.27.0", optional = true, default-features = false, features = ["mmap"] }
 
 # On wasm, Oxigraph needs its `js` feature (getrandom wasm backend) to build.
 [target.'cfg(target_family = "wasm")'.dependencies]
@@ -527,3 +535,8 @@ ikigai-vocab = "0.4.0"
 [[example]]
 name = "dump-memory"
 required-features = ["persistent"]
+
+[[bench]]
+name = "text_index"
+harness = false
+required-features = ["text-index"]

@@ -269,8 +269,10 @@ an update anyone has seen applied.) And a `DELETE DATA` quad or `DELETE` templat
 graph or the default graph removed nothing from the private copy and answered `-0`, including
 `WITH <other> DELETE … USING <G>`, where `USING` takes the `WHERE` and `WITH` is left naming
 the templates. It is refused by name; a write-only caller's `DELETE DATA` reaches this
-refusal too, which is decided on the text and says nothing about the data. Still not refused:
-`CLEAR`/`DROP` of another graph or `DEFAULT`, which answer `+0 -0`.
+refusal too, which is decided on the text and says nothing about the data. So is a `CLEAR` or
+`DROP` of another graph or `DEFAULT` (ledger #4022): without `SILENT` it failed saying an
+existing graph did not exist, and with it answered `+0 -0`. `COPY`/`MOVE … TO <other>` is
+still refused on its effect.
 
 ★ **And an update with a `WHERE` needs the READ grant too** (ledger #751). A `WHERE`
 reads the graph it matches against, so a caller holding only the write grant could once

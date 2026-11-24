@@ -662,3 +662,76 @@ fn the_broad_door_still_reads_another_graph() {
         .iter()
         .any(|row| row.starts_with("urn:example:south:1,urn:copied")));
 }
+
+/// ★ Ledger #4022: `CLEAR` or `DROP` of another graph, or of `DEFAULT`, ran against the private
+/// copy, which holds the scoped graph alone. Without `SILENT` it failed with `The graph
+/// <south> does not exist`, which is false: south exists, it is only outside `graph=`. With
+/// `SILENT` it answered `+0 -0` and dropped nothing. Each is refused by name now, on the text,
+/// like a `DELETE` naming another graph, and the store is unchanged.
+#[test]
+fn clear_or_drop_of_another_graph_or_the_default_graph_is_refused() {
+    for (update, says) in [
+        (format!("CLEAR GRAPH <{SOUTH}>"), format!("<{SOUTH}>")),
+        (format!("DROP GRAPH <{SOUTH}>"), format!("<{SOUTH}>")),
+        (
+            format!("CLEAR SILENT GRAPH <{SOUTH}>"),
+            format!("<{SOUTH}>"),
+        ),
+        (format!("DROP SILENT GRAPH <{SOUTH}>"), format!("<{SOUTH}>")),
+        ("CLEAR DEFAULT".to_string(), "the default graph".to_string()),
+        (
+            "DROP SILENT DEFAULT".to_string(),
+            "the default graph".to_string(),
+        ),
+        (
+            format!(
+                "INSERT DATA {{ GRAPH <{NORTH}> {{ <urn:example:north:2> <urn:p> \"ok\" }} }} ; \
+                 DROP GRAPH <{SOUTH}>"
+            ),
+            format!("<{SOUTH}>"),
+        ),
+    ] {
+        for cap in [
+            every_grant(),
+            // Decided on the text, so a write-only caller is refused the same way.
+            Capability::scoped([cap_write_graph(NORTH)]),
+        ] {
+            let kernel = kernel();
+            let before = the_store(&kernel);
+            let result = issue(
+                &kernel,
+                "urn:iki:store:graph-update",
+                Verb::Sink,
+                &[("graph", NORTH), ("content", &update)],
+                &cap,
+            );
+            if let Err(err) = &result {
+                assert!(
+                    !format!("{err:?}").contains("does not exist"),
+                    "{update}: claims an existing graph does not exist: {err:?}"
+                );
+            }
+            assert_refused_saying(result, &[&says, "CLEAR", "DROP"], &update);
+            assert_eq!(the_store(&kernel), before, "{update}: the store changed");
+        }
+    }
+}
+
+/// The other half of the pair: `CLEAR`/`DROP` of the scoped graph itself, and the whole-dataset
+/// targets (`NAMED`, `ALL`), still apply, to the scoped graph alone.
+#[test]
+fn clear_or_drop_of_the_scoped_graph_still_applies() {
+    for update in [
+        format!("CLEAR GRAPH <{NORTH}>"),
+        format!("DROP SILENT GRAPH <{NORTH}>"),
+        "CLEAR NAMED".to_string(),
+        "DROP ALL".to_string(),
+    ] {
+        let kernel = kernel();
+        let answer = scoped(&kernel, &update).unwrap_or_else(|e| panic!("{update}: {e:?}"));
+        assert!(answer.contains("-1 quads"), "{update}: {answer}");
+        assert!(subjects(&kernel, NORTH).is_empty(), "{update}");
+        assert_eq!(subjects(&kernel, SOUTH).len(), 1, "{update}");
+        assert_eq!(subjects(&kernel, EAST).len(), 1, "{update}");
+    }
+}

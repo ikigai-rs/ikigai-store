@@ -113,7 +113,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ikigai_core::{
     ArgRef, ArgSpec, Body, Description, Endpoint, EndpointSpace, Error, Exact, FailureClass,
-    Invocation, Iri, ReprType, Representation, Request, Result, UriTemplate, Verb,
+    Invocation, Iri, ReprType, Representation, Request, Result, UncachedReason, UriTemplate, Verb,
 };
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::{
@@ -405,7 +405,7 @@ pub fn space(store: DurableStore) -> EndpointSpace {
             },
         );
     }
-    space
+    let space = space
         .bind(
             Exact::new("urn:iki:store:info"),
             InfoEndpoint {
@@ -442,13 +442,26 @@ pub fn space(store: DurableStore) -> EndpointSpace {
                 store: Arc::clone(&store),
             },
         )
-        .bind(Exact::new("urn:iki:store:load"), LoadEndpoint { store })
+        .bind(
+            Exact::new("urn:iki:store:load"),
+            LoadEndpoint {
+                store: Arc::clone(&store),
+            },
+        )
         .bind(
             UriTemplate::parse(format!("{GRAPH_THREAD_PREFIX}{{graph}}"))
                 .expect("the template is a literal with one trailing variable"),
             GraphWrittenEndpoint,
-        )
+        );
+    #[cfg(feature = "text-index")]
+    let space = text_doors::bind(space, &store);
+    #[cfg(not(feature = "text-index"))]
+    drop(store);
+    space
 }
+
+#[cfg(feature = "text-index")]
+mod text_doors;
 
 /// Cacheable under the threads of every write that can change this read when it is covered;
 /// `Expiry::Always` when an invisible writer may have changed what it read.
@@ -531,6 +544,12 @@ fn cached_under(
 }
 
 // ---------------------------------------------------------------------------- query
+
+/// The trace note a query door adds when it answers uncached because the query calls SPARQL
+/// `NOW()` (ledger #3989). The kernel's own `uncached` note on the same event says `declared`:
+/// `ikigai-core` 0.4's `UncachedReason` has no variant for "reads the clock", so this note is
+/// where the reason is named.
+pub const NOW_NOTE: &str = "uncached-now";
 
 /// The four query forms, as `(IRI suffix, description id, scoped description id,
 /// graph-shaped?)`.
@@ -621,7 +640,7 @@ impl Endpoint for QueryEndpoint {
                     crate::budget::inline_bound(inv, "max_bytes")?,
                     self.store.answer_budget().for_capability(inv.capability),
                 )?;
-                let (media, bytes) = self.store.evaluate(
+                let (media, bytes, reads_the_clock) = self.store.evaluate(
                     query,
                     false,
                     inv.capability,
@@ -645,6 +664,10 @@ impl Endpoint for QueryEndpoint {
                         // `src/service.rs`): in a host with `oxigraph/http-client` on, a plain
                         // evaluator turns `SERVICE <http://…>` into an ungated request.
                         crate::service::refuse_service(&parsed, "query")?;
+                        // ★ `NOW()` reads the wall clock, so an answer that calls it is not a
+                        // function of the data and is never cached (ledger #3989). Read off
+                        // the parsed algebra, before `parsed` is handed to the evaluator.
+                        let reads_the_clock = crate::now::calls_now(&parsed);
                         // ★ A constant `GRAPH <iri>` outside the set is refused, not answered
                         // empty (ledger #388). `confine` already keeps it unreachable; this is
                         // about telling a caller who mistyped an IRI or left a graph out of
@@ -731,18 +754,33 @@ impl Endpoint for QueryEndpoint {
                             });
                         }
 
-                        if this.graph_shaped {
+                        let (media, bytes) = if this.graph_shaped {
                             serialize_graph(results, as_type, deadline, answer)
                         } else {
                             serialize_solutions(results, as_type, deadline, answer)
-                        }
+                        }?;
+                        Ok((media, bytes, reads_the_clock))
                     },
                 )?;
+                let rep = Representation::new(
+                    ReprType::new(&media).with_param("charset", "utf-8"),
+                    bytes,
+                );
+                if reads_the_clock {
+                    // ★ Uncached whatever the coverage says, and on a pinned chain too: the
+                    // evaluator reads the wall clock, not `inv.now()`, so even an as-of
+                    // read is not a pure function of its context (ledger #2203). Core 0.4
+                    // has no reason more specific than `declared` for `urn:kernel:uncached`;
+                    // the trace note says which.
+                    inv.trace_note(
+                        NOW_NOTE,
+                        "the query calls NOW(), which reads the wall clock, so its answer is \
+                         never cached",
+                    );
+                    return Ok(rep.with_uncached_reason(UncachedReason::Declared));
+                }
                 Ok(with_freshness(
-                    Representation::new(
-                        ReprType::new(&media).with_param("charset", "utf-8"),
-                        bytes,
-                    ),
+                    rep,
                     &self.store,
                     // `target` is `Some` exactly when `confine` ran, so this is the
                     // read's real universe and not a restatement of the IRI.
@@ -1977,6 +2015,9 @@ impl Endpoint for UpdateEndpoint {
                 // dataset before and after scanned all of it twice under the write lock, and a
                 // one-triple update cost 1.4 s at 10M quads and was refused at 1B. oxigraph
                 // reports nothing of what an update changed; `urn:iki:store:info` counts.
+                // ★ A broad update names no difference: every enrolled graph's text index
+                // is stale until rebuilt (ledger #4128).
+                self.store.text_all_stale();
                 Ok(plain("updated\n".to_string()))
             }
             other => Err(unsupported("store-update", other)),
@@ -2132,14 +2173,22 @@ impl Endpoint for GraphUpdateEndpoint {
                             crate::confine::reads_default_outside(parsed.reads_default, &target)?;
                             crate::confine::deletes_outside(&parsed.deletes, &target)?;
                             let _writes = store.write_lock_for(deadline);
-                            crate::confine::scoped_update(
+                            let applied = crate::confine::scoped_update(
                                 store.dataset(),
                                 &target,
                                 parsed.prepared,
                                 &parsed.footprint,
                                 max_copy,
                                 deadline,
-                            )
+                            )?;
+                            // ★ The text index learns the difference this door just
+                            // committed, under the same write lock (ledger #4128).
+                            store.text_apply(
+                                target.as_str(),
+                                &applied.removed_quads,
+                                &applied.added_quads,
+                            );
+                            Ok(applied)
                         });
                 // ★ After the commit, and on failure too, as the kernel cuts a write that ran
                 // and failed (ledger #1105). The request before the write cleared the same
@@ -2415,6 +2464,7 @@ impl Endpoint for LoadEndpoint {
                         .map_err(|e| Error::Endpoint(format!("load: committing: {e}")))?;
                     Ok(added)
                 })?;
+                self.store.text_all_stale();
                 Ok(plain(if may_read {
                     format!("loaded {media}: +{added} quads\n")
                 } else {
