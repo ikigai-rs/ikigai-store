@@ -98,7 +98,7 @@ choices. This is decision 1 below.
 - (ii) Refuse a query that uses `NOW()` with `InvalidArgument`, saying the kernel has no clock.
   This is core's reading of `None`, but it would break a host that has never installed a clock.
 
-### B. Upstream `with_now` on spareval and oxigraph (worth filing, does not replace A)
+### B. Upstream `with_now` on spareval and oxigraph (filed, does not replace A)
 
 This is the cleaner long-term seam. It also removes the eager wall-clock read and separates the
 statistics timer from the `NOW()` instant. It does not change what the store must decide about
@@ -106,8 +106,9 @@ caching (below), and the store would adopt it only after an oxigraph release, so
 B can replace the rewrite later without changing any answer.
 
 Draft issue text for oxigraph/oxigraph, laid out in its **Feature request** template (which adds the
-`enhancement` label). **Not filed**: filing it is Brian's (anything posted outside ikigai-rs is). A
-search of oxigraph's issues for `NOW()` and `with_now` on 2026-11-24 found no existing request.
+`enhancement` label). **Filed** by Brian on 2026-11-24 as
+[oxigraph/oxigraph#2044](https://github.com/oxigraph/oxigraph/issues/2044). A search of oxigraph's
+issues for `NOW()` and `with_now` that day found no earlier request.
 
 > **Title:** Allow the caller to provide the instant `NOW()` returns (`QueryEvaluator::with_now`)
 >
@@ -199,8 +200,8 @@ oxigraph, so it has the same defect. The walk should live where both crates can 
 ## Decisions (Brian, 2026-11-24)
 
 - **Option A is accepted:** `NOW()` is rewritten to a literal from `inv.now()` after the store's
-  two parse points. Option B (upstream `with_now`) is still worth filing, and filing it is
-  Brian's; option C stays rejected.
+  two parse points. Option B (upstream `with_now`) is filed as
+  [oxigraph/oxigraph#2044](https://github.com/oxigraph/oxigraph/issues/2044); option C stays rejected.
 - **Decision 1 takes the recommendation, (i):** a kernel with no clock keeps `NOW()` on the
   wall clock, and those answers are uncached.
 - **Decision 3:** ship A with every `NOW()` answer uncached (already true since store PR 101),
@@ -240,7 +241,8 @@ oxigraph, so it has the same defect. The walk should live where both crates can 
 4. **Cache `NOW()` answers under a pinned corridor.** Once item 3 lands, declare a `NOW()`
    answer computed from the pinned instant `.cacheable()` under the usual threads. Test that two
    corridors at two instants never share an entry.
-5. **File the upstream `with_now` issue on oxigraph.** Use the draft text in this note. When it
+5. **Upstream `with_now` on oxigraph: filed** as
+   [oxigraph/oxigraph#2044](https://github.com/oxigraph/oxigraph/issues/2044) (2026-11-24). When it
    ships, replace the store's rewrite with `with_now(inv.now())` and keep the tests.
 6. **ikigai-sparql: apply the same `NOW()` pinning.** Once decision 2 is settled, use the shared
    walk in `ikigai-sparql`'s evaluator, with the same caching rule.
