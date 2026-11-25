@@ -62,6 +62,62 @@ MIN/MAX with incomparable or tied RDF terms and floating-point accumulation in S
 [SPARQL 1.1 §§14, 16.4, 17.6, 18.5.1](https://www.w3.org/TR/sparql11-query/#basic-federated-query)
 [SPARQL 1.2 §§14, 16.4, 17.6, 18.6.1](https://www.w3.org/TR/2026/WD-sparql12-query-20261119/#basic-federated-query)
 
+## Ordering and output identity: insertion-order experiment
+
+`cargo test --test answer_repeatability` compares two in-memory stores containing the
+same four ground triples, inserted in opposite orders. An unordered SELECT agrees as a
+multiset, including a duplicate value; a slice ordered by numeric value and unique subject
+agrees as a sequence; COUNT, SUM, AVG, MIN and MAX agree on those small integers. A
+CONSTRUCT with one fresh blank node per solution produces graphs that are isomorphic,
+but the RDF terms differ. The isomorphism check matches each blank node's two ground
+edges; it is specific to this fixture. The public memory dump returns identical N-Quads
+bytes for a separate ground dataset inserted in opposite orders. These examples are
+observations on the tested evaluator and backing, not proofs for all datasets, plans,
+versions or serializations.
+
+Two controls expose why the examples cannot justify a broad relaxation. `ORDER BY ?key
+LIMIT 1` over tied keys selects different subjects when the input VALUES rows are reversed.
+`SUM` over the same double values in different VALUES orders changes its result because
+floating-point addition rounds. These controls change the query's VALUES order; they do
+not claim that reversing insertion alone always changes the evaluator's plan. The query
+doors serialize evaluator order and do not promise stable bytes for SELECT or CONSTRUCT.
+The dump's existing promise is narrower: the same dataset with the same stored blank
+node labels has stable bytes per backing, not across backings or isomorphic datasets with
+different labels. See `DumpEndpoint` in `src/endpoints.rs`.
+
+For output, **no stable blank-node labels or skolem IRIs are promised** by the query
+doors. A label in one serialized answer is not an identifier for another answer. Compare
+CONSTRUCT results by graph isomorphism, including consistent renaming across the entire
+graph; compare SELECT bindings with a consistent blank-node renaming across the whole
+result set when the input contains blank nodes. Template blank nodes are fresh, and an
+input blank node's label may depend on loading or storage. Consumers needing persistent
+identity must supply stable IRIs; consumers needing stable bytes must define their own
+canonicalization and serialization, including blank-node handling. This policy does not
+change the dump's stored-label contract.
+
+A slice can be repeatable if its own input multiset is repeatable and its ordering keys
+are bound, comparable and distinguish all observably different solutions at that slice;
+identical duplicates need not be distinguished. `ORDER BY` all projected variables is
+not sufficient by itself: terms can tie or be incomparable, unprojected variables can
+matter to an outer query, and blank-node identity can vary. The experiment does not
+prove a static analyzer can establish these preconditions, so retain the refusal of every
+`LIMIT` and `OFFSET` for now, including ordered and nested slices.
+
+`COUNT` over a repeatable solution multiset is order-independent, subject to the same RDF
+identity and evaluator limits; the prototype already admits it. Exact integer or decimal
+`SUM` and `AVG` can only be admitted where every intermediate operation is exact and
+within the evaluator's limits, and type promotion and error handling cannot vary with
+order. `MIN` and `MAX` need a domain with a total ordering and a unique RDF-term result,
+including ties. The small integer fixture does not prove those properties for arbitrary
+queries. Keep `SAMPLE` refused because it chooses a member and `GROUP_CONCAT` refused
+because it does not define member order; do not newly admit any slice or aggregate domain
+in the shared classifier on this evidence. In particular, reject floating-point `SUM` and
+`AVG` for a strict repeatability promise unless a separate proof rules out rounding
+sensitivity. The prototype is not an enforcement mechanism and its current aggregate
+coverage is not evidence that unrestricted aggregates are safe. A follow-up classifier
+needs typed reasons naming each construct and its cause, and proofs of these preconditions
+before relaxing its rules.
+
 ## One parsed-algebra traversal
 
 Extract the shape of `calls_now` from the [PR #101 branch at a88ce82](https://github.com/ikigai-rs/ikigai-store/blob/a88ce82431eb9ac1988546bf7444c64d2481bf7d/src/now.rs).
