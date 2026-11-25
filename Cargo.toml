@@ -351,7 +351,10 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # under the feature, so the default served catalog consumers pin is unchanged. Additive, so a patch.
 # 0.6.2 pins SPARQL NOW() to the invocation instant when available (ledger #4284).
 # No public API change, and no behavior change without an invocation clock.
-version = "0.6.2"
+# 0.6.3 keys a text-index document by the literal's whole term (ledger #4348): `"x"@en` and
+# `"x"@fr` were one document, so removing one left the other unsearchable. Index format 2, so
+# an index written by 0.6.2 is rebuilt on open. No public API change.
+version = "0.6.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
