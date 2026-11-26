@@ -38,7 +38,10 @@ use tantivy::{
 };
 
 /// The on-disk format this crate writes. A different number on open means rebuild.
-pub const TEXT_INDEX_FORMAT: u32 = 1;
+///
+/// 2: a document's key hashes the literal's whole term, language tag and datatype included;
+/// format 1 hashed only its text, so two literals differing only in tag shared one document.
+pub const TEXT_INDEX_FORMAT: u32 = 2;
 
 /// The analyzer, named in the fingerprint and in `urn:iki:store:text-enrollment`.
 const ANALYZER: &str = "words: split on non-alphanumerics, lowercased, no stemming";
@@ -258,7 +261,8 @@ fn ix(e: impl std::fmt::Display) -> String {
     format!("text index: {e}")
 }
 
-/// A stable 128-bit FNV-1a, so a key survives a toolchain upgrade.
+/// A stable 128-bit FNV-1a, so a key survives a toolchain upgrade. `literal` is the literal's
+/// whole term in N-Triples form: `"x"@en` and `"x"@fr` are two quads, so two documents.
 fn key_of(subject: &str, predicate: &str, literal: &str) -> String {
     let mut h: u128 = 0x6c62272e07bb014262b821756295c58d;
     for part in [subject, "\u{0}", predicate, "\u{0}", literal] {
@@ -475,7 +479,7 @@ impl TextIndexes {
         Some(key_of(
             &subject_text(&quad.subject),
             quad.predicate.as_str(),
-            lit.value(),
+            &lit.to_string(),
         ))
     }
 

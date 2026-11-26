@@ -534,3 +534,51 @@ fn index_bytes_contain(dir: &std::path::Path, needle: &str) -> bool {
     }
     false
 }
+
+/// ★ Two literals with the same text but another language tag (or datatype) are two quads,
+/// and the index keeps a document for each: removing one leaves the other searchable.
+#[test]
+fn removing_one_of_two_literals_differing_only_in_language_keeps_the_other_searchable() {
+    let kernel = seeded();
+    let write = Capability::scoped([cap_write_graph(A), cap_read_graph(A)]);
+    let update = |content: String| {
+        issue(
+            &kernel,
+            Verb::Sink,
+            "urn:iki:store:graph-update",
+            &[("graph", A), ("content", &content)],
+            &write,
+        )
+        .unwrap()
+    };
+    update(format!(
+        "INSERT DATA {{ GRAPH <{A}> {{ <urn:item:9> <{BODY}> \"quokka\"@en, \"quokka\"@fr, \"quokka\" }} }}"
+    ));
+    update(format!(
+        "DELETE DATA {{ GRAPH <{A}> {{ <urn:item:9> <{BODY}> \"quokka\"@en }} }}"
+    ));
+    let expected = BTreeSet::from([("urn:item:9".to_string(), BODY.to_string())]);
+    assert_eq!(
+        scan(&kernel, A, "quokka"),
+        expected,
+        "the store still holds two"
+    );
+    let hits = search(&kernel, A, &[("words", "quokka")], &all_read()).unwrap();
+    assert_eq!(hits.len(), 2, "one hit per stored literal: {hits:?}");
+
+    // A rebuild agrees with the scoped write's difference.
+    issue(
+        &kernel,
+        Verb::Sink,
+        &format!("{}:rebuild", status_iri(A)),
+        &[],
+        &Capability::root(),
+    )
+    .unwrap();
+    let hits = search(&kernel, A, &[("words", "quokka")], &all_read()).unwrap();
+    assert_eq!(
+        hits.len(),
+        2,
+        "one hit per stored literal after a rebuild: {hits:?}"
+    );
+}
