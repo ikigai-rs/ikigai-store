@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! cargo run --release --features persistent --example dump-memory -- seed <store-dir> <quads>
+//! /usr/bin/time -l target/release/examples/dump-memory open <store-dir>
 //! /usr/bin/time -l target/release/examples/dump-memory dump <store-dir> [<out-file>]
 //! /usr/bin/time -l target/release/examples/dump-memory baseline <store-dir>
 //! /usr/bin/time -l target/release/examples/dump-memory scan <store-dir>
@@ -9,10 +10,11 @@
 //!
 //! `seed` builds the store: `<quads>` quads shaped like `ikigai-gonk`'s live dataset (about 93%
 //! in one named graph beside a second, about 225 bytes of N-Quads each, literals that do not all
-//! compress alike), loaded in pieces under the store's own load cap, and then FLUSHED, so the
-//! measurement that follows does not also pay for replaying a write-ahead log. `dump` opens the
-//! store owned, binds it into a kernel and asks for one dump as root (the answer ceiling: 10M
-//! quads, 1 GiB), writing it to `<out-file>` when given so two builds' dumps can be compared with
+//! compress alike), loaded in pieces under the store's own load cap. The load door flushes each
+//! piece. Run `open` first, in a separate process, to measure the first reopen without reading
+//! any quads or building a kernel. `dump` opens the store owned, binds it into a kernel, and
+//! asks for one dump as root (the answer ceiling: 10M quads, 1 GiB), writing it to `<out-file>`
+//! when given so two builds' dumps can be compared with
 //! `cmp`; `baseline` does everything `dump` does except the dump, so the difference between
 //! their peaks is the dump's; `scan` reads every quad through the store's `SnapshotReader` and
 //! keeps none, so the difference between `scan` and `dump` is what the dump HOLDS, and between
@@ -31,7 +33,7 @@ use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
 use ikigai_store::{space, DurableStore};
 
 const USAGE: &str = "usage: dump-memory seed <store-dir> <quads> | dump <store-dir> [<out-file>] \
-                     | baseline <store-dir> | scan <store-dir>";
+                     | open <store-dir> | baseline <store-dir> | scan <store-dir>";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -44,6 +46,7 @@ fn main() {
         ["seed", dir, quads] => seed(Path::new(dir), quads.parse().expect("a quad count")),
         ["dump", dir] => run(Path::new(dir), true, None),
         ["dump", dir, out] => run(Path::new(dir), true, Some(Path::new(out))),
+        ["open", dir] => open(Path::new(dir)),
         ["baseline", dir] => run(Path::new(dir), false, None),
         ["scan", dir] => scan(Path::new(dir)),
         _ => panic!("{USAGE}"),
@@ -78,8 +81,7 @@ fn issue(kernel: &Kernel, verb: Verb, iri: &str, args: &[(&str, Vec<u8>)]) -> Ve
 }
 
 fn seed(dir: &Path, quads: u64) {
-    // Shared only so the seed can flush the store's write-ahead log when it is done.
-    let (store, handle) = DurableStore::open_shared(dir).expect("the scratch store opens");
+    let store = DurableStore::open(dir).expect("the scratch store opens");
     let kernel = Kernel::new(Arc::new(space(store)));
     let started = Instant::now();
     let mut n = 0;
@@ -99,8 +101,13 @@ fn seed(dir: &Path, quads: u64) {
             ],
         );
     }
-    handle.flush().expect("the store flushes");
     println!("seeded {quads} quads in {:.2?}", started.elapsed());
+}
+
+fn open(dir: &Path) {
+    let started = Instant::now();
+    let _store = DurableStore::open(dir).expect("the scratch store opens");
+    println!("first open in {:?}", started.elapsed());
 }
 
 fn run(dir: &Path, take: bool, out: Option<&Path>) {
