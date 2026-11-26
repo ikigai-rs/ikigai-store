@@ -41,10 +41,34 @@ use tantivy::{
 ///
 /// 2: a document's key hashes the literal's whole term, language tag and datatype included;
 /// format 1 hashed only its text, so two literals differing only in tag shared one document.
-pub const TEXT_INDEX_FORMAT: u32 = 2;
+///
+/// 3: the same documents; bumped so every index 0.6.3 and earlier wrote is rebuilt once on
+/// open (ledger #4448): a build overlapping a scoped write could leave such an index holding
+/// one literal's document twice.
+pub const TEXT_INDEX_FORMAT: u32 = 3;
 
 /// The analyzer, named in the fingerprint and in `urn:iki:store:text-enrollment`.
 const ANALYZER: &str = "words: split on non-alphanumerics, lowercased, no stemming";
+
+/// How many times a build runs in a row when the index it committed does not hold the number
+/// of documents it added, before it leaves the graph stale and retries later
+/// ([`RETRY_FIRST`]).
+const BUILD_ATTEMPTS: usize = 3;
+
+/// How long a graph left stale by a failed build waits before its build runs again; each
+/// further failure doubles the wait, up to [`RETRY_LONGEST`].
+const RETRY_FIRST: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_secs(1)
+};
+
+/// The longest wait between two builds of a graph whose builds keep failing.
+const RETRY_LONGEST: Duration = if cfg!(test) {
+    Duration::from_millis(80)
+} else {
+    Duration::from_secs(300)
+};
 
 /// How long written documents may wait before a commit makes them searchable.
 pub const COMMIT_INTERVAL: Duration = Duration::from_secs(1);
@@ -246,6 +270,9 @@ pub struct TextIndexes {
     schema: Schema,
     graphs: Mutex<HashMap<String, Arc<GraphIndex>>>,
     me: Weak<TextIndexes>,
+    /// Builds that will add one document too many, to test the repair of a miscount.
+    #[cfg(test)]
+    faults: AtomicUsize,
 }
 
 impl std::fmt::Debug for TextIndexes {
@@ -299,6 +326,8 @@ impl TextIndexes {
             schema,
             graphs: Mutex::new(HashMap::new()),
             me: me.clone(),
+            #[cfg(test)]
+            faults: AtomicUsize::new(0),
         });
         for graph in this.enrolled_graphs_in_store()? {
             this.index_for(&graph)?;
@@ -350,6 +379,16 @@ impl TextIndexes {
             .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .map_err(ix)?;
+        // ★ A clean, current index must also hold one document per enrolled literal the store
+        // holds: an index that drifted (one a build raced, ledger #4448) is rebuilt, not
+        // trusted forever.
+        let current = current && {
+            let held = reader.searcher().num_docs();
+            match self.literals_in(graph) {
+                Ok(n) => u64::try_from(n).is_ok_and(|n| n == held),
+                Err(_) => false,
+            }
+        };
         let g = Arc::new(GraphIndex {
             graph: graph.to_string(),
             index,
@@ -414,17 +453,56 @@ impl TextIndexes {
     }
 
     fn spawn_rebuild(&self, g: Arc<GraphIndex>) {
-        let Some(me) = self.me.upgrade() else { return };
+        self.spawn_rebuild_after(g, Duration::ZERO);
+    }
+
+    /// Build `g` in the background after `wait`, and again with a growing wait for as long as
+    /// its builds fail and it stays stale: a failed build is retried, never left stale until
+    /// some broad write happens to mark it again (ledger #4448). The thread holds the indexes
+    /// only while a build runs, so closing the store is never held up by a wait.
+    fn spawn_rebuild_after(&self, g: Arc<GraphIndex>, wait: Duration) {
+        let me = self.me.clone();
         std::thread::Builder::new()
             .name("ikigai-store text rebuild".into())
             .spawn(move || {
-                let _ = me.rebuild(&g);
+                let mut wait = wait;
+                loop {
+                    if !wait.is_zero() {
+                        std::thread::sleep(wait);
+                        if *g.state.lock().expect("text index state") != IndexState::Stale {
+                            return;
+                        }
+                    }
+                    let Some(me) = me.upgrade() else { return };
+                    if me.rebuild(&g).is_ok() {
+                        return;
+                    }
+                    drop(me);
+                    wait = (wait * 2).clamp(RETRY_FIRST, RETRY_LONGEST);
+                }
             })
             .ok();
     }
 
-    /// Rebuild one graph's index from the store's quads, now, until no write raced it.
+    /// How many documents `graph`'s index should hold: its enrolled literals in the store.
+    fn literals_in(&self, graph: &str) -> Result<usize, String> {
+        let graph = NamedNode::new(graph).map_err(ix)?;
+        let mut n = 0;
+        for quad in self
+            .store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref().into()))
+        {
+            if self.key(&quad.map_err(ix)?).is_some() {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Rebuild one graph's index from the store's quads, now, until no write raced it and the
+    /// committed index holds exactly the documents the build added.
     fn rebuild(&self, g: &GraphIndex) -> Result<usize, String> {
+        let mut miscounts = 0;
         loop {
             {
                 let mut state = g.state.lock().expect("text index state");
@@ -435,11 +513,27 @@ impl TextIndexes {
             }
             let started = g.generation.load(Ordering::SeqCst);
             let result = self.fill(g);
+            // Read before the generation is checked, so a write after this read is seen there.
+            let held = g.reader.searcher().num_docs();
             let mut state = g.state.lock().expect("text index state");
             match result {
                 Ok(n) if g.generation.load(Ordering::SeqCst) == started => {
-                    *state = IndexState::Ready;
-                    return Ok(n);
+                    if u64::try_from(n).is_ok_and(|n| n == held) {
+                        *state = IndexState::Ready;
+                        return Ok(n);
+                    }
+                    miscounts += 1;
+                    *state = IndexState::Stale;
+                    if miscounts >= BUILD_ATTEMPTS {
+                        return Err(ix(format!(
+                            "the build of graph <{}>'s text index added {n} documents, but \
+                             the index holds {held}, {BUILD_ATTEMPTS} times in a row. Searches \
+                             of the graph answer \"no index\" until a build matches; one is \
+                             retried in the background, or ask for one through \
+                             the graph's `urn:iki:store:text-index:graph:…:rebuild` door",
+                            g.graph
+                        )));
+                    }
                 }
                 Ok(_) => *state = IndexState::Stale,
                 Err(e) => {
@@ -453,6 +547,12 @@ impl TextIndexes {
     fn fill(&self, g: &GraphIndex) -> Result<usize, String> {
         let graph = NamedNode::new(g.graph.as_str()).map_err(ix)?;
         let mut writer = g.writer.lock().expect("text index writer");
+        // ★ Drop what the writer holds uncommitted first (ledger #4448): tantivy's
+        // `delete_all_documents` clears only committed segments, so a document a scoped write
+        // had added but no commit had made searchable survived it, and this build added the
+        // same literal again. Nothing is lost: `apply` runs after the store commits, so the
+        // scan below reads every quad whose document is dropped here.
+        writer.rollback().map_err(ix)?;
         writer.delete_all_documents().map_err(ix)?;
         let mut n = 0;
         for quad in self
@@ -464,6 +564,13 @@ impl TextIndexes {
                 writer.add_document(doc).map_err(ix)?;
                 n += 1;
             }
+        }
+        #[cfg(test)]
+        if self.faults.load(Ordering::SeqCst) > 0 {
+            self.faults.fetch_sub(1, Ordering::SeqCst);
+            let mut doc = TantivyDocument::default();
+            doc.add_text(self.fields.key, "fault");
+            writer.add_document(doc).map_err(ix)?;
         }
         writer.commit().map_err(ix)?;
         g.pending.store(0, Ordering::SeqCst);
@@ -522,10 +629,12 @@ impl TextIndexes {
                     changed += 1;
                 }
             }
-        }
-        if changed > 0 {
-            g.generation.fetch_add(1, Ordering::SeqCst);
-            g.pending.fetch_add(changed, Ordering::SeqCst);
+            // Counted under the writer's lock, so no build or commit can run between the
+            // documents and their count (ledger #4448).
+            if changed > 0 {
+                g.generation.fetch_add(1, Ordering::SeqCst);
+                g.pending.fetch_add(changed, Ordering::SeqCst);
+            }
         }
     }
 
@@ -564,12 +673,14 @@ impl TextIndexes {
             return Ok(());
         }
         let mut writer = g.writer.lock().expect("text index writer");
-        let pending = g.pending.swap(0, Ordering::SeqCst);
-        if let Err(e) = writer.commit() {
-            g.pending.fetch_add(pending, Ordering::SeqCst);
-            return Err(ix(e));
-        }
-        g.reader.reload().map_err(ix)
+        // ★ `pending` falls only once what it counts is searchable (ledger #4448): zeroed
+        // before the commit, a status read in between said `pending: 0` beside the count
+        // before the commit, which a caller waiting for `pending: 0` took as settled.
+        let pending = g.pending.load(Ordering::SeqCst);
+        writer.commit().map_err(ix)?;
+        g.reader.reload().map_err(ix)?;
+        g.pending.fetch_sub(pending, Ordering::SeqCst);
+        Ok(())
     }
 
     fn commit_all(&self) {
@@ -600,7 +711,11 @@ impl TextIndexes {
             std::thread::sleep(Duration::from_millis(10));
         }
         *g.state.lock().expect("text index state") = IndexState::Stale;
-        self.rebuild(&g).map(Some)
+        let built = self.rebuild(&g);
+        if built.is_err() {
+            self.spawn_rebuild_after(Arc::clone(&g), RETRY_FIRST);
+        }
+        built.map(Some)
     }
 
     /// Commit, merge away every deleted document, and collect the old files, before
@@ -866,4 +981,91 @@ fn dir_size(dir: &PathBuf) -> u64 {
                 .sum()
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxigraph::model::{GraphName, Literal};
+
+    const GRAPH: &str = "urn:example:ledger:faulty";
+    const TITLE: &str = "urn:example:title";
+
+    fn indexes() -> Arc<TextIndexes> {
+        let store = Arc::new(Store::new().unwrap());
+        for n in 0..3 {
+            store
+                .insert(&Quad::new(
+                    NamedNode::new(format!("urn:item:{n}")).unwrap(),
+                    NamedNode::new(TITLE).unwrap(),
+                    Literal::new_simple_literal(format!("Title {n}")),
+                    GraphName::NamedNode(NamedNode::new(GRAPH).unwrap()),
+                ))
+                .unwrap();
+        }
+        let enrollment = TextEnrollment::new()
+            .graphs_starting_with("urn:example:ledger:")
+            .predicate(TITLE);
+        TextIndexes::open(store, None, enrollment).unwrap()
+    }
+
+    fn ready_with(indexes: &TextIndexes, documents: usize) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let s = indexes.status(GRAPH).unwrap();
+            if s.contains("state: ready\n") && s.contains(&format!("documents: {documents}\n")) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// Every build of a run miscounts, so `rebuild` gives up and leaves the graph stale: the
+    /// build is retried later, not left stale until some broad write (ledger #4448).
+    #[test]
+    fn a_graph_whose_builds_miscount_is_built_again_later() {
+        let indexes = indexes();
+        // Let the build `open` started finish, then make the next run of builds miscount.
+        assert!(ready_with(&indexes, 3));
+        indexes.faults.store(BUILD_ATTEMPTS + 2, Ordering::SeqCst);
+        let refused = indexes.rebuild_now(GRAPH).unwrap_err();
+        assert_eq!(
+            refused,
+            format!(
+                "text index: the build of graph <{GRAPH}>'s text index added 3 documents, but \
+                 the index holds 4, {BUILD_ATTEMPTS} times in a row. Searches of the graph \
+                 answer \"no index\" until a build matches; one is retried in the background, \
+                 or ask for one through the graph's \
+                 `urn:iki:store:text-index:graph:…:rebuild` door"
+            )
+        );
+        assert!(indexes.status(GRAPH).unwrap().contains("state: stale\n"));
+        assert!(
+            ready_with(&indexes, 3),
+            "a later build heals it: {}",
+            indexes.status(GRAPH).unwrap()
+        );
+        assert_eq!(indexes.faults.load(Ordering::SeqCst), 0);
+    }
+
+    /// A build that keeps failing is retried with a growing wait, and a store closed meanwhile
+    /// is not held open by the waiting thread.
+    #[test]
+    fn a_retry_waiting_does_not_hold_the_indexes_open() {
+        let indexes = indexes();
+        assert!(ready_with(&indexes, 3));
+        indexes.faults.store(usize::MAX, Ordering::SeqCst);
+        assert!(indexes.rebuild_now(GRAPH).is_err());
+        let weak = Arc::downgrade(&indexes);
+        drop(indexes);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while weak.strong_count() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retry held the indexes"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
