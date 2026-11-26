@@ -1,14 +1,20 @@
 //! A text index's first build and the scoped writes that overlap it never count one literal
 //! twice, and an index that already counts one twice heals (ledger #4448).
 //!
-//! What this reproduces on 0.6.3: a timer commit zeroed `pending` before its documents were
-//! searchable, so a status read in between said `state: ready`, `pending: 0` beside the count
-//! from before the commit, here 4 or 6 documents for 8 literals. A caller that waits for
-//! `pending: 0`, as the ledger's `complete` check does, took that count as settled.
+//! What this reproduces on 0.6.3, two defects:
 //!
-//! The reported doubled count (9 for 8) is not reproduced here. An index holding one
-//! more document than its graph holds enrolled literals, however it got there, now heals: its
-//! count is checked on open, after every build, and format 3 rebuilds every older index once.
+//! - **One literal counted twice.** A first build cleared the index with tantivy's
+//!   `delete_all_documents`, which clears only committed segments: a document a scoped write had
+//!   added but not yet committed survived, and the build added the same literal again. The graph
+//!   settled at `documents: 9` for 8 literals, with `deleted documents awaiting compaction: 1`,
+//!   and stayed there. `many_threads_filling_new_graphs_never_count_a_literal_twice` hits it.
+//! - **A count read too early.** A timer commit zeroed `pending` before its documents were
+//!   searchable, so a status read in between said `state: ready`, `pending: 0` beside the count
+//!   from before the commit, here 2 to 6 documents for 8 literals. A caller that waits for
+//!   `pending: 0`, as the ledger's `complete` check does, took that count as settled.
+//!
+//! An index that already counts one literal twice, as 0.6.3 could leave on disk, heals: its
+//! count is checked on open and after every build, and format 3 rebuilds every older index once.
 #![cfg(feature = "text-index")]
 
 use futures::executor::block_on;
@@ -136,6 +142,51 @@ fn a_first_build_overlapping_scoped_writes_counts_each_literal_once() {
             "the graph holds 8 enrolled literals: {s}"
         );
     }
+}
+
+/// Many threads, each writing ten graphs no index has seen, as gonk's tests do in parallel:
+/// on 0.6.3 a few graphs of a few hundred settled at `documents: 9` with `deleted documents
+/// awaiting compaction: 1`, the state the ledger reported. A first build's
+/// `delete_all_documents` cleared only committed segments, so a document a scoped write had
+/// added but not yet committed survived it, and the build added the same literal again.
+#[test]
+fn many_threads_filling_new_graphs_never_count_a_literal_twice() {
+    const THREADS: usize = 16;
+    const GRAPHS: usize = 10;
+    let kernel = Arc::new(Kernel::new(Arc::new(space(
+        DurableStore::in_memory()
+            .unwrap()
+            .with_text_index(enrollment())
+            .unwrap(),
+    ))));
+    let threads: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let kernel = Arc::clone(&kernel);
+            std::thread::spawn(move || {
+                let mut wrong = Vec::new();
+                for n in 0..GRAPHS {
+                    let graph = format!("urn:example:ledger:stress{t}x{n}");
+                    fill_new_graph(&kernel, &graph);
+                    let s = settled(&kernel, &graph);
+                    if field(&s, "documents") != 8 {
+                        wrong.push(s);
+                    }
+                }
+                wrong
+            })
+        })
+        .collect();
+    let wrong: Vec<String> = threads
+        .into_iter()
+        .flat_map(|t| t.join().unwrap())
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "{} of {} graphs, each holding 8 enrolled literals, settled at another count:\n{}",
+        wrong.len(),
+        THREADS * GRAPHS,
+        wrong.join("\n")
+    );
 }
 
 #[cfg(feature = "persistent")]
