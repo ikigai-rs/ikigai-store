@@ -2435,7 +2435,7 @@ impl Endpoint for LoadEndpoint {
                 // lookup per statement, and only for a caller that may read: whether a quad
                 // was there already is a read.
                 let may_read = inv.capability.allows(CAP_READ);
-                let added = self.store.on_writer(move |store| {
+                let flushed = self.store.on_writer(move |store| {
                     let mut transaction = store.dataset().start_transaction().map_err(|e| {
                         Error::Endpoint(format!("load: starting a transaction: {e}"))
                     })?;
@@ -2457,9 +2457,22 @@ impl Endpoint for LoadEndpoint {
                     transaction
                         .commit()
                         .map_err(|e| Error::Endpoint(format!("load: committing: {e}")))?;
-                    Ok(added)
+                    // Keep the flush on the writer, after the atomic commit. Otherwise
+                    // the next open can spend seconds replaying this load's WAL.
+                    #[cfg(all(feature = "persistent", not(target_family = "wasm")))]
+                    if matches!(store.backing(), Backing::Durable(_)) {
+                        return Ok(store.dataset().flush().map(|()| added).map_err(|e| {
+                            Error::Endpoint(format!(
+                                "load: the data was committed, but flushing it to disk failed: {e}"
+                            ))
+                        }));
+                    }
+                    Ok(Ok(added))
                 })?;
+                // A failed flush does not undo the commit. Mark the text index stale
+                // even then, just as the kernel cuts the load thread on an error.
                 self.store.text_all_stale();
+                let added = flushed?;
                 Ok(plain(if may_read {
                     format!("loaded {media}: +{added} quads\n")
                 } else {

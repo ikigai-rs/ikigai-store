@@ -1073,6 +1073,11 @@ was 84 MB on 2026-10-13, a third of the default); a host restoring a larger one 
 bound. `tests/load_bounds.rs` pins each refusal, and that a refusal is answered while another
 write holds the writer.
 
+On RocksDB, the load door flushes after the document's transaction commits, before returning
+the receipt (ledger #3275). This moves I/O onto the load path so the next open does not have
+to replay the load's write-ahead log. If the flush fails, the door reports that the data was
+already committed. In-memory loads have no flush.
+
 **SPARQL `LOAD <url>` is refused** at both update doors, as an `InvalidArgument` on `content`,
 before evaluation. oxigraph fetches and parses the document itself, with nothing between the two
 where a scan could stand: with `oxigraph/http-client` on (it is, in `ikigai-cli`'s graph), a
