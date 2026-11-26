@@ -15,8 +15,9 @@ On store main at `64a46722ad42d73973e31e84baddb9bfe867d09a`, the live select doo
 each of `RAND()`, `UUID()`, `STRUUID()`, and `BNODE()` into the kernel cache. The
 reproducer asks the kernel whether the exact request is cached after issuing it. This
 avoids inferring a cache hit from a random value or a blank node label. The test failed
-with all four calls listed. Run it explicitly with
-`cargo test --test deterministic_sparql volatile_selects_bypass_the_cache -- --ignored`.
+with all four calls listed. Run it with
+`cargo test --test deterministic_sparql volatile_selects_bypass_the_cache`. It was ignored
+during the spike and is active since follow-up 2 (ledger #4418, below).
 The separate NOW-only change also leaves these four calls outside its walker.
 [Store PR #101](https://github.com/ikigai-rs/ikigai-store/pull/101)
 
@@ -172,9 +173,9 @@ Keep the module independent of Oxigraph evaluators, endpoints, and cache APIs. A
 `cargo test --test deterministic_sparql` runs a test-only boolean prototype for the
 listed built-ins, slices, SAMPLE, GROUP_CONCAT, and REDUCED. Fixtures include a nested
 CONSTRUCT subquery, EXISTS, an aggregate argument, and negative controls for literal
-and comment text. A second active test evaluates the UUID CONSTRUCT twice. The ignored
-cache assertion preserves the failing reproduction for a future production regression.
-CI exercises the two active tests. The prototype does not implement typed reasons,
+and comment text. A second active test evaluates the UUID CONSTRUCT twice. The cache
+assertion preserved the failing reproduction and is the production regression now.
+CI exercises all three. The prototype does not implement typed reasons,
 template blank node detection, extension policy, or consumer enforcement.
 
 ## Proposed follow-up items
@@ -182,10 +183,19 @@ template blank node detection, extension policy, or consumer enforcement.
 - **Share a parsed SPARQL repeatability classifier**
   Implement typed reasons in the shared algebra module. Test structural coverage,
   feature unification, and bounded traversal with consumers' real parser versions.
-- **Bypass store caching for flagged SPARQL reads**
+- **Bypass store caching for flagged SPARQL reads** (done, ledger #4418, 0.7.0)
   Wire the classifier to broad and graph-scoped query doors, preserve cache hits for
   eligible reads, and activate the baseline regression. Verify trace reasons and cache
-  rollover behavior.
+  rollover behavior. `src/repeatable.rs` runs `ikigai-rdf` 0.6.1's
+  `repeatability_reasons` after the budget check and the `SERVICE` refusal, and before
+  `NOW()` is rewritten. Every reason makes the answer uncached, and so does a query the
+  classifier cannot finish within its own depth and node limits, which are not the
+  store's budget. The reasons are in the `uncached-not-repeatable` trace note. The
+  `urn:kernel:uncached` row says `declared`, because core 0.4's `UncachedReason` cannot carry a
+  reason. `tests/repeatable_uncached.rs` covers both doors, cache hits for eligible
+  reads, the trace and readout, and rollover. For rollover, a kernel holding entries a
+  pre-policy store wrote serves them until the thread they hang from is cut. After the
+  cut, and on a fresh kernel, the read is computed every time.
 - **Validate repeatable Markdown mappings before execution**
   Share lint and application validation, promote the UUID reproduction to a refusal
   regression, and document stable input-derived identifiers and migration examples.

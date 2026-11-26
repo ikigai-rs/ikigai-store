@@ -220,6 +220,14 @@
 //! owned store into a shared one later. The choice is made at the call site, on the line
 //! where it is paid for.
 //!
+//! ★ **A query that is not repeatable is never cached, whatever the coverage** (ledger
+//! #4418). The query doors run `ikigai-rdf`'s shared classifier on the parsed query, and a
+//! query that uses `RAND()`, `UUID()`, `STRUUID()`, `BNODE()`, `NOW()`, `LIMIT`/`OFFSET`,
+//! `SAMPLE`, `GROUP_CONCAT`, `REDUCED` or a blank node in a `CONSTRUCT` template is evaluated
+//! and answered uncached, naming each construct in the
+//! [`NOT_REPEATABLE_NOTE`](endpoints::NOT_REPEATABLE_NOTE) trace note.
+//! `docs/design/deterministic-sparql.md` says why.
+//!
 //! ★ **A host that only needs to READ every quad takes a [`SnapshotReader`] instead**
 //! ([`DurableStore::reader`], ledger #1732): a consistent snapshot per call and no way to
 //! write, so an owned store stays owned and keeps its caching. It is the host's authority (it
@@ -289,6 +297,7 @@ pub mod depth;
 pub mod endpoints;
 pub mod limits;
 mod now;
+mod repeatable;
 pub(crate) mod scope;
 pub mod service;
 pub mod sparql;

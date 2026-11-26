@@ -397,8 +397,8 @@ fn the_costliest_bracket_at_the_bound_runs() {
 /// Triple terms count against their own bound (`MAX_RDF_NESTING`, also 64) since ledger #1354,
 /// so a text may nest the costliest bracket AND triple terms to the bound at once: 126 nested
 /// function calls for the evaluator (an expression's `<<( … )>>` is a `TRIPLE` call, ~50 KiB a
-/// level unoptimized on oxigraph 0.5.11), on the thread the door sizes for it. Without RDF 1.2
-/// the parser recurses through all of it and then refuses it as SPARQL 1.2 only.
+/// level unoptimized on oxigraph 0.5.11), on the thread the door sizes for it. RDF 1.2 is on
+/// in every build since 0.6.4 (`ikigai-rdf`'s `sparql-algebra` enables it), so it answers.
 #[test]
 fn the_costliest_bracket_around_triple_terms_both_at_their_bounds_runs() {
     let k = kernel();
@@ -411,13 +411,7 @@ fn the_costliest_bracket_around_triple_terms_both_at_their_bounds_runs() {
     );
     let req = Request::new(Verb::Source, Iri::parse("urn:iki:store:select").unwrap())
         .with_arg("query", ArgRef::Inline(both.into_bytes()));
-    let answer = block_on(k.issue(req, &Capability::root()));
-    if cfg!(feature = "rdf-12") {
-        answer.unwrap();
-    } else {
-        let err = answer.unwrap_err().to_string();
-        assert!(!err.contains("NESTING"), "{err}");
-    }
+    block_on(k.issue(req, &Capability::root())).unwrap();
 }
 
 #[test]
