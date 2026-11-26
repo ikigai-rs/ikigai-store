@@ -41,10 +41,18 @@ use tantivy::{
 ///
 /// 2: a document's key hashes the literal's whole term, language tag and datatype included;
 /// format 1 hashed only its text, so two literals differing only in tag shared one document.
-pub const TEXT_INDEX_FORMAT: u32 = 2;
+///
+/// 3: the same documents; bumped so every index 0.6.3 and earlier wrote is rebuilt once on
+/// open (ledger #4448), as one such index was reported holding one document more than its
+/// graph holds enrolled literals.
+pub const TEXT_INDEX_FORMAT: u32 = 3;
 
 /// The analyzer, named in the fingerprint and in `urn:iki:store:text-enrollment`.
 const ANALYZER: &str = "words: split on non-alphanumerics, lowercased, no stemming";
+
+/// How many times a build runs again when the index it committed does not hold the number of
+/// documents it added, before it gives up and leaves the graph stale.
+const BUILD_ATTEMPTS: usize = 3;
 
 /// How long written documents may wait before a commit makes them searchable.
 pub const COMMIT_INTERVAL: Duration = Duration::from_secs(1);
@@ -350,6 +358,16 @@ impl TextIndexes {
             .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .map_err(ix)?;
+        // ★ A clean, current index must also hold one document per enrolled literal the store
+        // holds: an index that drifted (one a build raced, ledger #4448) is rebuilt, not
+        // trusted forever.
+        let current = current && {
+            let held = reader.searcher().num_docs();
+            match self.literals_in(graph) {
+                Ok(n) => u64::try_from(n).is_ok_and(|n| n == held),
+                Err(_) => false,
+            }
+        };
         let g = Arc::new(GraphIndex {
             graph: graph.to_string(),
             index,
@@ -423,8 +441,25 @@ impl TextIndexes {
             .ok();
     }
 
-    /// Rebuild one graph's index from the store's quads, now, until no write raced it.
+    /// How many documents `graph`'s index should hold: its enrolled literals in the store.
+    fn literals_in(&self, graph: &str) -> Result<usize, String> {
+        let graph = NamedNode::new(graph).map_err(ix)?;
+        let mut n = 0;
+        for quad in self
+            .store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref().into()))
+        {
+            if self.key(&quad.map_err(ix)?).is_some() {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Rebuild one graph's index from the store's quads, now, until no write raced it and the
+    /// committed index holds exactly the documents the build added.
     fn rebuild(&self, g: &GraphIndex) -> Result<usize, String> {
+        let mut miscounts = 0;
         loop {
             {
                 let mut state = g.state.lock().expect("text index state");
@@ -435,11 +470,23 @@ impl TextIndexes {
             }
             let started = g.generation.load(Ordering::SeqCst);
             let result = self.fill(g);
+            // Read before the generation is checked, so a write after this read is seen there.
+            let held = g.reader.searcher().num_docs();
             let mut state = g.state.lock().expect("text index state");
             match result {
                 Ok(n) if g.generation.load(Ordering::SeqCst) == started => {
-                    *state = IndexState::Ready;
-                    return Ok(n);
+                    if u64::try_from(n).is_ok_and(|n| n == held) {
+                        *state = IndexState::Ready;
+                        return Ok(n);
+                    }
+                    miscounts += 1;
+                    *state = IndexState::Stale;
+                    if miscounts >= BUILD_ATTEMPTS {
+                        return Err(ix(format!(
+                            "a build of <{}> added {n} documents but the index holds {held}",
+                            g.graph
+                        )));
+                    }
                 }
                 Ok(_) => *state = IndexState::Stale,
                 Err(e) => {
@@ -522,10 +569,12 @@ impl TextIndexes {
                     changed += 1;
                 }
             }
-        }
-        if changed > 0 {
-            g.generation.fetch_add(1, Ordering::SeqCst);
-            g.pending.fetch_add(changed, Ordering::SeqCst);
+            // Counted under the writer's lock, so no build or commit can run between the
+            // documents and their count (ledger #4448).
+            if changed > 0 {
+                g.generation.fetch_add(1, Ordering::SeqCst);
+                g.pending.fetch_add(changed, Ordering::SeqCst);
+            }
         }
     }
 
@@ -564,12 +613,14 @@ impl TextIndexes {
             return Ok(());
         }
         let mut writer = g.writer.lock().expect("text index writer");
-        let pending = g.pending.swap(0, Ordering::SeqCst);
-        if let Err(e) = writer.commit() {
-            g.pending.fetch_add(pending, Ordering::SeqCst);
-            return Err(ix(e));
-        }
-        g.reader.reload().map_err(ix)
+        // ★ `pending` falls only once what it counts is searchable (ledger #4448): zeroed
+        // before the commit, a status read in between said `pending: 0` beside the count
+        // before the commit, which a caller waiting for `pending: 0` took as settled.
+        let pending = g.pending.load(Ordering::SeqCst);
+        writer.commit().map_err(ix)?;
+        g.reader.reload().map_err(ix)?;
+        g.pending.fetch_sub(pending, Ordering::SeqCst);
+        Ok(())
     }
 
     fn commit_all(&self) {
