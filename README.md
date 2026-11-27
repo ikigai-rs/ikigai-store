@@ -10,12 +10,27 @@ derives from a 4.3 MB Zotero export; materializing a whole relational database i
 roadmap. A store that survives a restart is the difference between those being viable and
 being a warm-up cost.
 
+> **Unreleased upgrade to 0.7.0:** Move to `ikigai-core = "0.5.0"` with
+> `ikigai-store = "0.7.0"`: public APIs carry core types, so this is a minor
+> release. Core 0.5 measures `Invocation::time_left` on operational time; this
+> crate has no callers of that method. RDF 0.7.0 requires core 0.5.1, so Cargo
+> resolves at least that version. Persisted state is unchanged; no migration
+> is needed.
+>
+> **Also in 0.7.0 (ledger #4504):** a query, dump, count or running update past its time
+> budget is answered `Error::OverBudget { detail }`, no longer `Error::Timeout(message)`; the
+> sentence is the same. Core classes `OverBudget` as never retried, so a retry policy no
+> longer repeats the heavy request and a circuit breaker no longer counts it against the
+> store. A caller that matched `Error::Timeout` for this case matches `Error::OverBudget`
+> now. An update refused while it was still waiting for the writes ahead of it stays
+> `Error::Timeout`, worded as that wait.
+
 > ⚠ **Reading this on `main`?** It can be ahead of crates.io. The latest published release is
 > **0.3.3**; a passage marked **unreleased, after 0.3.3** describes behavior merged since,
 > which arrives with the next release (and takes that version number then). Everything
 > unmarked is in 0.3.3.
 >
-> **Unreleased, after 0.3.3:** the next release is **0.4.0**, on `ikigai-core` 0.3.0 (the
+> **Earlier upgrade to 0.4.0:** This release moved to `ikigai-core` 0.3.0 (the
 > scoped content store). No behavior changes in this crate, which never calls
 > `ContentStore::put` or `put_replay`; it is a minor because core's types are in this crate's
 > API, so a consumer moves to `ikigai-core = "0.3.0"` and `ikigai-store = "0.4.0"` together.
@@ -584,7 +599,7 @@ type bypasses the read boundary entirely.
 `urn:iki:store:info` counts the whole store under the broad `urn:cap:store:read`, so a tenant
 holding only `urn:cap:store:read:graph:<G>` could not ask how large its own graph is.
 The whole-store count scans within the caller's time budget (which `budget=` may lower);
-expiration refuses the answer with `Timeout`, never a partial count.
+expiration refuses the answer with `OverBudget`, never a partial count.
 `urn:iki:store:graph-info` answers under exactly that grant:
 
 ```text
@@ -1073,6 +1088,11 @@ was 84 MB on 2026-10-13, a third of the default); a host restoring a larger one 
 bound. `tests/load_bounds.rs` pins each refusal, and that a refusal is answered while another
 write holds the writer.
 
+On RocksDB, the load door flushes after the document's transaction commits, before returning
+the receipt (ledger #3275). This moves I/O onto the load path so the next open does not have
+to replay the load's write-ahead log. If the flush fails, the door reports that the data was
+already committed. In-memory loads have no flush.
+
 **SPARQL `LOAD <url>` is refused** at both update doors, as an `InvalidArgument` on `content`,
 before evaluation. oxigraph fetches and parses the document itself, with nothing between the two
 where a scan could stand: with `oxigraph/http-client` on (it is, in `ikigai-cli`'s graph), a
@@ -1213,8 +1233,10 @@ two into one shared module):
    and `budget::measure_update(&parsed)` return an `AlgebraCost` whose `widest_join()` and
    `nodes()` are exactly what the check compares against the two bounds, so a consumer can
    pin how far under them its widest query sits in its own test instead of copying the walk.
-2. **A deadline, and the caller is answered at it**, with a typed `Error::Timeout` naming
-   the budget — never later, never a partial answer. The evaluation is cancelled, and this
+2. **A deadline, and the caller is answered at it**, with a typed `Error::OverBudget` naming
+   the budget — never later, never a partial answer — which nothing in a retry chain repeats
+   and no circuit breaker counts (since 0.7.0, ledger #4504; an update refused while still
+   waiting for the writes ahead of it is `Error::Timeout`, since that wait may clear). The evaluation is cancelled, and this
    crate's serializers check the token between rows. **An update that runs out of time
    writes nothing**, then or later: its transaction commits only while the caller is still
    waiting, under the lock the caller takes to give up.
@@ -1365,7 +1387,7 @@ let matched = budget.run(&text.clone(), inv.capability, None, move |token| {
 })?;
 ```
 
-- **The caller is answered at the budget** with `Error::Timeout` naming it, on a thread sized as
+- **The caller is answered at the budget** with `Error::OverBudget` naming it, on a thread sized as
   `limits::on_sparql_stack` sizes one, so `run` replaces that call.
 - **The token is not a deadline.** oxigraph checks it only where it touches the dataset, and a
   cross product spends its time over rows already in memory: cancelled at 50 ms, the k=7

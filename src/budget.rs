@@ -37,8 +37,11 @@
 //!   [`crate::limits::on_sparql_stack`] sizes one): a query on one spawned for it, an update on
 //!   the store's one long-lived writer thread, because a write committed on a freshly spawned
 //!   thread degrades RocksDB's memtable (ledger #1127, `Writer`). Past the budget the caller
-//!   gets a typed [`Error::Timeout`] naming it — never a partial answer: a bound refuses, it
-//!   does not truncate. An update's budget includes any time it waited behind another.
+//!   gets a typed [`Error::OverBudget`] naming it — never a partial answer: a bound refuses,
+//!   it does not truncate — which nothing in a retry chain repeats and no circuit breaker
+//!   counts (ledger #4504). An update's budget includes any time it waited behind another;
+//!   one refused while still waiting for the writes ahead of it, before it took the write
+//!   lock, is answered [`Error::Timeout`] instead, because what ran out was that wait.
 //! - **The evaluation is told to stop** through oxigraph's [`CancellationToken`], and this
 //!   crate's serializers check the same token on every row, so a query whose cost is in its
 //!   rows stops between two of them.
@@ -706,7 +709,7 @@ impl TimeBudget {
 /// every evaluation within a [`TimeBudget`]; this hands the same machinery out, so a consumer
 /// gets the same three promises with no copy of it:
 ///
-/// - **The caller is answered at the budget** with a typed [`Error::Timeout`] naming it, never
+/// - **The caller is answered at the budget** with a typed [`Error::OverBudget`] naming it, never
 ///   later and never with a partial answer. `work` runs on a thread of its own, sized for
 ///   `text` as [`crate::limits::on_sparql_stack`] sizes one, so `run` REPLACES that call.
 /// - **The evaluation is told to stop**: `work` gets the oxigraph [`CancellationToken`] to hand
@@ -835,8 +838,8 @@ impl EvaluationBudget {
     ///     });
     ///     let _ = release.send(());
     ///     match result {
-    ///         Err(Error::Timeout(sentence)) => sentence,
-    ///         other => panic!("expected a timeout, got {other:?}"),
+    ///         Err(Error::OverBudget { detail }) => detail,
+    ///         other => panic!("expected OverBudget, got {other:?}"),
     ///     }
     /// };
     ///
@@ -901,7 +904,7 @@ impl EvaluationBudget {
     /// `text` sizes the thread's stack and nothing else: parse it inside `work`. `work` must
     /// own what it uses (`'static`), because its thread may outlive this call.
     ///
-    /// Refused with [`Error::Timeout`] naming the budget when it runs past it, and with
+    /// Refused with [`Error::OverBudget`] naming the budget when it runs past it, and with
     /// [`Error::Unavailable`] at once while [`TimeBudget::max_overdue`] are overdue, or when
     /// that many are running and none ends within the budget. On wasm there are no threads and
     /// `work` runs inline, unbounded in time.
@@ -922,6 +925,7 @@ impl EvaluationBudget {
             state: Arc::new(Mutex::new(State::Running)),
             budget,
             write: false,
+            writing: Arc::default(),
             argument: self.argument.clone(),
             work: self.work.clone(),
         };
@@ -955,6 +959,12 @@ pub(crate) struct Deadline {
     budget: Duration,
     /// Whether this evaluation is an update, for the refusal's wording.
     write: bool,
+    /// Whether an update holds the store's write lock (ledger #4504): set by
+    /// [`WriteLock::lock_for`]. An update refused before it holds it was still waiting for the
+    /// writes ahead of it, which is a wait ([`Error::Timeout`], worth repeating); one refused
+    /// while holding it ran its own evaluation past the budget ([`Error::OverBudget`]). Unused
+    /// for a read, which waits for nothing but its slot and is refused as `OverBudget`.
+    writing: Arc<std::sync::atomic::AtomicBool>,
     /// The argument the refusal tells its caller lowers the budget, if the caller has one
     /// (ledger #1383): `budget` at this store's doors, the consumer's own name (or none)
     /// through an [`EvaluationBudget`].
@@ -971,9 +981,15 @@ impl Deadline {
             state: Arc::new(Mutex::new(State::Running)),
             budget: Duration::from_secs(3600),
             write: true,
+            writing: Arc::default(),
             argument: Some(DOOR_ARGUMENT.into()),
             work: None,
         }
+    }
+
+    /// Where this evaluation stands, for the class and wording of its refusal.
+    fn phase(&self) -> Phase {
+        phase(self.write, &self.writing)
     }
 
     /// The token, for `SparqlEvaluator::with_cancellation_token` and for a serializer to
@@ -988,7 +1004,7 @@ impl Deadline {
         if self.token.is_cancelled() {
             return Err(timeout(
                 self.budget,
-                self.write,
+                self.phase(),
                 self.argument.as_deref(),
                 self.work.as_deref(),
             ));
@@ -1004,7 +1020,7 @@ impl Deadline {
         if *state == State::Abandoned {
             return Err(timeout(
                 self.budget,
-                self.write,
+                self.phase(),
                 self.argument.as_deref(),
                 self.work.as_deref(),
             ));
@@ -1054,7 +1070,12 @@ impl WriteLock {
     /// Take the lock for an update under `deadline`: another writer takes it over once the
     /// update's caller has given up on it.
     pub(crate) fn lock_for(&self, deadline: &Deadline) -> WriteGuard<'_> {
-        self.take(Some(Arc::clone(&deadline.state)))
+        let guard = self.take(Some(Arc::clone(&deadline.state)));
+        // From here what runs is the update's own evaluation (ledger #4504).
+        deadline
+            .writing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        guard
     }
 
     fn take(&self, holder: Option<Arc<Mutex<State>>>) -> WriteGuard<'_> {
@@ -1103,9 +1124,48 @@ fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
 /// The argument this store's own doors read a request's lower bound from (`budget=`).
 const DOOR_ARGUMENT: &str = "budget";
 
+/// Where an evaluation stood when its budget ran out, which decides its refusal's class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    /// A read, evaluating.
+    Reading,
+    /// An update still waiting for the writes ahead of it: in the writer's queue, or for the
+    /// write lock. It has not started its own work.
+    Waiting,
+    /// An update holding the write lock, evaluating.
+    Writing,
+}
+
+fn phase(write: bool, writing: &std::sync::atomic::AtomicBool) -> Phase {
+    match (write, writing.load(std::sync::atomic::Ordering::SeqCst)) {
+        (false, _) => Phase::Reading,
+        (true, false) => Phase::Waiting,
+        (true, true) => Phase::Writing,
+    }
+}
+
+/// The words every refusal of an evaluation past its time budget carries, so a door that
+/// rewords one for what it scanned can tell it from a size bound's `OverBudget`.
+const RAN_PAST: &str = "ran past its time budget of";
+
+/// Whether `error` is this module's refusal of an evaluation that ran past its time budget
+/// (an [`Error::OverBudget`] built by [`timeout`]), and not some other bound's.
+pub(crate) fn is_past_time_budget(error: &Error) -> bool {
+    matches!(error, Error::OverBudget { detail } if detail.contains(RAN_PAST))
+}
+
+/// The refusal of an evaluation at its time budget (ledger #4504).
+///
+/// ★ **`OverBudget`, not `Timeout`, for the work itself.** A read or an update whose own
+/// evaluation ran past the budget costs the same and fails the same when sent again under the
+/// same budget, so it is [`Error::OverBudget`], which nothing in a retry chain repeats and no
+/// circuit breaker counts against the store. An update refused while still WAITING for the
+/// writes ahead of it (in the writer's queue, or for the write lock) did none of its own
+/// work: what ran out was a wait on something else, which may clear, so it stays
+/// [`Error::Timeout`], with words that say it waited.
 fn timeout(
     budget: Duration,
-    write: bool,
+    phase: Phase,
     argument: Option<&str>,
     work: Option<&WorkDescription>,
 ) -> Error {
@@ -1118,19 +1178,33 @@ fn timeout(
     };
     let subject = match work {
         Some(work) => format!("This {}", work.singular),
-        None if write => "This SPARQL update".into(),
-        None => "This SPARQL query".into(),
+        None if phase == Phase::Reading => "This SPARQL query".into(),
+        None => "This SPARQL update".into(),
     };
+    let ms = budget.as_millis();
+    if phase == Phase::Waiting {
+        return Error::Timeout(format!(
+            "Send it again once the writes ahead of it have finished, or ask the host for a \
+             larger budget. {subject} waited for the store's writer past its time budget of \
+             {ms} ms and never started. Nothing was written. The budget is set by the \
+             host{lower}."
+        ));
+    }
     let remedy = work.map_or(
         "Narrow the query — fewer joins, a bound subject, a LIMIT —",
         |work| work.remedy.as_ref(),
     );
-    Error::Timeout(format!(
-        "{remedy} or ask the host for a larger budget. {subject} ran past its time budget of \
-         {} ms and was stopped.{} The budget is set by the host{lower}.",
-        budget.as_millis(),
-        if write { " Nothing was written." } else { "" },
-    ))
+    Error::OverBudget {
+        detail: format!(
+            "{remedy} or ask the host for a larger budget. {subject} {RAN_PAST} {ms} ms and \
+             was stopped.{} The budget is set by the host{lower}.",
+            if phase == Phase::Writing {
+                " Nothing was written."
+            } else {
+                ""
+            },
+        ),
+    }
 }
 
 /// Run one evaluation of `text` within `budget`, on a thread sized for it: a read on a
@@ -1161,6 +1235,7 @@ where
         state: Arc::new(Mutex::new(State::Running)),
         budget,
         write,
+        writing: Arc::default(),
         argument: Some(DOOR_ARGUMENT.into()),
         work: None,
     };
@@ -1450,6 +1525,7 @@ where
     let remaining = budget.saturating_sub(started.elapsed());
     let argument = deadline.argument.clone();
     let description = deadline.work.clone();
+    let writing = Arc::clone(&deadline.writing);
     let stack = crate::limits::sparql_stack_size(text);
     let (tx, rx) = std::sync::mpsc::channel();
     let state = Arc::clone(&deadline.state);
@@ -1555,7 +1631,7 @@ where
                     }
                     return Err(timeout(
                         budget,
-                        write,
+                        phase(write, &writing),
                         argument.as_deref(),
                         description.as_deref(),
                     ));
@@ -2873,10 +2949,21 @@ impl Cost {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
+
+    /// What the runner answers when a read runs past a budget of `ms`, for tests elsewhere in
+    /// the crate that reword it.
+    pub(crate) fn past_budget_refusal(ms: u64) -> Error {
+        timeout(
+            Duration::from_millis(ms),
+            Phase::Reading,
+            Some(DOOR_ARGUMENT),
+            None,
+        )
+    }
 
     fn counter() -> Arc<Evaluations> {
         Arc::default()
@@ -2957,7 +3044,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(&err, Error::Timeout(m) if m.contains("100 ms")),
+            matches!(&err, Error::OverBudget { detail } if detail.contains("100 ms")),
             "{err}"
         );
         assert!(start.elapsed() < Duration::from_secs(2));
@@ -2993,7 +3080,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(matches!(err, Error::Timeout(_)));
+        assert!(matches!(err, Error::OverBudget { .. }));
         assert_eq!(overdue.overdue(), 1);
         let refused = run(
             "q",
@@ -3431,8 +3518,12 @@ mod tests {
             },
         )
         .unwrap_err();
+        // ★ Ledger #4504: it never left the queue, so what ran out was a wait on the writes
+        // ahead of it, which may clear: `Timeout`, worded as that wait, never `OverBudget`.
         assert!(
-            matches!(&err, Error::Timeout(m) if m.contains("Nothing was written")),
+            matches!(&err, Error::Timeout(m) if m.contains("Nothing was written")
+                && m.contains("waited for the store's writer past its time budget of 50 ms")
+                && m.starts_with("Send it again once the writes ahead of it have finished")),
             "{err}"
         );
         assert_eq!(overdue.overdue(), 1);
@@ -3444,6 +3535,100 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(ran.load(Ordering::SeqCst), 0, "an abandoned write was run");
+    }
+
+    /// ★ Ledger #4504: an update that holds the write lock when its budget runs out ran its
+    /// own evaluation past the budget. Sent again under the same budget it costs the same, so
+    /// it is `OverBudget` (never retried, never counted by a breaker), with nothing written.
+    #[test]
+    fn an_update_evaluating_under_the_write_lock_past_its_budget_is_over_budget() {
+        let overdue = counter();
+        let writer = Writer::default();
+        let writes = Arc::new(WriteLock::default());
+        let held = Arc::clone(&writes);
+        let err = run(
+            "u",
+            true,
+            Duration::from_millis(50),
+            &overdue,
+            Admission {
+                limits: Limits::only_the_cap(4),
+                caller: Caller::Unnamed,
+            },
+            Some(&writer),
+            move |deadline| {
+                let _guard = held.lock_for(deadline);
+                // Cooperative work under the lock: stops when told.
+                while deadline.check().is_ok() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.class(), ikigai_core::FailureClass::OverBudget, "{err}");
+        assert!(
+            matches!(&err, Error::OverBudget { detail } if detail.contains("50 ms")
+                && detail.contains("This SPARQL update ran past its time budget")
+                && detail.contains("Nothing was written")
+                && detail.starts_with("Narrow the query")),
+            "{err}"
+        );
+        let wait = Instant::now();
+        while overdue.overdue() != 0 {
+            assert!(wait.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// ★ Ledger #4504: an update whose job started but is still waiting for the write lock
+    /// (a load holds it) has done none of its own work: it is a wait, `Timeout`.
+    #[test]
+    fn an_update_still_waiting_for_the_write_lock_past_its_budget_is_a_timeout() {
+        let overdue = counter();
+        let writer = Writer::default();
+        let writes = Arc::new(WriteLock::default());
+        let load = writes.lock();
+        let held = Arc::clone(&writes);
+        let err = run(
+            "u",
+            true,
+            Duration::from_millis(50),
+            &overdue,
+            Admission {
+                limits: Limits::only_the_cap(4),
+                caller: Caller::Unnamed,
+            },
+            Some(&writer),
+            move |deadline| {
+                let _guard = held.lock_for(deadline);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err.is_transient(), "{err}");
+        assert!(
+            matches!(&err, Error::Timeout(m) if m.contains("waited for the store's writer")
+                && m.contains("50 ms") && m.contains("Nothing was written")),
+            "{err}"
+        );
+        drop(load);
+        let wait = Instant::now();
+        while overdue.overdue() != 0 {
+            assert!(wait.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn only_a_time_refusal_reads_as_past_the_time_budget() {
+        assert!(is_past_time_budget(&past_budget_refusal(5)));
+        assert!(!is_past_time_budget(&Error::OverBudget {
+            detail: "the dataset exceeds this dump's bound of 10 bytes".into()
+        }));
+        assert!(!is_past_time_budget(&Error::Timeout(
+            "ran past its time budget of 5 ms".into()
+        )));
     }
 
     #[test]

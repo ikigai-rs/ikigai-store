@@ -95,7 +95,7 @@ fn concurrent_requests_cannot_overshoot_the_cap() {
     let (mut timeouts, mut unavailable) = (0, 0);
     for handle in handles {
         match handle.join().unwrap() {
-            Err(Error::Timeout(_)) => timeouts += 1,
+            Err(Error::OverBudget { detail: _ }) => timeouts += 1,
             Err(Error::Unavailable(message)) => {
                 assert!(
                     message.contains("the most it allows is 1")

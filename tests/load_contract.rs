@@ -131,3 +131,56 @@ fn load_graph_replaces_a_quad_documents_default_graph_and_nothing_else() {
         );
     }
 }
+
+#[cfg(all(feature = "persistent", not(target_family = "wasm")))]
+#[test]
+fn durable_load_flushes_before_returning() {
+    let path = std::env::temp_dir().join(format!(
+        "ikigai-store-load-flush-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir(&path).unwrap();
+
+    let flushed = {
+        let k = Kernel::new(Arc::new(space(DurableStore::open(&path).unwrap())));
+        let table_count = || {
+            std::fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|file| file.extension().is_some_and(|ext| ext == "sst"))
+                .count()
+        };
+        let before = table_count();
+        let receipt = run(
+            &k,
+            Verb::Sink,
+            "urn:iki:store:load",
+            &[
+                ("format", "application/n-quads"),
+                (
+                    "content",
+                    "<urn:s> <urn:p> <urn:default> .\n<urn:s> <urn:p> <urn:named> <urn:g> .\n",
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(receipt, "loaded application/n-quads: +2 quads\n");
+        // This tiny load cannot fill a RocksDB memtable. Look for new SSTs while
+        // the store is still open, so neither shutdown nor replay can create them.
+        table_count() > before
+    };
+    let reopened = {
+        let k = Kernel::new(Arc::new(space(DurableStore::open(&path).unwrap())));
+        ask(
+            &k,
+            "ASK { <urn:s> <urn:p> <urn:default> . GRAPH <urn:g> { <urn:s> <urn:p> <urn:named> } }",
+        )
+    };
+    std::fs::remove_dir_all(path).unwrap();
+    assert!(reopened, "the default and named quads survive reopening");
+    assert!(
+        flushed,
+        "the load should flush before returning its receipt"
+    );
+}

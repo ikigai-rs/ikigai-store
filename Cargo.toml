@@ -354,6 +354,14 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # 0.6.3 keys a text-index document by the literal's whole term (ledger #4348): `"x"@en` and
 # `"x"@fr` were one document, so removing one left the other unsearchable. Index format 2, so
 # an index written by 0.6.2 is rebuilt on open. No public API change.
+# 0.6.4 settles a text index's status honestly (ledger #4448): `pending` fell before the
+# commit it counted was searchable, so a caller waiting for `pending: 0` read a short count. An
+# index whose document count differs from its graph's enrolled literals is rebuilt on open and
+# after a build; index format 3, so an index written by 0.6.3 is rebuilt on open. No public API
+# change.
+# 0.7.0 moves to ikigai-core 0.5.0, ikigai-vocab 0.5.0, ikigai-rdf 0.7.0 and ikigai-conformance
+# 0.16.0 (the core 0.5 cascade, ledger #4454). A minor because the public API carries core
+# types. No persisted state changes, so nothing to migrate.
 # ★ 0.7.0 never caches a SPARQL read that is not repeatable (ledger #4418; the spec is
 # `docs/design/deterministic-sparql.md`, follow-up 2). The broad and graph-scoped query doors run
 # `ikigai-rdf`'s shared classifier on the parsed query and answer uncached, with the reason in the
@@ -450,19 +458,20 @@ async-trait = "0.1"
 # calls neither. `"0.2.1"` was `<0.3.0`, so the core 0.3.0 cascade (ledger #3040) moved it.
 # ★ 0.4.0 is core 0.4.0 (scope opacity, structured denials; the cascade, ledger #3933, epic #3893).
 # `"0.3.0"` was `<0.4.0`, so it could never reach 0.4 on its own.
-# ⚠ `"0.4.0"` is `<0.5.0` in turn: move it when core 0.5 publishes.
-ikigai-core = "0.4.0"
+# 0.5.0 is the direct core 0.5 floor; ikigai-rdf 0.7.0 requires core 0.5.1,
+# so the resolved graph cannot use core 0.5.0. This crate has no time_left callers.
+ikigai-core = "0.5.0"
 # Runtime-free Stream::unfold for one-quad-at-a-time durable dump bodies, also on wasm.
 futures = "0.3"
 # 0.2.7 included the RDF/XML parseType fixes required by the shared depth scan; 0.3.0 is
 # the same API on ikigai-core 0.2 (the core 0.2.0 sweep, ledger #2342). 0.5.0 is its release on
 # ikigai-core 0.3, so one core links (the core 0.3.0 cascade, ledger #3040). 0.6.0 is its release
 # on core 0.4.0 (scope opacity, structured denials; the cascade, ledger #3933), so one core links.
-# ★ 0.6.1 is the floor for `sparql-algebra`, the shared SPARQL repeatability classifier the query
-# doors run (ledger #4418, `src/repeatable.rs`). That feature turns on `oxrdf/rdf-12` and
-# `spargebra/sparql-12`, which is why oxigraph's `rdf-12` is on below: without it `sparesults` does
-# not compile (E0004 on `TermRef::Triple`).
-ikigai-rdf = { version = "0.6.1", features = ["sparql-algebra"] }
+# 0.7.0 is the floor for the release using core 0.5. ★ It carries `sparql-algebra`, the shared
+# SPARQL repeatability classifier the query doors run (ledger #4418, `src/repeatable.rs`). That
+# feature turns on `oxrdf/rdf-12` and `spargebra/sparql-12`, which is why oxigraph's `rdf-12` is on
+# below: without it `sparesults` does not compile (E0004 on `TermRef::Triple`).
+ikigai-rdf = { version = "0.7.0", features = ["sparql-algebra"] }
 # In-memory store by default; `persistent` turns the RocksDB backend back on. Oxigraph
 # itself gates `oxrocksdb-sys` out of wasm by target, so the feature pulls in nothing
 # there — and this crate's durable constructors are gated off wasm too, so `persistent`
@@ -550,12 +559,19 @@ oxigraph = { version = "0.5.1", default-features = false, features = ["js", "rdf
 # with the suite so deterministic body contracts are probed, not skipped.
 # 0.14.0 is conformance on ikigai-core 0.3.0, so the test build links one core (ledger #3040).
 # 0.15.0 is conformance on core 0.4.0 (scope opacity, structured denials; the cascade, ledger #3933).
-ikigai-conformance = "0.15.0"
+# 0.16.0 is the floor for the release using core 0.5.
+ikigai-conformance = "0.16.0"
 # `TurtleRenderer` for the `Meta` face the kernel routes. 0.2.0 is the streams release
 # (ledger #2261), matching core above; the old `"0.1"` meant `<0.2.0` under 0.x rules.
 # 0.3.0 matches core 0.3.0 (the scoped content store, ledger #2965).
 # 0.4.0 matches core 0.4.0 (scope opacity, structured denials; the cascade, ledger #3933).
-ikigai-vocab = "0.4.0"
+# 0.5.0 is the floor for the release using core 0.5.
+ikigai-vocab = "0.5.0"
+# ★ Ledger #4504: `tests/over_budget_not_retried.rs` sends a read past its budget through
+# the real `Retry` and `CircuitBreaker`, so "never retried, never counted" is proven against
+# the overlays a client runs, not against a reading of core's class table. 0.7 is the first
+# release on core 0.5.
+ikigai-throttle = "0.7.0"
 
 # The peak-memory harness for `urn:iki:store:dump` (ledger #1732): it measures a RocksDB store, so
 # it needs `persistent`. ⚠ `required-features` hides a target from `--all-targets` unless the
