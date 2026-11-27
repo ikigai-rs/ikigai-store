@@ -119,8 +119,9 @@
 //! 118-byte cross product runs for minutes). So the parsed algebra is bounded before oxigraph
 //! plans it, and every evaluation runs within a budget the host sets per door through the
 //! capability (a request's `budget=` can only lower it): the caller is answered with a typed
-//! `Error::Timeout` at the budget, the evaluation is cancelled, and an update that runs out
-//! of time writes nothing. [`budget`] has the numbers, the default and its evidence, and —
+//! `Error::OverBudget` at the budget (never retried; an update still waiting for the writes
+//! ahead of it is answered `Error::Timeout`), the evaluation is cancelled, and an update that
+//! runs out of time writes nothing. [`budget`] has the numbers, the default and its evidence, and —
 //! as plainly — what oxigraph still cannot be stopped partway through (ledger #964).
 //!
 //! # …and answered within a size bound

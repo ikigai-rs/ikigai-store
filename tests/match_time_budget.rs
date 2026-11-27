@@ -177,7 +177,7 @@ fn ms(n: u64) -> Duration {
 
 fn assert_timeout<T: std::fmt::Debug>(result: ikigai_core::Result<T>, budget_ms: u64) {
     match result {
-        Err(Error::Timeout(message)) => assert!(
+        Err(Error::OverBudget { detail: message }) => assert!(
             message.contains(&format!("{budget_ms} ms")),
             "the refusal names the budget: {message}"
         ),

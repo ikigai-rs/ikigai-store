@@ -121,3 +121,4 @@ technology, if you are comfortable sharing them. Anything security-sensitive goe
 | 2026-11-09 | Added the `urn:iki:store:graph-written:…` receipt and refusals, and the scoped write's refusal when cached reads could not be invalidated. |
 | 2026-11-11 | Added direction-preserving bindings and refusals of invalid or unsupported literal directions. |
 | 2026-11-12 | Recorded Pass, Fail and Blocked results with commands, versions and scope; retained unrun assistive-technology checks and historical findings explicitly. |
+| 2026-11-27 | A read, dump, count or running update past its time budget is now `OverBudget` with the same sentence; an update that only waited for the writer is `Timeout`, with a new sentence that says it waited and to send it again once the writes ahead of it have finished. |

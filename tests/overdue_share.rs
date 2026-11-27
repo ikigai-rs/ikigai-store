@@ -102,7 +102,7 @@ fn backup_job() -> Capability {
 fn timeouts(answers: &[Error]) -> usize {
     answers
         .iter()
-        .filter(|e| matches!(e, Error::Timeout(_)))
+        .filter(|e| matches!(e, Error::OverBudget { detail: _ }))
         .count()
 }
 
@@ -127,7 +127,7 @@ fn runaways(kernel: &Arc<Kernel>, capability: &Capability, n: usize) -> Vec<Erro
     handles
         .into_iter()
         .map(|handle| match handle.join().unwrap() {
-            Err(e @ (Error::Timeout(_) | Error::Unavailable(_))) => e,
+            Err(e @ (Error::OverBudget { detail: _ } | Error::Unavailable(_))) => e,
             other => panic!("expected a Timeout or Unavailable, got {other:?}"),
         })
         .collect()
