@@ -552,13 +552,15 @@ fn cached_under(
 pub const NOW_NOTE: &str = "uncached-now";
 
 /// The trace note a query door adds when it answers uncached because `ikigai-rdf`'s shared
-/// classifier flags the query as not repeatable (ledger #4418): `RAND()`, `UUID()`,
-/// `STRUUID()`, `BNODE()`, `NOW()`, `LIMIT`/`OFFSET`, `SAMPLE`, `GROUP_CONCAT`, `REDUCED`, or a
-/// blank node in a `CONSTRUCT` template. The value names every construct found and why it
-/// matters, in plain words. As with [`NOW_NOTE`], the kernel's own `uncached` note and the
-/// `urn:kernel:uncached` row say `declared`, because `ikigai-core` 0.4's `UncachedReason` has
-/// no variant that carries a reason, so this note is where the reason is named. A `NOW()`
-/// query carries both notes.
+/// classifier finds a volatile call in the query (ledger #4418): `RAND()`, `UUID()`,
+/// `STRUUID()`, `BNODE()`, or `NOW()` when no pinned instant applies. It is also added when
+/// the query is past the classifier's depth or node limit. The value names every call found
+/// and why it matters, in plain words. `LIMIT`/`OFFSET`, `SAMPLE`, `GROUP_CONCAT`, `REDUCED`
+/// and CONSTRUCT template blank nodes stay cacheable (`docs/design/deterministic-sparql.md`).
+/// As with [`NOW_NOTE`], the kernel's own `uncached` note and the `urn:kernel:uncached` row
+/// say `declared`, because `ikigai-core` 0.5's `UncachedReason` has no variant that carries a
+/// reason, so this note is where the reason is named. An unpinned `NOW()` query carries both
+/// notes; a pinned one carries only [`NOW_NOTE`].
 pub const NOT_REPEATABLE_NOTE: &str = "uncached-not-repeatable";
 
 /// The four query forms, as `(IRI suffix, description id, scoped description id,
@@ -674,9 +676,11 @@ impl Endpoint for QueryEndpoint {
                         // `src/service.rs`): in a host with `oxigraph/http-client` on, a plain
                         // evaluator turns `SERVICE <http://…>` into an ungated request.
                         crate::service::refuse_service(&parsed, "query")?;
-                        // Classify before `NOW()` is rewritten to a literal, so a pinned
-                        // `NOW()` still counts (ledger #4418, `src/repeatable.rs`).
-                        let not_repeatable = crate::repeatable::why_not_cacheable(&parsed);
+                        // Look for volatile calls before `NOW()` is rewritten to a literal
+                        // (ledger #4418, `src/repeatable.rs`). A pinned `NOW()` is left to its
+                        // own rewrite and note below.
+                        let not_repeatable =
+                            crate::repeatable::why_not_cacheable(&parsed, now.is_some());
                         // Detect calls before rewriting so clocked answers stay uncached too.
                         let reads_the_clock = crate::now::pin_query(&mut parsed, now);
                         // ★ A constant `GRAPH <iri>` outside the set is refused, not answered

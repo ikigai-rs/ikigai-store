@@ -161,10 +161,9 @@ fn walk(suite: Suite, store: DurableStore) -> String {
 
 /// One query per form, each answering in the shape its IRI promises. The DESCRIBE
 /// fixture names the subject [`kernel`] seeds, so the RDF faces have something to
-/// serialize. No fixture slices with `LIMIT` or `OFFSET`: a slice is not repeatable, so
-/// its answer is never cached (ledger #4418), and the CACHEABLE check would rightly fail.
+/// serialize.
 const FORM_FIXTURES: [(&str, &str); 4] = [
-    ("store-select", "SELECT ?s WHERE { ?s ?p ?o }"),
+    ("store-select", "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1"),
     ("store-ask", "ASK { ?s ?p ?o }"),
     (
         "store-construct",

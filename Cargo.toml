@@ -362,21 +362,21 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # 0.7.0 moves to ikigai-core 0.5.0, ikigai-vocab 0.5.0, ikigai-rdf 0.7.0 and ikigai-conformance
 # 0.16.0 (the core 0.5 cascade, ledger #4454). A minor because the public API carries core
 # types. No persisted state changes, so nothing to migrate.
-# ★ 0.7.0 never caches a SPARQL read that is not repeatable (ledger #4418; the spec is
+# ★ 0.7.0 also never caches a SPARQL read that makes a volatile call (ledger #4418; the spec is
 # `docs/design/deterministic-sparql.md`, follow-up 2). The broad and graph-scoped query doors run
 # `ikigai-rdf`'s shared classifier on the parsed query and answer uncached, with the reason in the
-# `uncached-not-repeatable` trace note, any query that uses RAND(), UUID(), STRUUID(), BNODE(),
-# NOW(), LIMIT or OFFSET (ordered or nested too), SAMPLE, GROUP_CONCAT, REDUCED or a blank node in
-# a CONSTRUCT template, or that is too deep or large for the classifier to finish. ⚠ BEHAVIOR
-# CHANGE: a caller that relied on the kernel cache for such a read now gets it evaluated on every
-# request. Every other read is cached exactly as before. No persisted state changes: cache entries
-# are in memory, so a restarted host holds none written before the policy; a host that swaps the
-# store's doors under a running kernel must cut the thread they hang from (as `DynamicSpace` does)
-# or keep a fresh cache. A MINOR, not a patch: `sparql-algebra` enables RDF 1.2 (`oxrdf/rdf-12`,
-# `spargebra/sparql-12`), so oxigraph's `rdf-12` is now on in every build and in every consumer's
-# graph, and a consumer that matched `oxrdf::Term` exhaustively without it stops compiling (the
-# 0.2.2 break). The SPARQL 1.2 and RDF 1.2 syntax the `rdf-12` build accepted is now accepted by
-# default.
+# `uncached-not-repeatable` trace note, any query that calls RAND(), UUID(), STRUUID(), BNODE(),
+# or NOW() with no pinned instant (a pinned NOW() keeps its rewrite and `uncached-now` note), or
+# that is too deep or large for the classifier to finish. ⚠ BEHAVIOR CHANGE: a caller that relied
+# on the kernel cache for such a read now gets it evaluated on every request. LIMIT/OFFSET,
+# SAMPLE, GROUP_CONCAT, REDUCED and CONSTRUCT template blank nodes stay cacheable, and every other
+# read is cached exactly as before. No persisted state changes: cache entries are in memory, so a
+# restarted host holds none written before the policy; a host that swaps the store's doors under
+# a running kernel must cut the thread they hang from (as `DynamicSpace` does) or keep a fresh
+# cache. `sparql-algebra` enables RDF 1.2 (`oxrdf/rdf-12`, `spargebra/sparql-12`), so oxigraph's
+# `rdf-12` is now on in every build and in every consumer's graph, and a consumer that matched
+# `oxrdf::Term` exhaustively without it stops compiling (the 0.2.2 break). The SPARQL 1.2 and
+# RDF 1.2 syntax the `rdf-12` build accepted is now accepted by default.
 version = "0.7.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"

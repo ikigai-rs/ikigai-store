@@ -1,5 +1,6 @@
-//! A SPARQL read the shared classifier flags as not repeatable is never cached (ledger
-//! #4418, follow-up 2 of `docs/design/deterministic-sparql.md`).
+//! A SPARQL read that makes a volatile call is never cached (ledger #4418, follow-up 2 of
+//! `docs/design/deterministic-sparql.md`), and every other read the shared classifier flags
+//! stays cacheable (decided 2026-11-27).
 //!
 //! The claim, from the design spike: on main at 64a4672, `SELECT (RAND() AS ?v) WHERE {}`
 //! and the same for `UUID()`, `STRUUID()` and `BNODE()` all entered the kernel cache through
@@ -47,37 +48,43 @@ fn doors(query: &str) -> [&'static str; 2] {
     }
 }
 
-/// Every hazard the classifier names, one query each, and the words its note must carry.
-const FLAGGED: [(&str, &str); 10] = [
+/// Every volatile call, one query each through each door kind, and the words its note must
+/// carry. `NOW()` here has no pinned instant (a plain kernel); a pinned one keeps its own
+/// rewrite and note (`tests/sparql_now_clock.rs`).
+const VOLATILE: [(&str, &str); 7] = [
     ("SELECT (RAND() AS ?v) WHERE {}", "RAND()"),
     ("SELECT (UUID() AS ?v) WHERE {}", "UUID()"),
     ("SELECT (STRUUID() AS ?v) WHERE {}", "STRUUID()"),
     ("SELECT (BNODE() AS ?v) WHERE {}", "BNODE()"),
-    (
-        "SELECT ?v WHERE { VALUES ?v { 1 2 } } ORDER BY ?v LIMIT 1",
-        "LIMIT or OFFSET",
-    ),
-    (
-        "SELECT (SAMPLE(?v) AS ?s) WHERE { VALUES ?v { 1 2 } }",
-        "SAMPLE",
-    ),
-    (
-        "SELECT (GROUP_CONCAT(?v) AS ?s) WHERE { VALUES ?v { 1 2 } }",
-        "GROUP_CONCAT",
-    ),
-    ("SELECT REDUCED ?v WHERE { VALUES ?v { 1 1 } }", "REDUCED"),
+    ("SELECT (NOW() AS ?v) WHERE {}", "NOW()"),
     (
         "CONSTRUCT { <urn:s> <urn:p> ?id } WHERE { BIND(UUID() AS ?id) }",
         "UUID()",
     ),
-    ("CONSTRUCT { _:b <urn:p> 1 } WHERE {}", "CONSTRUCT template"),
+    (
+        "CONSTRUCT { <urn:s> <urn:p> ?b } WHERE { BIND(BNODE() AS ?b) }",
+        "BNODE()",
+    ),
+];
+
+/// Reasons the classifier reports that are not volatile calls: the store answers them the
+/// same way over unchanged data, so they stay cacheable (decided 2026-11-27,
+/// `docs/design/deterministic-sparql.md`).
+const CACHEABLE_DESPITE_THE_CLASSIFIER: [&str; 7] = [
+    "SELECT ?v WHERE { VALUES ?v { 1 2 3 } } ORDER BY ?v LIMIT 1",
+    "SELECT ?v WHERE { VALUES ?v { 1 2 3 } } LIMIT 2",
+    "SELECT ?v WHERE { VALUES ?v { 1 2 3 } } ORDER BY ?v OFFSET 1",
+    "SELECT (SAMPLE(?v) AS ?s) WHERE { VALUES ?v { 1 2 } }",
+    "SELECT (GROUP_CONCAT(?v) AS ?s) WHERE { VALUES ?v { 1 2 } }",
+    "SELECT REDUCED ?v WHERE { VALUES ?v { 1 1 } }",
+    "CONSTRUCT { _:b <urn:p> ?v } WHERE { VALUES ?v { 1 } }",
 ];
 
 #[test]
-fn every_flagged_read_is_answered_uncached_by_both_doors() {
+fn every_volatile_read_is_answered_uncached_by_both_doors() {
     let kernel = kernel();
     let mut cached = Vec::new();
-    for (query, _) in FLAGGED {
+    for (query, _) in VOLATILE {
         for door in doors(query) {
             let request = request(door, query);
             issue(&kernel, &request);
@@ -89,8 +96,33 @@ fn every_flagged_read_is_answered_uncached_by_both_doors() {
     }
     assert!(
         cached.is_empty(),
-        "flagged reads entered the cache: {cached:#?}"
+        "volatile reads entered the cache: {cached:#?}"
     );
+}
+
+/// Cached after the first read, and the second read is served from the cache.
+fn assert_cache_hit(kernel: &Kernel, door: &str, query: &str) {
+    let request = request(door, query);
+    issue(kernel, &request);
+    assert!(
+        kernel.is_cached(&request, &Capability::root()),
+        "{door}: {query}"
+    );
+    let collect = Arc::new(Collect::default());
+    block_on(kernel.issue_traced(request, &Capability::root(), collect.clone())).unwrap();
+    let event = collect.event(door);
+    assert_eq!(event.state(), TraceState::Served, "{door}: {query}");
+    assert_eq!(note(&event, NOT_REPEATABLE_NOTE), None, "{door}: {query}");
+}
+
+#[test]
+fn a_limit_offset_sample_or_group_concat_read_is_answered_from_the_cache() {
+    let kernel = kernel();
+    for query in CACHEABLE_DESPITE_THE_CLASSIFIER {
+        for door in doors(query) {
+            assert_cache_hit(&kernel, door, query);
+        }
+    }
 }
 
 #[test]
@@ -99,20 +131,11 @@ fn an_ordinary_read_still_hits_the_cache_through_both_doors() {
     for query in [
         "SELECT ?v WHERE { VALUES ?v { 1 2 } }",
         "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }",
-        "SELECT (\"UUID() RAND()\" AS ?v) WHERE {} # LIMIT 1",
+        "SELECT (\"UUID() RAND()\" AS ?v) WHERE {} # BNODE()",
         "CONSTRUCT { <urn:s> <urn:p> ?o } WHERE { VALUES ?o { 1 } }",
     ] {
         for door in doors(query) {
-            let request = request(door, query);
-            issue(&kernel, &request);
-            assert!(
-                kernel.is_cached(&request, &Capability::root()),
-                "{door}: {query}"
-            );
-            let collect = Arc::new(Collect::default());
-            block_on(kernel.issue_traced(request, &Capability::root(), collect.clone())).unwrap();
-            let event = collect.event(door);
-            assert_eq!(event.state(), TraceState::Served, "{door}: {query}");
+            assert_cache_hit(&kernel, door, query);
         }
     }
 }
@@ -159,9 +182,9 @@ fn note(event: &TraceEvent, key: &str) -> Option<String> {
 }
 
 #[test]
-fn the_trace_names_the_construct_and_why() {
+fn the_trace_names_the_call_and_why() {
     let kernel = kernel();
-    for (query, construct) in FLAGGED {
+    for (query, construct) in VOLATILE {
         for door in doors(query) {
             let collect = Arc::new(Collect::default());
             block_on(kernel.issue_traced(
@@ -177,7 +200,12 @@ fn the_trace_names_the_construct_and_why() {
                 .unwrap_or_else(|| panic!("no repeatability note for {door}: {query}"));
             assert!(why.contains(construct), "{door}: {query}: {why}");
             assert!(why.contains("never cached"), "{why}");
-            assert_eq!(note(&event, NOW_NOTE), None, "{door}: {query}");
+            let reads_the_clock = query.contains("NOW()");
+            assert_eq!(
+                note(&event, NOW_NOTE).is_some(),
+                reads_the_clock,
+                "{door}: {query}"
+            );
         }
     }
 }
@@ -278,7 +306,7 @@ impl Endpoint for Cacheable {
 /// fresh kernel cache has none (the cache is in memory), and on a kernel that outlives
 /// the swap, cutting the thread the replaced doors hung from drops them.
 #[test]
-fn a_flagged_read_is_never_served_from_an_entry_written_before_the_policy() {
+fn a_volatile_read_is_never_served_from_an_entry_written_before_the_policy() {
     const DEPLOY: &str = "urn:test:deployment";
     let old: Arc<dyn Space> = Arc::new(BeforeThePolicy(space(DurableStore::in_memory().unwrap())));
     let swap = Arc::new(Swap(RwLock::new(old)));
@@ -321,5 +349,23 @@ fn a_flagged_read_is_never_served_from_an_entry_written_before_the_policy() {
         assert!(!fresh.is_cached(&request, &root));
         assert_ne!(&issue(&fresh, &request), before, "{door}");
         assert!(!fresh.is_cached(&request, &root));
+    }
+}
+
+/// A pinned `NOW()` keeps its rewrite (ledger #4284) and its own `uncached-now` note: it is
+/// still never cached, but the volatile-call note does not name it.
+#[test]
+fn a_pinned_now_keeps_its_own_note_and_stays_uncached() {
+    let kernel = kernel().with_clock(Arc::new(ikigai_core::FixedClock::at(1_000_000_000_000)));
+    let query = "SELECT (NOW() AS ?v) WHERE {}";
+    for door in doors(query) {
+        let request = request(door, query);
+        let collect = Arc::new(Collect::default());
+        block_on(kernel.issue_traced(request.clone(), &Capability::root(), collect.clone()))
+            .unwrap();
+        let event = collect.event(door);
+        assert!(note(&event, NOW_NOTE).is_some(), "{door}");
+        assert_eq!(note(&event, NOT_REPEATABLE_NOTE), None, "{door}");
+        assert!(!kernel.is_cached(&request, &Capability::root()), "{door}");
     }
 }
