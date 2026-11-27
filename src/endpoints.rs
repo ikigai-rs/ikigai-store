@@ -1826,17 +1826,11 @@ fn streamed_n_quads(
         let (mut quads, rows, bytes) = state?;
         let step = (|| {
             if started.elapsed() >= budget {
-                return Err(Error::Timeout(format!(
-                    "this dump exceeded its time budget of {} ms",
-                    budget.as_millis()
-                )));
+                return Err(dump_past_budget(budget));
             }
             let next = quads.next();
             if started.elapsed() >= budget {
-                return Err(Error::Timeout(format!(
-                    "this dump exceeded its time budget of {} ms",
-                    budget.as_millis()
-                )));
+                return Err(dump_past_budget(budget));
             }
             let Some(quad) = next else {
                 return Ok(None);
@@ -1858,10 +1852,7 @@ fn streamed_n_quads(
             }
             written.map_err(|e| Error::Endpoint(format!("serialize: {e}")))?;
             if started.elapsed() >= budget {
-                return Err(Error::Timeout(format!(
-                    "this dump exceeded its time budget of {} ms",
-                    budget.as_millis()
-                )));
+                return Err(dump_past_budget(budget));
             }
             Ok(Some(ikigai_core::Bytes::from(out.into_bytes())))
         })();
@@ -1874,6 +1865,17 @@ fn streamed_n_quads(
             Err(error) => Some((Err(error), None)),
         }
     }))
+}
+
+/// A streamed dump that ran past its time budget mid-stream: the read itself was too large
+/// for the budget, so `OverBudget`, never retried (ledger #4504).
+fn dump_past_budget(budget: std::time::Duration) -> Error {
+    Error::OverBudget {
+        detail: format!(
+            "this dump exceeded its time budget of {} ms",
+            budget.as_millis()
+        ),
+    }
 }
 
 fn streamed_dump_too_large(unit: &str, bound: u64) -> Error {
@@ -1905,18 +1907,20 @@ fn dump_too_large(unit: &str, arg: &str, bound: u64) -> Error {
     }
 }
 
-/// A timeout from a scan that is not a SPARQL evaluation, told as what it was: the shared
+/// A time-budget refusal from a scan that is not a SPARQL evaluation, told as what it was: the shared
 /// message says "this SPARQL query" and advises fewer joins, which a dump or a count has none
 /// of. Every other error passes through unchanged.
 fn scan_timeout(e: Error, what: &str, budget: std::time::Duration) -> Error {
     match e {
-        Error::Timeout(_) => Error::Timeout(format!(
-            "Ask the host for a larger budget with a `urn:cap:store:budget:<ms>` grant (root \
+        e if crate::budget::is_past_time_budget(&e) => Error::OverBudget {
+            detail: format!(
+                "Ask the host for a larger budget with a `urn:cap:store:budget:<ms>` grant (root \
              gets 120 s by default). {what} ran past its time budget of {} ms and was stopped, \
              with nothing answered. The budget is set by the host; a request's `budget=` can \
              only lower it",
-            budget.as_millis()
-        )),
+                budget.as_millis()
+            ),
+        },
         other => other,
     }
 }
@@ -2899,12 +2903,12 @@ mod stream_tests {
         assert!(detail.contains("larger than 7 quads"), "{detail}");
         assert!(detail.contains("refused, not truncated"), "{detail}");
         assert!(!detail.contains("ledger #"), "{detail}");
-        let Error::Timeout(detail) = scan_timeout(
-            Error::Timeout("ignored".into()),
-            "this dump",
-            std::time::Duration::from_millis(5),
-        ) else {
-            panic!("expected a timeout");
+        // What the evaluation runner answers at the budget, reworded for a scan.
+        let past = crate::budget::tests::past_budget_refusal(5);
+        let Error::OverBudget { detail } =
+            scan_timeout(past, "this dump", std::time::Duration::from_millis(5))
+        else {
+            panic!("expected OverBudget");
         };
         assert!(
             detail.starts_with("Ask the host for a larger budget"),
@@ -2913,6 +2917,30 @@ mod stream_tests {
         assert!(detail.contains("5 ms"), "{detail}");
         assert!(detail.contains("nothing answered"), "{detail}");
         assert!(!detail.contains("ledger #"), "{detail}");
+    }
+
+    /// ★ Ledger #4504: a scan's own size refusal is `OverBudget` too, and is not reworded as
+    /// a time refusal; any other error passes through.
+    #[test]
+    fn a_scan_rewords_only_its_time_refusal() {
+        let size = streamed_dump_too_large("bytes", 10);
+        assert_eq!(
+            scan_timeout(
+                size.clone(),
+                "this dump",
+                std::time::Duration::from_millis(5)
+            ),
+            size
+        );
+        let wait = Error::Timeout("a wait ran out".into());
+        assert_eq!(
+            scan_timeout(
+                wait.clone(),
+                "this dump",
+                std::time::Duration::from_millis(5)
+            ),
+            wait
+        );
     }
 
     #[test]
@@ -3024,7 +3052,7 @@ mod stream_tests {
         );
         assert!(matches!(
             block_on(streamed.collect(1024)),
-            Err(Error::Timeout(_))
+            Err(Error::OverBudget { detail }) if detail.contains("time budget of 1 ms")
         ));
         assert_eq!(polled.load(Ordering::SeqCst), 0);
     }

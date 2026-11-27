@@ -70,7 +70,10 @@ fn a_scoped_write_behind_a_refused_one_is_not_refused() {
         "urn:iki:store:update",
         &[("content", &broad), ("budget", "100")],
     );
-    assert!(matches!(refused, Err(Error::Timeout(_))), "{refused:?}");
+    assert!(
+        matches!(refused, Err(Error::OverBudget { detail: _ })),
+        "{refused:?}"
+    );
     assert_eq!(store.overdue_evaluations(), 1, "the refused write runs on");
 
     // A small scoped write right behind it, with the store's 10 s budget.

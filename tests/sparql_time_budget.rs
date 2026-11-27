@@ -113,7 +113,7 @@ fn path(n: usize) -> String {
 
 fn assert_timeout(result: ikigai_core::Result<String>, budget_ms: u64) {
     match result {
-        Err(Error::Timeout(message)) => assert!(
+        Err(Error::OverBudget { detail: message }) => assert!(
             message.contains(&format!("{budget_ms} ms")),
             "the refusal names the budget: {message}"
         ),
@@ -403,7 +403,7 @@ fn an_update_that_runs_out_of_time_writes_nothing_then_or_later() {
         &[("content", &update)],
     );
     match result {
-        Err(Error::Timeout(m)) => assert!(m.contains("100 ms"), "{m}"),
+        Err(Error::OverBudget { detail: m }) => assert!(m.contains("100 ms"), "{m}"),
         other => panic!("expected a Timeout, got {other:?}"),
     }
     // However its worker ends — cancelled, or finishing its evaluation and finding it was
@@ -445,7 +445,10 @@ fn a_scoped_update_that_runs_out_of_time_writes_nothing_then_or_later() {
         "urn:iki:store:graph-update",
         &[("content", &update), ("graph", G)],
     );
-    assert!(matches!(result, Err(Error::Timeout(_))), "{result:?}");
+    assert!(
+        matches!(result, Err(Error::OverBudget { detail: _ })),
+        "{result:?}"
+    );
     settles(&store, Duration::from_secs(120));
     assert_eq!(quads(&kernel), before, "a timed-out scoped update wrote");
 }

@@ -20,7 +20,7 @@ fn info_refuses_a_count_past_the_callers_budget() {
         Request::new(Verb::Source, Iri::parse("urn:iki:store:info").unwrap()),
         &Capability::scoped([CAP_READ.to_string()]),
     ));
-    let Err(Error::Timeout(why)) = result else {
+    let Err(Error::OverBudget { detail: why }) = result else {
         panic!("expected a timeout, got {result:?}");
     };
     assert!(why.contains("counting quads"), "{why}");

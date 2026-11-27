@@ -83,7 +83,10 @@ fn fill_with_overdue(budget: &EvaluationBudget, n: usize) -> Vec<mpsc::Sender<()
                 Some("50"),
                 held_work(started, held),
             );
-            assert!(matches!(answer, Err(Error::Timeout(_))), "{answer:?}");
+            assert!(
+                matches!(answer, Err(Error::OverBudget { detail: _ })),
+                "{answer:?}"
+            );
             release
         })
         .collect()
@@ -271,7 +274,10 @@ fn consumer_work_names_reach_overdue_store_pool_and_share_refusals() {
             let _ = held.recv();
             Ok(())
         });
-        assert!(matches!(result, Err(Error::Timeout(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(Error::OverBudget { detail: _ })),
+            "{result:?}"
+        );
         // Clones keep both the description and the shared count.
         let result = budget.clone().run("", &patient(), None, |_| Ok(()));
         let message = match result {

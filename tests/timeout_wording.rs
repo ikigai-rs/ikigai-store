@@ -48,7 +48,7 @@ fn timeout_sentence(budget: &EvaluationBudget) -> String {
         std::thread::sleep(ms(5));
     }
     match result {
-        Err(Error::Timeout(message)) => message,
+        Err(Error::OverBudget { detail: message }) => message,
         other => panic!("expected a Timeout, got {other:?}"),
     }
 }
@@ -112,7 +112,7 @@ fn the_doors_name_their_budget_argument() {
         ),
     );
     match result {
-        Err(Error::Timeout(message)) => assert_eq!(
+        Err(Error::OverBudget { detail: message }) => assert_eq!(
             message,
             "Narrow the query — fewer joins, a bound subject, a LIMIT — or ask the host for a \
              larger budget. This SPARQL query ran past its time budget of 300 ms and was stopped. \
