@@ -10,12 +10,19 @@ derives from a 4.3 MB Zotero export; materializing a whole relational database i
 roadmap. A store that survives a restart is the difference between those being viable and
 being a warm-up cost.
 
+> **Unreleased upgrade to 0.7.0:** Move to `ikigai-core = "0.5.0"` with
+> `ikigai-store = "0.7.0"`: public APIs carry core types, so this is a minor
+> release. Core 0.5 measures `Invocation::time_left` on operational time; this
+> crate has no callers of that method. RDF 0.7.0 requires core 0.5.1, so Cargo
+> resolves at least that version. Persisted state is unchanged; no migration
+> is needed.
+
 > ⚠ **Reading this on `main`?** It can be ahead of crates.io. The latest published release is
 > **0.3.3**; a passage marked **unreleased, after 0.3.3** describes behavior merged since,
 > which arrives with the next release (and takes that version number then). Everything
 > unmarked is in 0.3.3.
 >
-> **Unreleased, after 0.3.3:** the next release is **0.4.0**, on `ikigai-core` 0.3.0 (the
+> **Earlier upgrade to 0.4.0:** This release moved to `ikigai-core` 0.3.0 (the
 > scoped content store). No behavior changes in this crate, which never calls
 > `ContentStore::put` or `put_replay`; it is a minor because core's types are in this crate's
 > API, so a consumer moves to `ikigai-core = "0.3.0"` and `ikigai-store = "0.4.0"` together.
