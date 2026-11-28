@@ -63,6 +63,12 @@ fn a_scoped_write_behind_a_refused_one_is_not_refused() {
     let kernel = Kernel::new(Arc::new(space(store.clone())));
 
     // The broad write, refused at a lowered budget. Oxigraph cannot stop it there.
+    //
+    // ★ Which refusal is the store's call, not the test's (ledger #4550). Once the write holds
+    // the writer it is refused `OverBudget`; if a slow machine keeps it from the writer for
+    // the whole 100 ms (store PR 116's first CI run took 1.91 s here) it is refused `Timeout`,
+    // worded as the wait (ledger #4504). Both are documented refusals of a write past its
+    // budget, both leave it overdue, and the write behind it must get through either way.
     let broad = cross(4, "INSERT { ?s0 <urn:copied> ?o0 }");
     let refused = issue(
         &kernel,
@@ -70,9 +76,17 @@ fn a_scoped_write_behind_a_refused_one_is_not_refused() {
         "urn:iki:store:update",
         &[("content", &broad), ("budget", "100")],
     );
+    let documented = match &refused {
+        Err(Error::OverBudget { detail }) => detail.contains("ran past its time budget of 100 ms"),
+        Err(Error::Timeout(message)) => {
+            message.contains("waited for the store's writer past its time budget of 100 ms")
+                && message.contains("Nothing was written")
+        }
+        _ => false,
+    };
     assert!(
-        matches!(refused, Err(Error::OverBudget { detail: _ })),
-        "{refused:?}"
+        documented,
+        "the broad write was not refused at its budget: {refused:?}"
     );
     assert_eq!(store.overdue_evaluations(), 1, "the refused write runs on");
 
