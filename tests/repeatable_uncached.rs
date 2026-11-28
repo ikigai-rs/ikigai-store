@@ -49,8 +49,8 @@ fn doors(query: &str) -> [&'static str; 2] {
 }
 
 /// Every volatile call, one query each through each door kind, and the words its note must
-/// carry. `NOW()` here has no pinned instant (a plain kernel); a pinned one keeps its own
-/// rewrite and note (`tests/sparql_now_clock.rs`).
+/// carry. `NOW()` here has no pinned instant (a plain kernel); a corridor-pinned one is
+/// cached (`a_corridor_pinned_now_carries_no_note_and_is_cached`, ledger #4286).
 const VOLATILE: [(&str, &str); 7] = [
     ("SELECT (RAND() AS ?v) WHERE {}", "RAND()"),
     ("SELECT (UUID() AS ?v) WHERE {}", "UUID()"),
@@ -352,10 +352,12 @@ fn a_volatile_read_is_never_served_from_an_entry_written_before_the_policy() {
     }
 }
 
-/// A pinned `NOW()` keeps its rewrite (ledger #4284) and its own `uncached-now` note: it is
-/// still never cached, but the volatile-call note does not name it.
+/// A `NOW()` on the kernel's clock is rewritten to its instant (ledger #4284), but that clock
+/// is live time, in no cache key, so the answer is volatile: uncached under both notes. Until
+/// 0.7.1 this read carried only `uncached-now`, because the classifier counted any instant as
+/// pinned; core's `pinned_now` now tells a corridor's instant from a live clock (ledger #4286).
 #[test]
-fn a_pinned_now_keeps_its_own_note_and_stays_uncached() {
+fn a_now_on_the_kernel_clock_carries_both_notes_and_stays_uncached() {
     let kernel = kernel().with_clock(Arc::new(ikigai_core::FixedClock::at(1_000_000_000_000)));
     let query = "SELECT (NOW() AS ?v) WHERE {}";
     for door in doors(query) {
@@ -365,7 +367,54 @@ fn a_pinned_now_keeps_its_own_note_and_stays_uncached() {
             .unwrap();
         let event = collect.event(door);
         assert!(note(&event, NOW_NOTE).is_some(), "{door}");
-        assert_eq!(note(&event, NOT_REPEATABLE_NOTE), None, "{door}");
+        let why = note(&event, NOT_REPEATABLE_NOTE).unwrap_or_else(|| panic!("{door}"));
+        assert!(why.contains("NOW()"), "{door}: {why}");
         assert!(!kernel.is_cached(&request, &Capability::root()), "{door}");
+    }
+}
+
+/// A `NOW()` pinned by a temporal corridor is rewritten to the corridor's instant, which the
+/// chain fingerprint holds, so the answer is cacheable through both doors with neither note
+/// (ledger #4286). A volatile call beside it still uncaches the read, naming only that call.
+#[test]
+fn a_corridor_pinned_now_carries_no_note_and_is_cached() {
+    let kernel = kernel();
+    let corridor = Scope::empty().with_named_at(
+        Iri::parse("urn:test:corridor:pinned").unwrap(),
+        Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
+        Arc::new(ikigai_core::FixedClock::at(1_000_000_000_000)),
+    );
+    let root = Capability::root();
+    let issue_in = |request: &Request| {
+        let collect = Arc::new(Collect::default());
+        let issue = ikigai_core::BodyIssue::new()
+            .in_scope(corridor.clone())
+            .traced(collect.clone());
+        block_on(kernel.issue_with(request.clone(), &root, issue)).unwrap();
+        collect
+    };
+    let query = "SELECT (NOW() AS ?v) WHERE {}";
+    for door in doors(query) {
+        let request = request(door, query);
+        let event = issue_in(&request).event(door);
+        assert_eq!(event.state(), TraceState::Computed, "{door}");
+        assert_eq!(note(&event, NOW_NOTE), None, "{door}");
+        assert_eq!(note(&event, NOT_REPEATABLE_NOTE), None, "{door}");
+        assert!(kernel.is_cached_in(&request, &root, &corridor), "{door}");
+        let event = issue_in(&request).event(door);
+        assert_eq!(event.state(), TraceState::Served, "{door}");
+    }
+
+    let query = "SELECT (NOW() AS ?v) (RAND() AS ?r) WHERE {}";
+    for door in doors(query) {
+        let request = request(door, query);
+        let event = issue_in(&request).event(door);
+        let why = note(&event, NOT_REPEATABLE_NOTE).unwrap_or_else(|| panic!("{door}"));
+        assert!(
+            why.contains("RAND()") && !why.contains("NOW()"),
+            "{door}: {why}"
+        );
+        assert_eq!(note(&event, NOW_NOTE), None, "{door}");
+        assert!(!kernel.is_cached_in(&request, &root, &corridor), "{door}");
     }
 }

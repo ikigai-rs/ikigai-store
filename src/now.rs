@@ -1,19 +1,46 @@
 //! Pin SPARQL `NOW()` to the invocation's instant when it has one (ledger #4284).
 //!
 //! Detect calls on the parsed algebra, so a comment, literal, or IRI mentioning `NOW()`
-//! does not affect caching. Query answers remain uncached even with an invocation instant
-//! because the store cannot distinguish a pinned corridor from a live clock.
+//! does not affect caching. An answer computed from a temporal corridor's pinned instant is
+//! cacheable, and one computed from a live clock is not (ledger #4286, [`instant`]).
 //!
 //! The pattern and expression matches are exhaustive on purpose: a new variant is a compile
 //! error, never a place `NOW()` could hide. Both doors run the walk after the budget check,
 //! so recursion is bounded, on the sized SPARQL thread.
 
-use ikigai_core::Time;
+use ikigai_core::{Invocation, Time};
 use oxigraph::model::{vocab::xsd, Literal};
 use spargebra::algebra::{
     AggregateExpression, Expression, Function, GraphPattern, OrderExpression,
 };
 use spargebra::{GraphUpdateOperation, Query, Update};
+
+/// The instant a query's `NOW()` is rewritten to, and whether an answer computed from it may
+/// be cached (ledger #4286).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NowInstant {
+    /// [`Invocation::now`]: a temporal corridor's clock, else the kernel's; `None` with
+    /// neither, and then `NOW()` stays on oxigraph's wall clock.
+    pub(crate) time: Option<Time>,
+    /// Whether `time` is the instant the kernel's cache key covers: the pinned instant of the
+    /// innermost temporal corridor ([`Invocation::pinned_now`]), which the chain fingerprint
+    /// hashes beside the corridor's name. Only then is a `NOW()` answer a pure function of the
+    /// key and the data. The kernel's own clock is live time and is in no key.
+    ///
+    /// ⚠ `now()` and `pinned_now()` can disagree under a corridor: `now()` reads the
+    /// corridor's clock again at each call while `pinned_now()` is what it read at injection,
+    /// and an invocation's own `with_clock` wins over both. The literal is always `now()`'s,
+    /// so the answer is cacheable only when the two are equal, never under a ticking clock
+    /// that moved since the corridor was injected.
+    pub(crate) pinned: bool,
+}
+
+/// Read [`NowInstant`] for `inv`.
+pub(crate) fn instant(inv: &Invocation<'_>) -> NowInstant {
+    let time = inv.now();
+    let pinned = time.is_some() && inv.pinned_now() == time;
+    NowInstant { time, pinned }
+}
 
 /// Rewrite all calls when a clock is available, and report whether the original query
 /// called `NOW()` for the cache decision. With no clock, leave evaluation to Oxigraph.

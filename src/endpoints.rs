@@ -546,21 +546,23 @@ fn cached_under(
 // ---------------------------------------------------------------------------- query
 
 /// The trace note a query door adds when it answers uncached because the query calls SPARQL
-/// `NOW()` (ledger #3989). The kernel's own `uncached` note on the same event says `declared`:
-/// `ikigai-core` 0.4's `UncachedReason` has no variant for "reads the clock", so this note is
-/// where the reason is named.
+/// `NOW()` on a live clock (ledger #3989): the kernel's, or the wall clock when the kernel has
+/// none. Under a temporal corridor whose pinned instant `NOW()` is rewritten to, the answer is
+/// cacheable and carries no note (ledger #4286). The kernel's own `uncached` note on the same
+/// event says `declared`: `ikigai-core` 0.5's `UncachedReason` has no variant for "reads the
+/// clock", so this note is where the reason is named.
 pub const NOW_NOTE: &str = "uncached-now";
 
 /// The trace note a query door adds when it answers uncached because `ikigai-rdf`'s shared
 /// classifier finds a volatile call in the query (ledger #4418): `RAND()`, `UUID()`,
-/// `STRUUID()`, `BNODE()`, or `NOW()` when no pinned instant applies. It is also added when
+/// `STRUUID()`, `BNODE()`, or `NOW()` on a live clock (no temporal corridor pins it). It is also added when
 /// the query is past the classifier's depth or node limit. The value names every call found
 /// and why it matters, in plain words. `LIMIT`/`OFFSET`, `SAMPLE`, `GROUP_CONCAT`, `REDUCED`
 /// and CONSTRUCT template blank nodes stay cacheable (`docs/design/deterministic-sparql.md`).
 /// As with [`NOW_NOTE`], the kernel's own `uncached` note and the `urn:kernel:uncached` row
 /// say `declared`, because `ikigai-core` 0.5's `UncachedReason` has no variant that carries a
-/// reason, so this note is where the reason is named. An unpinned `NOW()` query carries both
-/// notes; a pinned one carries only [`NOW_NOTE`].
+/// reason, so this note is where the reason is named. An unpinned `NOW()` query (a live clock)
+/// carries both notes; a pinned one carries neither and is cached (ledger #4286).
 pub const NOT_REPEATABLE_NOTE: &str = "uncached-not-repeatable";
 
 /// The four query forms, as `(IRI suffix, description id, scoped description id,
@@ -641,7 +643,8 @@ impl Endpoint for QueryEndpoint {
                 // stop between rows. `src/budget.rs` has the numbers and the limits.
                 let this = self.clone();
                 let text = query.to_string();
-                let now = inv.now();
+                // `NOW()`'s instant, and whether a temporal corridor pins it (ledger #4286).
+                let clock = crate::now::instant(inv);
                 let confined = target.clone();
                 let requested = crate::budget::inline_bound(inv, "budget")?;
                 // ★ …and within this caller's answer SIZE (ledger #970): rows (triples for a
@@ -653,7 +656,7 @@ impl Endpoint for QueryEndpoint {
                     crate::budget::inline_bound(inv, "max_bytes")?,
                     self.store.answer_budget().for_capability(inv.capability),
                 )?;
-                let (media, bytes, reads_the_clock, not_repeatable) = self.store.evaluate(
+                let (media, bytes, reads_a_live_clock, not_repeatable) = self.store.evaluate(
                     query,
                     false,
                     inv.capability,
@@ -677,12 +680,14 @@ impl Endpoint for QueryEndpoint {
                         // evaluator turns `SERVICE <http://…>` into an ungated request.
                         crate::service::refuse_service(&parsed, "query")?;
                         // Look for volatile calls before `NOW()` is rewritten to a literal
-                        // (ledger #4418, `src/repeatable.rs`). A pinned `NOW()` is left to its
-                        // own rewrite and note below.
+                        // (ledger #4418, `src/repeatable.rs`). A `NOW()` pinned by a temporal
+                        // corridor is not volatile: the cache key holds its instant.
                         let not_repeatable =
-                            crate::repeatable::why_not_cacheable(&parsed, now.is_some());
-                        // Detect calls before rewriting so clocked answers stay uncached too.
-                        let reads_the_clock = crate::now::pin_query(&mut parsed, now);
+                            crate::repeatable::why_not_cacheable(&parsed, clock.pinned);
+                        // Detected on the original query, then rewritten. Only a live clock
+                        // keeps the answer out of the cache (ledger #4286).
+                        let reads_a_live_clock =
+                            crate::now::pin_query(&mut parsed, clock.time) && !clock.pinned;
                         // ★ A constant `GRAPH <iri>` outside the set is refused, not answered
                         // empty (ledger #388). `confine` already keeps it unreachable; this is
                         // about telling a caller who mistyped an IRI or left a graph out of
@@ -774,24 +779,25 @@ impl Endpoint for QueryEndpoint {
                         } else {
                             serialize_solutions(results, as_type, deadline, answer)
                         }?;
-                        Ok((media, bytes, reads_the_clock, not_repeatable))
+                        Ok((media, bytes, reads_a_live_clock, not_repeatable))
                     },
                 )?;
                 let rep = Representation::new(
                     ReprType::new(&media).with_param("charset", "utf-8"),
                     bytes,
                 );
-                if reads_the_clock {
-                    // Core does not distinguish a pinned corridor from a live clock here.
+                if reads_a_live_clock {
+                    // A `NOW()` answer under a pinned corridor is cacheable like any covered
+                    // read below: the chain fingerprint holds the corridor's name and instant.
                     inv.trace_note(
                         NOW_NOTE,
-                        "the query calls NOW(), so its answer is never cached",
+                        "the query calls NOW() on a live clock, so its answer is never cached",
                     );
                 }
                 if let Some(why) = &not_repeatable {
                     inv.trace_note(NOT_REPEATABLE_NOTE, why.as_str());
                 }
-                if reads_the_clock || not_repeatable.is_some() {
+                if reads_a_live_clock || not_repeatable.is_some() {
                     return Ok(rep.with_uncached_reason(UncachedReason::Declared));
                 }
                 Ok(with_freshness(

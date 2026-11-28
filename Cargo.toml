@@ -377,7 +377,13 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # `rdf-12` is now on in every build and in every consumer's graph, and a consumer that matched
 # `oxrdf::Term` exhaustively without it stops compiling (the 0.2.2 break). The SPARQL 1.2 and
 # RDF 1.2 syntax the `rdf-12` build accepted is now accepted by default.
-version = "0.7.0"
+# 0.7.1 caches a SPARQL `NOW()` answer computed from a temporal corridor's pinned instant
+# (ledger #4286), under the usual golden threads: the chain fingerprint already holds the
+# corridor's name and instant, read through core 0.5's `Invocation::pinned_now`. A `NOW()` on
+# a live clock (the kernel's, or the wall clock) stays uncached, and now carries both
+# `uncached-now` and `uncached-not-repeatable` (0.7.0 gave a kernel-clock `NOW()` only the
+# first). Additive, so a patch. No persisted state changes: cache entries are in memory.
+version = "0.7.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]

@@ -30,9 +30,10 @@ conformance claim. Adapted from the
   `src/scope.rs`, `src/service.rs` and `src/depth.rs`, which a host, or a crate that uses this
   one's limits and budget, shows to whoever made the request.
 - **Two trace notes** (`src/endpoints.rs`):
-  - `NOW_NOTE`: a query door answering uncached because the query calls `NOW()` adds
-    `uncached-now` to its trace event, a sentence saying the query calls `NOW()` and so its
-    answer is never cached. Untested for wording beyond naming `NOW()`.
+  - `NOW_NOTE`: a query door answering uncached because the query calls `NOW()` on a live
+    clock adds `uncached-now` to its trace event, a sentence saying the query calls `NOW()` on
+    a live clock and so its answer is never cached. A `NOW()` pinned by a temporal corridor is
+    cached and adds no note. Untested for wording beyond naming `NOW()`.
   - `NOT_REPEATABLE_NOTE`: a query door answering uncached because the query makes a
     volatile call adds `uncached-not-repeatable`. The note is a sentence saying the query can
     give a different answer each time it runs, so its answer is never cached. Then comes one
@@ -133,3 +134,4 @@ technology, if you are comfortable sharing them. Anything security-sensitive goe
 | 2026-11-11 | Added direction-preserving bindings and refusals of invalid or unsupported literal directions. |
 | 2026-11-12 | Recorded Pass, Fail and Blocked results with commands, versions and scope; retained unrun assistive-technology checks and historical findings explicitly. |
 | 2026-11-27 | A read, dump, count or running update past its time budget is now `OverBudget` with the same sentence; an update that only waited for the writer is `Timeout`, with a new sentence that says it waited and to send it again once the writes ahead of it have finished. |
+| 2026-11-27 | The `uncached-now` note now says the query calls `NOW()` on a live clock; a `NOW()` pinned by a temporal corridor is cached and carries no note, and a `NOW()` on the kernel's clock also carries `uncached-not-repeatable`. |

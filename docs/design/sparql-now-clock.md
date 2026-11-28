@@ -2,8 +2,10 @@
 
 Ledger #2203. **Option A implemented for 0.6.2 (ledger #4284).** The query and update doors
 rewrite `NOW()` to the invocation's instant when one is available. Without a clock, evaluation
-still uses the wall clock. All queries that call `NOW()` remain uncached, including inside
-pinned corridors. The tables and analysis below record the original design spike.
+still uses the wall clock. **Since 0.7.1 (ledger #4286), a `NOW()` answer computed from a
+temporal corridor's pinned instant is cached** under the usual golden threads; one computed
+from a live clock (the kernel's, or the wall clock) stays uncached. The tables and analysis
+below record the original design spike.
 The integration tests now exercise the implemented behavior through the real doors.
 
 ## The claim, and what held
@@ -205,7 +207,8 @@ oxigraph, so it has the same defect. The walk should live where both crates can 
 - **Decision 1 takes the recommendation, (i):** a kernel with no clock keeps `NOW()` on the
   wall clock, and those answers are uncached.
 - **Decision 3:** ship A with every `NOW()` answer uncached (already true since store PR 101),
-  and enable corridor caching once core has `pinned_now`.
+  and enable corridor caching once core has `pinned_now`. Core 0.5 has it, and 0.7.1 enables
+  it (ledger #4286).
 - **Decision 2 stays open** in its follow-up item. Store PR 101 already added a `NOW()` walk
   in `src/now.rs` (`calls_now`), which the rewrite should reuse or extend rather than duplicate.
 
@@ -234,13 +237,26 @@ oxigraph, so it has the same defect. The walk should live where both crates can 
    `QueryEndpoint::invoke` and `confine::parse`. The behavior with no clock follows decision 1.
    This flips the first two tests in `tests/sparql_now_clock.rs`, and moves the proof's walk
    into `src/`.
-3. **ikigai-core: let an endpoint read the pinned instant on its own.** Add
+3. **Done: ikigai-core 0.5 `Invocation::pinned_now`.** Add
    `Invocation::pinned_now() -> Option<Time>`, the chain's instant from `with_named_at` only,
    or an equivalent. Then an endpoint can declare an answer computed from a pinned instant
    `.cacheable()` and one computed from a live clock not cacheable.
-4. **Cache `NOW()` answers under a pinned corridor.** Once item 3 lands, declare a `NOW()`
-   answer computed from the pinned instant `.cacheable()` under the usual threads. Test that two
-   corridors at two instants never share an entry.
+4. **Done: ledger #4286, 0.7.1. Cache `NOW()` answers under a pinned corridor.** Once item 3
+   lands, declare a `NOW()` answer computed from the pinned instant `.cacheable()` under the
+   usual threads. Test that two corridors at two instants never share an entry.
+
+   As built: `src/now.rs`'s `instant` reads `inv.now()` (the literal `NOW()` becomes, as
+   before) and calls it pinned only when it equals `inv.pinned_now()`. The two can differ: a
+   corridor's clock is read again at each `now()`, while `pinned_now()` is what it read when
+   the corridor was injected, and an invocation's own `with_clock` wins over both. So a corridor
+   whose clock ticks is not cached, because its answer is not the instant the key holds. A
+   pinned `NOW()` is not a volatile call to `src/repeatable.rs` and carries no trace note; a
+   `NOW()` on the kernel's clock carries both `uncached-now` and `uncached-not-repeatable` (in
+   0.7.0 it carried only the first, because any instant counted as pinned).
+   `tests/sparql_now_clock.rs` and `tests/repeatable_uncached.rs` hold the behavior, and
+   `tests/pinned_now_measure.rs` the measurement: a repeated corridor read over 10,000 triples
+   went from about 37 µs (`NOW()` alone) and 1.07 ms (`NOW()` with a `COUNT(*)`) to about
+   1.2 µs, served from the cache (release build, plasma, 2026-11-27).
 5. **Upstream `with_now` on oxigraph: filed** as
    [oxigraph/oxigraph#2044](https://github.com/oxigraph/oxigraph/issues/2044) (2026-11-24). When it
    ships, replace the store's rewrite with `with_now(inv.now())` and keep the tests.

@@ -1,7 +1,7 @@
 //! Never cache a SPARQL read that makes a volatile call (ledger #4418).
 //!
 //! `RAND()`, `UUID()`, `STRUUID()` and `BNODE()` give a different answer on every
-//! evaluation, and so does `NOW()` when no pinned corridor instant applies. A cached answer
+//! evaluation, and so does `NOW()` when no temporal corridor's pinned instant applies. A cached answer
 //! to such a query would replay one evaluation as though it were the only one. The query
 //! doors still evaluate it, and answer it uncached. The spec is
 //! `docs/design/deterministic-sparql.md`, whose store policy section says why.
@@ -21,9 +21,10 @@ use ikigai_rdf::algebra::{repeatability_reasons, RepeatabilityReason};
 use spargebra::Query;
 
 /// Whether `reason` is a volatile call: one that can change the answer between two
-/// evaluations over the same data. `pinned` is whether the invocation carries an instant
-/// that `NOW()` is rewritten to; a pinned `NOW()` keeps its own rewrite and note
-/// (`src/now.rs`), so it is not named here.
+/// evaluations over the same data. `pinned` is whether `NOW()` is rewritten to a temporal
+/// corridor's pinned instant, which the kernel's cache key holds (`src/now.rs`, ledger
+/// #4286); such a `NOW()` is repeatable, so it is not named here. A `NOW()` on the kernel's
+/// live clock, or on the wall clock, is.
 fn is_volatile(reason: RepeatabilityReason, pinned: bool) -> bool {
     match reason {
         RepeatabilityReason::Rand
