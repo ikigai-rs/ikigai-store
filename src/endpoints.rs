@@ -551,6 +551,18 @@ fn cached_under(
 /// where the reason is named.
 pub const NOW_NOTE: &str = "uncached-now";
 
+/// The trace note a query door adds when it answers uncached because `ikigai-rdf`'s shared
+/// classifier finds a volatile call in the query (ledger #4418): `RAND()`, `UUID()`,
+/// `STRUUID()`, `BNODE()`, or `NOW()` when no pinned instant applies. It is also added when
+/// the query is past the classifier's depth or node limit. The value names every call found
+/// and why it matters, in plain words. `LIMIT`/`OFFSET`, `SAMPLE`, `GROUP_CONCAT`, `REDUCED`
+/// and CONSTRUCT template blank nodes stay cacheable (`docs/design/deterministic-sparql.md`).
+/// As with [`NOW_NOTE`], the kernel's own `uncached` note and the `urn:kernel:uncached` row
+/// say `declared`, because `ikigai-core` 0.5's `UncachedReason` has no variant that carries a
+/// reason, so this note is where the reason is named. An unpinned `NOW()` query carries both
+/// notes; a pinned one carries only [`NOW_NOTE`].
+pub const NOT_REPEATABLE_NOTE: &str = "uncached-not-repeatable";
+
 /// The four query forms, as `(IRI suffix, description id, scoped description id,
 /// graph-shaped?)`.
 ///
@@ -641,7 +653,7 @@ impl Endpoint for QueryEndpoint {
                     crate::budget::inline_bound(inv, "max_bytes")?,
                     self.store.answer_budget().for_capability(inv.capability),
                 )?;
-                let (media, bytes, reads_the_clock) = self.store.evaluate(
+                let (media, bytes, reads_the_clock, not_repeatable) = self.store.evaluate(
                     query,
                     false,
                     inv.capability,
@@ -664,6 +676,11 @@ impl Endpoint for QueryEndpoint {
                         // `src/service.rs`): in a host with `oxigraph/http-client` on, a plain
                         // evaluator turns `SERVICE <http://…>` into an ungated request.
                         crate::service::refuse_service(&parsed, "query")?;
+                        // Look for volatile calls before `NOW()` is rewritten to a literal
+                        // (ledger #4418, `src/repeatable.rs`). A pinned `NOW()` is left to its
+                        // own rewrite and note below.
+                        let not_repeatable =
+                            crate::repeatable::why_not_cacheable(&parsed, now.is_some());
                         // Detect calls before rewriting so clocked answers stay uncached too.
                         let reads_the_clock = crate::now::pin_query(&mut parsed, now);
                         // ★ A constant `GRAPH <iri>` outside the set is refused, not answered
@@ -757,7 +774,7 @@ impl Endpoint for QueryEndpoint {
                         } else {
                             serialize_solutions(results, as_type, deadline, answer)
                         }?;
-                        Ok((media, bytes, reads_the_clock))
+                        Ok((media, bytes, reads_the_clock, not_repeatable))
                     },
                 )?;
                 let rep = Representation::new(
@@ -770,6 +787,11 @@ impl Endpoint for QueryEndpoint {
                         NOW_NOTE,
                         "the query calls NOW(), so its answer is never cached",
                     );
+                }
+                if let Some(why) = &not_repeatable {
+                    inv.trace_note(NOT_REPEATABLE_NOTE, why.as_str());
+                }
+                if reads_the_clock || not_repeatable.is_some() {
                     return Ok(rep.with_uncached_reason(UncachedReason::Declared));
                 }
                 Ok(with_freshness(

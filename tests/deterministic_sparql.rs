@@ -1,4 +1,7 @@
-//! Test-only proof derived from the traversal in ikigai-store PR #101.
+//! The design spike's evidence (`docs/design/deterministic-sparql.md`), with its cache
+//! regression active since the doors adopted the shared classifier (ledger #4418). The
+//! boolean walk below is the spike's test-only prototype, kept as a cross-check;
+//! `tests/repeatable_uncached.rs` covers the production policy.
 
 use futures::executor::block_on;
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
@@ -10,7 +13,6 @@ use spargebra::Query;
 use std::sync::Arc;
 
 #[test]
-#[ignore = "The design spike leaves production cache policy unchanged"]
 fn volatile_selects_bypass_the_cache() {
     let kernel = Kernel::new(Arc::new(space(DurableStore::in_memory().unwrap())));
     let capability = Capability::root();

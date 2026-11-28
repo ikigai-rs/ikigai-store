@@ -15,8 +15,9 @@ On store main at `64a46722ad42d73973e31e84baddb9bfe867d09a`, the live select doo
 each of `RAND()`, `UUID()`, `STRUUID()`, and `BNODE()` into the kernel cache. The
 reproducer asks the kernel whether the exact request is cached after issuing it. This
 avoids inferring a cache hit from a random value or a blank node label. The test failed
-with all four calls listed. Run it explicitly with
-`cargo test --test deterministic_sparql volatile_selects_bypass_the_cache -- --ignored`.
+with all four calls listed. Run it with
+`cargo test --test deterministic_sparql volatile_selects_bypass_the_cache`. It was ignored
+during the spike and is active since follow-up 2 (ledger #4418, below).
 The separate NOW-only change also leaves these four calls outside its walker.
 [Store PR #101](https://github.com/ikigai-rs/ikigai-store/pull/101)
 
@@ -144,12 +145,29 @@ Keep the module independent of Oxigraph evaluators, endpoints, and cache APIs. A
 
 ## Consumer policy
 
-- **Store.** Evaluate flagged reads normally, returning the answer as uncached across
-  broad and scoped query doors. Existing freshness coverage still applies to eligible
-  queries. Report the detected reason in tracing. Ensure no pre-policy cache entries
+- **Store.** Evaluate a read that makes a volatile call normally, returning the answer as
+  uncached across broad and scoped query doors. Existing freshness coverage still applies to
+  eligible queries. Report the detected reason in tracing. Ensure no pre-policy cache entries
   survive on a kernel that adopts the policy, since the kernel looks up a hit before
   dispatching the request. Deploy with a fresh kernel cache or change the cache namespace
   if caches can span deployment.
+
+  **Decision (Brian, 2026-11-27): only volatile calls make a store read uncached.** They are
+  `RAND()`, `UUID()`, `STRUUID()`, `BNODE()`, and `NOW()` when no pinned corridor instant
+  applies. A pinned `NOW()` keeps its rewrite and its own `uncached-now` note. Every other
+  reason the classifier reports stays cacheable: `LIMIT`/`OFFSET` (ordered or not),
+  `SAMPLE`, `GROUP_CONCAT`, `REDUCED` and CONSTRUCT template blank nodes. Why:
+  - The SPARQL spec does not promise that those forms repeat, but this store does. Over
+    unchanged data its evaluator answers them the same way each time.
+  - The kernel cache is already cut when the data changes, so a cached answer never
+    outlives the data it was computed from.
+  - Losing the cache on every paged read (a listing's `ORDER BY … LIMIT 50`) costs more
+    than the theoretical variance it would guard against.
+
+  A query too deep or too large for the classifier to finish (depth 128, 16,384 nodes)
+  stays uncached, with a note naming the limit, because nothing then shows that it makes no
+  volatile call. A strict mode that also uncaches the other reasons is possible later as a
+  host setting. It is not built here.
 - **Repeatable Markdown mappings.** Use the same check in lint and evaluation. Refuse a
   mapping with a hazard before running its CONSTRUCT and return a diagnostic naming the
   mapping and construct. Validate all mappings before returning any derived output.
@@ -172,9 +190,9 @@ Keep the module independent of Oxigraph evaluators, endpoints, and cache APIs. A
 `cargo test --test deterministic_sparql` runs a test-only boolean prototype for the
 listed built-ins, slices, SAMPLE, GROUP_CONCAT, and REDUCED. Fixtures include a nested
 CONSTRUCT subquery, EXISTS, an aggregate argument, and negative controls for literal
-and comment text. A second active test evaluates the UUID CONSTRUCT twice. The ignored
-cache assertion preserves the failing reproduction for a future production regression.
-CI exercises the two active tests. The prototype does not implement typed reasons,
+and comment text. A second active test evaluates the UUID CONSTRUCT twice. The cache
+assertion preserved the failing reproduction and is the production regression now.
+CI exercises all three. The prototype does not implement typed reasons,
 template blank node detection, extension policy, or consumer enforcement.
 
 ## Proposed follow-up items
@@ -182,10 +200,21 @@ template blank node detection, extension policy, or consumer enforcement.
 - **Share a parsed SPARQL repeatability classifier**
   Implement typed reasons in the shared algebra module. Test structural coverage,
   feature unification, and bounded traversal with consumers' real parser versions.
-- **Bypass store caching for flagged SPARQL reads**
+- **Bypass store caching for flagged SPARQL reads** (done, ledger #4418, 0.7.0)
   Wire the classifier to broad and graph-scoped query doors, preserve cache hits for
   eligible reads, and activate the baseline regression. Verify trace reasons and cache
-  rollover behavior.
+  rollover behavior. `src/repeatable.rs` runs `ikigai-rdf` 0.7.0's
+  `repeatability_reasons` after the budget check and the `SERVICE` refusal, and before
+  `NOW()` is rewritten. Only a volatile call makes the answer uncached, as the store policy
+  above decides, and so does a query the classifier cannot finish within its own depth and
+  node limits, which are not the store's budget. The calls are named in the
+  `uncached-not-repeatable` trace note. The `urn:kernel:uncached` row says `declared`,
+  because core 0.5's `UncachedReason` cannot carry a reason. `tests/repeatable_uncached.rs`
+  covers each volatile call through both doors, cache hits for `LIMIT`, `OFFSET`, `SAMPLE`,
+  `GROUP_CONCAT`, `REDUCED`, template blank nodes and ordinary reads, the trace and readout,
+  a pinned `NOW()`, and rollover. For rollover, a kernel holding entries a pre-policy store
+  wrote serves them until the thread they hang from is cut. After the cut, and on a fresh
+  kernel, the read is computed every time.
 - **Validate repeatable Markdown mappings before execution**
   Share lint and application validation, promote the UUID reproduction to a refusal
   regression, and document stable input-derived identifiers and migration examples.

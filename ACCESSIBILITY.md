@@ -29,9 +29,20 @@ conformance claim. Adapted from the
   other errors in `src/endpoints.rs`, `src/budget.rs`, `src/limits.rs`, `src/confine.rs`,
   `src/scope.rs`, `src/service.rs` and `src/depth.rs`, which a host, or a crate that uses this
   one's limits and budget, shows to whoever made the request.
-- **One trace note** (`src/endpoints.rs`, `NOW_NOTE`): a query door answering uncached because the
-  query calls `NOW()` adds `uncached-now` to its trace event, a sentence saying the query calls
-  `NOW()` and so its answer is never cached. Untested for wording beyond naming `NOW()`.
+- **Two trace notes** (`src/endpoints.rs`):
+  - `NOW_NOTE`: a query door answering uncached because the query calls `NOW()` adds
+    `uncached-now` to its trace event, a sentence saying the query calls `NOW()` and so its
+    answer is never cached. Untested for wording beyond naming `NOW()`.
+  - `NOT_REPEATABLE_NOTE`: a query door answering uncached because the query makes a
+    volatile call adds `uncached-not-repeatable`. The note is a sentence saying the query can
+    give a different answer each time it runs, so its answer is never cached. Then comes one
+    sentence per call found (`RAND()`, `UUID()`, `STRUUID()`, `BNODE()`, or an unpinned
+    `NOW()`), from `ikigai-rdf`'s classifier, naming it and why (for example
+    `RAND() draws a pseudo-random value on evaluation.`). When the classifier cannot finish,
+    the note says so and names the limit. `tests/repeatable_uncached.rs` checks that each
+    call is named and that the note says the answer is never cached, and `src/repeatable.rs`
+    checks that a reason which does not uncache the read (such as `LIMIT`) is not named. That
+    is not a readability review.
 - `examples/dump-memory.rs` prints timings to a terminal; it is a measurement, not a shipped
   binary.
 

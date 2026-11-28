@@ -362,6 +362,21 @@ description = "The persistent RDF store for ikigai: a dataset opened from a path
 # 0.7.0 moves to ikigai-core 0.5.0, ikigai-vocab 0.5.0, ikigai-rdf 0.7.0 and ikigai-conformance
 # 0.16.0 (the core 0.5 cascade, ledger #4454). A minor because the public API carries core
 # types. No persisted state changes, so nothing to migrate.
+# ★ 0.7.0 also never caches a SPARQL read that makes a volatile call (ledger #4418; the spec is
+# `docs/design/deterministic-sparql.md`, follow-up 2). The broad and graph-scoped query doors run
+# `ikigai-rdf`'s shared classifier on the parsed query and answer uncached, with the reason in the
+# `uncached-not-repeatable` trace note, any query that calls RAND(), UUID(), STRUUID(), BNODE(),
+# or NOW() with no pinned instant (a pinned NOW() keeps its rewrite and `uncached-now` note), or
+# that is too deep or large for the classifier to finish. ⚠ BEHAVIOR CHANGE: a caller that relied
+# on the kernel cache for such a read now gets it evaluated on every request. LIMIT/OFFSET,
+# SAMPLE, GROUP_CONCAT, REDUCED and CONSTRUCT template blank nodes stay cacheable, and every other
+# read is cached exactly as before. No persisted state changes: cache entries are in memory, so a
+# restarted host holds none written before the policy; a host that swaps the store's doors under
+# a running kernel must cut the thread they hang from (as `DynamicSpace` does) or keep a fresh
+# cache. `sparql-algebra` enables RDF 1.2 (`oxrdf/rdf-12`, `spargebra/sparql-12`), so oxigraph's
+# `rdf-12` is now on in every build and in every consumer's graph, and a consumer that matched
+# `oxrdf::Term` exhaustively without it stops compiling (the 0.2.2 break). The SPARQL 1.2 and
+# RDF 1.2 syntax the `rdf-12` build accepted is now accepted by default.
 version = "0.7.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -397,6 +412,8 @@ persistent = ["oxigraph/rocksdb"]
 # exactly where the variant exists — the same break wearing a fix's clothes. The one
 # sound direction is the other one: this feature ON implies the variant exists, which is
 # why the test that constructs a quoted triple may be cfg'd on it and the arm may not.
+# ★ Since 0.7.0 RDF 1.2 is on in every build (the `ikigai-rdf` dependency below needs it), so
+# this feature changes nothing. It stays declared so a consumer that names it still builds.
 rdf-12 = ["oxigraph/rdf-12"]
 # ⚠ A GATE too, and like `rdf-12` NEVER a `cfg` on a code path. `oxigraph/http-client` is what
 # `ikigai-cli` and `ikigai-web-demo` get by unification (rudof_rdf enables
@@ -450,8 +467,11 @@ futures = "0.3"
 # the same API on ikigai-core 0.2 (the core 0.2.0 sweep, ledger #2342). 0.5.0 is its release on
 # ikigai-core 0.3, so one core links (the core 0.3.0 cascade, ledger #3040). 0.6.0 is its release
 # on core 0.4.0 (scope opacity, structured denials; the cascade, ledger #3933), so one core links.
-# 0.7.0 is the floor for the release using core 0.5.
-ikigai-rdf = "0.7.0"
+# 0.7.0 is the floor for the release using core 0.5. ★ It carries `sparql-algebra`, the shared
+# SPARQL repeatability classifier the query doors run (ledger #4418, `src/repeatable.rs`). That
+# feature turns on `oxrdf/rdf-12` and `spargebra/sparql-12`, which is why oxigraph's `rdf-12` is on
+# below: without it `sparesults` does not compile (E0004 on `TermRef::Triple`).
+ikigai-rdf = { version = "0.7.0", features = ["sparql-algebra"] }
 # In-memory store by default; `persistent` turns the RocksDB backend back on. Oxigraph
 # itself gates `oxrocksdb-sys` out of wasm by target, so the feature pulls in nothing
 # there — and this crate's durable constructors are gated off wasm too, so `persistent`
@@ -473,7 +493,9 @@ ikigai-rdf = "0.7.0"
 # one family": a direct dependency is its own edge and never steers spareval's (measured, both
 # directions, 2026-10-10). The consumer's fix is `cargo update -p sha2@0.10.9` (README, "two
 # `digest` crates"); the real fix is upstream, oxigraph/oxigraph#1712.
-oxigraph = { version = "0.5.1", default-features = false }
+# `rdf-12` because `ikigai-rdf`'s `sparql-algebra` enables RDF 1.2 in oxrdf and spargebra, and
+# oxigraph's term adapters must agree with them (see `ikigai-rdf` above). On since 0.7.0.
+oxigraph = { version = "0.5.1", default-features = false, features = ["rdf-12"] }
 # The parser oxigraph itself uses, named directly so a query's ALGEBRA can be measured against
 # the time budget's bounds before oxigraph plans it (ledger #964): planning cannot be
 # cancelled. Its type must be the one oxigraph converts from (`for_query`/`for_update`), and
@@ -505,7 +527,7 @@ tantivy = { version = "0.27.0", optional = true, default-features = false, featu
 
 # On wasm, Oxigraph needs its `js` feature (getrandom wasm backend) to build.
 [target.'cfg(target_family = "wasm")'.dependencies]
-oxigraph = { version = "0.5.1", default-features = false, features = ["js"] }
+oxigraph = { version = "0.5.1", default-features = false, features = ["js", "rdf-12"] }
 
 [dev-dependencies]
 # The module recipe as one test, from day one — condition 6. 0.3.0 for the AUTHORITY
