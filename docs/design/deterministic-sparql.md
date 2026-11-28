@@ -154,7 +154,8 @@ Keep the module independent of Oxigraph evaluators, endpoints, and cache APIs. A
 
   **Decision (Brian, 2026-11-27): only volatile calls make a store read uncached.** They are
   `RAND()`, `UUID()`, `STRUUID()`, `BNODE()`, and `NOW()` when no pinned corridor instant
-  applies. A pinned `NOW()` keeps its rewrite and its own `uncached-now` note. Every other
+  applies. A `NOW()` pinned by a temporal corridor is rewritten to that instant, which the
+  cache key holds, so since 0.7.1 it is cached with no note (ledger #4286). Every other
   reason the classifier reports stays cacheable: `LIMIT`/`OFFSET` (ordered or not),
   `SAMPLE`, `GROUP_CONCAT`, `REDUCED` and CONSTRUCT template blank nodes. Why:
   - The SPARQL spec does not promise that those forms repeat, but this store does. Over
@@ -212,13 +213,14 @@ template blank node detection, extension policy, or consumer enforcement.
   because core 0.5's `UncachedReason` cannot carry a reason. `tests/repeatable_uncached.rs`
   covers each volatile call through both doors, cache hits for `LIMIT`, `OFFSET`, `SAMPLE`,
   `GROUP_CONCAT`, `REDUCED`, template blank nodes and ordinary reads, the trace and readout,
-  a pinned `NOW()`, and rollover. For rollover, a kernel holding entries a pre-policy store
+  a `NOW()` on the kernel's clock and one pinned by a corridor, and rollover. For rollover, a kernel holding entries a pre-policy store
   wrote serves them until the thread they hang from is cut. After the cut, and on a fresh
   kernel, the read is computed every time.
 - **Validate repeatable Markdown mappings before execution**
   Share lint and application validation, promote the UUID reproduction to a refusal
   regression, and document stable input-derived identifiers and migration examples.
-- **Bind NOW to an explicit evaluation instant**
+- **Bind NOW to an explicit evaluation instant** (done: ledger #4284 in 0.6.2, and the pinned
+  keyed half, ledger #4286, in 0.7.1)
   Implement the parsed rewrite and verify live uncached and pinned keyed behavior.
   Test mixed NOW and UUID queries so removing one dependency never hides another.
 - **Define ordering and RDF identity guarantees**

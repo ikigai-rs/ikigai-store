@@ -223,11 +223,13 @@
 //!
 //! ★ **A query that makes a volatile call is never cached, whatever the coverage** (ledger
 //! #4418). The query doors run `ikigai-rdf`'s shared classifier on the parsed query, and a
-//! query that calls `RAND()`, `UUID()`, `STRUUID()`, `BNODE()`, or `NOW()` with no pinned
-//! instant is evaluated and answered uncached, naming each call in the
+//! query that calls `RAND()`, `UUID()`, `STRUUID()`, `BNODE()`, or `NOW()` on a live clock
+//! is evaluated and answered uncached, naming each call in the
 //! [`NOT_REPEATABLE_NOTE`](endpoints::NOT_REPEATABLE_NOTE) trace note. `LIMIT`/`OFFSET`,
 //! `SAMPLE`, `GROUP_CONCAT`, `REDUCED` and CONSTRUCT template blank nodes stay cacheable:
-//! this store answers them the same way over unchanged data.
+//! this store answers them the same way over unchanged data. So does a `NOW()` under a
+//! temporal corridor (`Scope::with_named_at`), rewritten to the corridor's pinned instant,
+//! which the cache key holds (ledger #4286).
 //! `docs/design/deterministic-sparql.md` says why.
 //!
 //! ★ **A host that only needs to READ every quad takes a [`SnapshotReader`] instead**
